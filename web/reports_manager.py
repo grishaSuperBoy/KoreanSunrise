@@ -10,13 +10,26 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
+import threading
+import time
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(HERE)
 REPORTS_DIR = os.path.join(PROJECT_ROOT, "reports", "daily")
 
+_REPORTS_CACHE: List[Dict[str, Any]] = []
+_REPORTS_CACHE_TIME: float = 0.0
+_REPORTS_CACHE_LOCK = threading.Lock()
 
-def list_available_reports() -> List[Dict[str, Any]]:
-    """Discovers all archived daily reports and extracts card metrics."""
+
+def list_available_reports(force: bool = False, ttl_sec: float = 10.0) -> List[Dict[str, Any]]:
+    """Discovers all archived daily reports and extracts card metrics, with in-memory caching."""
+    global _REPORTS_CACHE, _REPORTS_CACHE_TIME
+    now = time.time()
+    with _REPORTS_CACHE_LOCK:
+        if not force and _REPORTS_CACHE and (now - _REPORTS_CACHE_TIME < ttl_sec):
+            return list(_REPORTS_CACHE)
+
     os.makedirs(REPORTS_DIR, exist_ok=True)
     report_files = sorted(glob.glob(os.path.join(REPORTS_DIR, "report_*.md")), reverse=True)
 
@@ -41,6 +54,9 @@ def list_available_reports() -> List[Dict[str, Any]]:
         cards.append(card)
 
     cards.sort(key=lambda x: x["date_key"], reverse=True)
+    with _REPORTS_CACHE_LOCK:
+        _REPORTS_CACHE = cards
+        _REPORTS_CACHE_TIME = time.time()
     return cards
 
 

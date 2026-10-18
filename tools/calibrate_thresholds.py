@@ -209,7 +209,7 @@ def calibrate(
                 for c in udoc.get("coins", []):
                     # Check which venues this coin trades on
                     venues = []
-                    for v in ["binance", "bybit", "okx", "gateio", "mexc", "kucoin", "bingx", "htx", "pionex"]:
+                    for v in ["binance", "bybit", "okx", "gateio", "mexc", "kucoin", "bingx", "htx", "pionex", "asterdex", "hyperliquid"]:
                         sym_map = udoc.get(f"{v}_sym_map", {})
                         if any(val[0] == c for val in sym_map.values()):
                             venues.append(v)

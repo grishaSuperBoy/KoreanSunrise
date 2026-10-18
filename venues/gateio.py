@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
@@ -112,6 +113,17 @@ class GateioStream(BaseCEXStream):
     ):
         super().__init__("gateio", symbols, callback, stream_name=stream_name, contract_sizes=contract_sizes)
         self._books: Dict[str, Dict[str, Dict[float, float]]] = {}
+        self._lock = threading.RLock()
+        self._last_id: Dict[str, int] = {}
+        self._synced: Dict[str, bool] = {}
+
+    def get_book_snapshot(self, contract: str) -> Optional[Dict[str, Dict[float, float]]]:
+        """Thread-safe snapshot copy of the current L2 book for contract."""
+        with self._lock:
+            b = self._books.get(contract)
+            if not b:
+                return None
+            return {"bids": dict(b["bids"]), "asks": dict(b["asks"])}
 
     def _to_raw_symbol(self, s: str) -> str:
         s_u = s.upper()
@@ -126,7 +138,11 @@ class GateioStream(BaseCEXStream):
         await ws.send(json.dumps({"time": int(time.time()), "channel": "futures.ping"}))
 
     async def _send_subscriptions(self, ws: Any) -> None:
-        self._books.clear()
+        with self._lock:
+            self._books.clear()
+            self._last_id.clear()
+            self._synced.clear()
+
         if not self._contract_sizes:
             try:
                 sizes = await asyncio.to_thread(GateioRestClient().fetch_contract_sizes)
@@ -162,40 +178,74 @@ class GateioStream(BaseCEXStream):
             contract_size = self._get_contract_size(contract)
 
             event = data.get("event")
-            if contract not in self._books or event == "all":
-                self._books[contract] = {"bids": {}, "asks": {}}
+            curr_id = int(result.get("id") or result.get("last_id") or 0)
 
-            book = self._books[contract]
-            bids_dict = book["bids"]
-            asks_dict = book["asks"]
-
-            for row in result.get("b", []):
-                p, s = float(row.get("p", 0.0)), float(row.get("s", 0.0))
-                q = s * contract_size
-                if q <= 0.0 or p <= 0.0:
-                    bids_dict.pop(p, None)
+            with self._lock:
+                cur_book = self._books.get(contract)
+                is_desynced = (self._synced.get(contract) is False)
+                if event == "all" or (cur_book is None and not is_desynced):
+                    self._synced[contract] = True
+                    self._last_id[contract] = curr_id
+                    new_bids: Dict[float, float] = {}
+                    new_asks: Dict[float, float] = {}
                 else:
-                    bids_dict[p] = q
+                    if is_desynced:
+                        # Waiting for a fresh 'all' snapshot after gap
+                        self.seq_gaps += 1
+                        return
 
-            for row in result.get("a", []):
-                p, s = float(row.get("p", 0.0)), float(row.get("s", 0.0))
-                q = s * contract_size
-                if q <= 0.0 or p <= 0.0:
-                    asks_dict.pop(p, None)
-                else:
-                    asks_dict[p] = q
+                    last_id = self._last_id.get(contract, 0)
+                    if curr_id > 0 and last_id > 0:
+                        if curr_id <= last_id:
+                            self.seq_duplicates += 1
+                            return
+                        if curr_id > last_id + 1:
+                            self.seq_gaps += 1
+                            log.warning(
+                                f"[gateio] Sequence gap on {contract}: expected {last_id + 1}, got {curr_id}. Desyncing book."
+                            )
+                            self._synced[contract] = False
+                            self._books.pop(contract, None)
+                            return
 
-            if not bids_dict or not asks_dict:
-                return
+                    self._last_id[contract] = curr_id
+                    new_bids = dict(cur_book.get("bids", {}))
+                    new_asks = dict(cur_book.get("asks", {}))
 
-            sorted_bids_raw = sorted(bids_dict.items(), key=lambda x: x[0], reverse=True)
-            sorted_asks_raw = sorted(asks_dict.items(), key=lambda x: x[0])
+                for row in result.get("b", []):
+                    p, s = float(row.get("p", 0.0)), float(row.get("s", 0.0))
+                    q = s * contract_size
+                    if q <= 0.0 or p <= 0.0:
+                        new_bids.pop(p, None)
+                    else:
+                        new_bids[p] = q
 
-            # Prevent unbounded memory growth on volatile price moves
-            if len(bids_dict) > 100:
-                book["bids"] = dict(sorted_bids_raw[:50])
-            if len(asks_dict) > 100:
-                book["asks"] = dict(sorted_asks_raw[:50])
+                for row in result.get("a", []):
+                    p, s = float(row.get("p", 0.0)), float(row.get("s", 0.0))
+                    q = s * contract_size
+                    if q <= 0.0 or p <= 0.0:
+                        new_asks.pop(p, None)
+                    else:
+                        new_asks[p] = q
+
+                if not new_bids or not new_asks:
+                    return
+
+                sorted_bids_raw = sorted(new_bids.items(), key=lambda x: x[0], reverse=True)
+                sorted_asks_raw = sorted(new_asks.items(), key=lambda x: x[0])
+
+                # Memory leak / GC protection: strictly cap depth to MAX_BOOK_DEPTH (25)
+                MAX_BOOK_DEPTH = 25
+                if len(new_bids) > MAX_BOOK_DEPTH:
+                    new_bids = dict(sorted_bids_raw[:MAX_BOOK_DEPTH])
+                if len(new_asks) > MAX_BOOK_DEPTH:
+                    new_asks = dict(sorted_asks_raw[:MAX_BOOK_DEPTH])
+
+                # Atomic Copy-on-Write assignment
+                self._books[contract] = {"bids": new_bids, "asks": new_asks}
+
+                top_bids = sorted_bids_raw[:5]
+                top_asks = sorted_asks_raw[:5]
 
             if mult != 1.0:
                 inv_mult = 1.0 / mult

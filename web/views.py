@@ -1,5 +1,6 @@
 """
 web/views.py - Material Design 3 Dark Theme Dashboard and Reporting Hub for Korean Sunrise.
+Hardened with zero-token URL leaks, anti-CSRF protection, and session controls.
 """
 from __future__ import annotations
 
@@ -9,15 +10,22 @@ import urllib.parse
 from typing import Any, Dict, List, Optional
 
 
-def render_login_html() -> str:
-    return """<!DOCTYPE html>
+def render_login_html(error: Optional[str] = None) -> str:
+    error_banner = ""
+    if error:
+        error_banner = f"""<div style="background:rgba(239, 68, 68, 0.15);border:1px solid #ef4444;border-radius:10px;padding:12px;margin-bottom:20px;color:#fca5a5;font-size:13px;display:flex;align-items:center;gap:8px;">
+          <span>⚠️</span>
+          <span>{html.escape(error)}</span>
+        </div>"""
+
+    return f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Вход | Korean Sunrise Intelligence</title>
 <style>
-:root {
+:root {{
   --bg-color: #0b0e17;
   --surface-color: #151c2c;
   --surface-border: rgba(255, 255, 255, 0.08);
@@ -25,9 +33,9 @@ def render_login_html() -> str:
   --primary-glow: rgba(56, 189, 248, 0.25);
   --text-main: #f8fafc;
   --text-muted: #94a3b8;
-}
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body {
+}}
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
   background-color: var(--bg-color);
   color: var(--text-main);
@@ -36,8 +44,8 @@ body {
   justify-content: center;
   min-height: 100vh;
   padding: 16px;
-}
-.login-card {
+}}
+.login-card {{
   background: var(--surface-color);
   border: 1px solid var(--surface-border);
   border-radius: 20px;
@@ -47,8 +55,8 @@ body {
   box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
   position: relative;
   overflow: hidden;
-}
-.login-card::before {
+}}
+.login-card::before {{
   content: '';
   position: absolute;
   top: -50px;
@@ -57,37 +65,37 @@ body {
   height: 120px;
   background: radial-gradient(circle, var(--primary-glow) 0%, transparent 70%);
   border-radius: 50%;
-}
-.logo-title {
+}}
+.logo-title {{
   display: flex;
   align-items: center;
   gap: 12px;
   margin-bottom: 8px;
-}
-.logo-icon {
+}}
+.logo-icon {{
   font-size: 28px;
-}
-h1 {
+}}
+h1 {{
   font-size: 22px;
   font-weight: 700;
   letter-spacing: -0.5px;
-}
-.subtitle {
+}}
+.subtitle {{
   color: var(--text-muted);
   font-size: 14px;
   margin-bottom: 28px;
-}
-.form-group {
+}}
+.form-group {{
   margin-bottom: 20px;
-}
-label {
+}}
+label {{
   display: block;
   font-size: 13px;
   color: var(--text-muted);
   margin-bottom: 8px;
   font-weight: 500;
-}
-input[type="password"] {
+}}
+input[type="password"] {{
   width: 100%;
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid var(--surface-border);
@@ -97,12 +105,12 @@ input[type="password"] {
   font-size: 15px;
   outline: none;
   transition: border-color 0.2s, box-shadow 0.2s;
-}
-input[type="password"]:focus {
+}}
+input[type="password"]:focus {{
   border-color: var(--primary-color);
   box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.15);
-}
-button {
+}}
+button {{
   width: 100%;
   background: linear-gradient(135deg, #0284c7 0%, #2563eb 100%);
   border: none;
@@ -113,9 +121,9 @@ button {
   padding: 14px;
   cursor: pointer;
   transition: opacity 0.2s, transform 0.1s;
-}
-button:hover { opacity: 0.95; }
-button:active { transform: scale(0.99); }
+}}
+button:hover {{ opacity: 0.95; }}
+button:active {{ transform: scale(0.99); }}
 </style>
 </head>
 <body>
@@ -125,7 +133,8 @@ button:active { transform: scale(0.99); }
     <h1>Korean Sunrise</h1>
   </div>
   <p class="subtitle">Авторизация для доступа к квантовой телеметрии</p>
-  <form method="GET" action="/">
+  {error_banner}
+  <form method="POST" action="/login">
     <div class="form-group">
       <label for="token">Секретный ключ авторизации:</label>
       <input type="password" id="token" name="token" placeholder="Введите API токен" required autofocus>
@@ -143,8 +152,10 @@ def render_dashboard_html(
     profile_data: Dict[str, Any],
     thresholds_doc: Dict[str, Any],
     reports_cards: List[Dict[str, Any]],
-    auth_token: str,
+    csrf_token: str = "",
+    auth_token: str = "",
 ) -> str:
+    effective_csrf = csrf_token or auth_token
     summary = pool_snapshot.get("summary", {})
     counters = service_status.get("counters", {})
     streams = service_status.get("streams", {})
@@ -193,6 +204,7 @@ def render_dashboard_html(
                 """)
             venues_html = "".join(v_rows) if v_rows else "<div style='color:#64748b;font-size:12px;'>Нет связок</div>"
 
+            fn_escaped = urllib.parse.quote(rc.get("filename_md", ""))
             report_cards_html.append(f"""
             <div class="report-card">
               <div class="rc-header">
@@ -213,7 +225,7 @@ def render_dashboard_html(
               </div>
               <div class="rc-footer">
                 <button class="btn-read" onclick="viewReport('{rc.get('id', '')}')">📖 Читать квантовый отчёт</button>
-                <a href="/download?token={auth_token}&file={rc.get('filename_md', '')}" class="btn-dl">Скачать .md</a>
+                <a href="/download?file={fn_escaped}" class="btn-dl">Скачать .md</a>
               </div>
             </div>
             """)
@@ -309,6 +321,7 @@ body {{
 /* Navigation Tabs */
 .tabs {{
   display: flex;
+  align-items: center;
   gap: 8px;
 }}
 .tab-btn {{
@@ -449,44 +462,55 @@ body {{
   border: 1px solid var(--border);
   border-radius: 12px;
   overflow: hidden;
+  font-size: 13px;
 }}
 .data-table th, .data-table td {{
   padding: 12px 16px;
   border-bottom: 1px solid var(--border);
-  font-size: 13px;
 }}
-.data-table th {{ background: var(--bg-2); color: var(--text-muted); font-weight: 600; text-align: left; }}
-.badge {{ padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: 700; text-transform: uppercase; }}
+.data-table th {{
+  background: var(--bg-2);
+  color: var(--text-muted);
+  font-weight: 600;
+  text-align: left;
+}}
+.badge {{
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}}
 .badge-green {{ background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.3); }}
 .badge-blue {{ background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); }}
 .badge-yellow {{ background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.3); }}
 .badge-red {{ background: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3); }}
 
-/* Modal */
+/* Modal overlay */
 .modal-overlay {{
-  display: none;
   position: fixed;
   top: 0; left: 0; right: 0; bottom: 0;
-  background: rgba(0,0,0,0.8);
-  backdrop-filter: blur(4px);
-  z-index: 1000;
-  padding: 24px;
+  background: rgba(0,0,0,0.85);
+  display: none;
   align-items: center;
   justify-content: center;
+  z-index: 1000;
+  padding: 24px;
 }}
 .modal-overlay.active {{ display: flex; }}
 .modal-box {{
   background: var(--bg-1);
   border: 1px solid var(--border);
   border-radius: 16px;
-  width: 100%;
   max-width: 900px;
+  width: 100%;
   max-height: 85vh;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }}
 .modal-header {{
-  padding: 16px 20px;
+  padding: 16px 24px;
   border-bottom: 1px solid var(--border);
   display: flex;
   justify-content: space-between;
@@ -515,6 +539,10 @@ body {{
     <button class="tab-btn" onclick="switchTab('thresholds')">Матрица спредов ({len(th_items)})</button>
     <button class="tab-btn" onclick="switchTab('profile')">Депозит и слоты</button>
     <button class="tab-btn" onclick="switchTab('controls')">Управление</button>
+    <form method="POST" action="/logout" style="margin:0;display:inline;">
+      <input type="hidden" name="csrf_token" value="{effective_csrf}">
+      <button type="submit" class="tab-btn" style="color:var(--red);" title="Завершить сеанс">Выйти 🚪</button>
+    </form>
   </div>
 </div>
 
@@ -619,8 +647,8 @@ body {{
       </div>
       <div style="background:var(--bg-1);border:1px solid var(--border);border-radius:12px;padding:20px;">
         <h3>Экспорт всех данных (.ZIP)</h3>
-        <p style="color:var(--text-muted);font-size:13px;margin:8px 0 16px;">Выгрузка сигналов, отчётов и конфигураций в 1 клик без SSH.</p>
-        <a href="/download?token={auth_token}" class="btn-dl" style="display:block;text-align:center;">📦 Скачать архив</a>
+        <p style="color:var(--text-muted);font-size:13px;margin:8px 0 16px;">Выгрузка сигналов, отчётов и конфигураций в 1 клик без передачи токена в URL.</p>
+        <a href="/download" class="btn-dl" style="display:block;text-align:center;">📦 Скачать архив</a>
       </div>
     </div>
   </div>
@@ -639,13 +667,18 @@ body {{
 </div>
 
 <script>
-const TOKEN = "{auth_token}";
+const CSRF_TOKEN = "{effective_csrf}";
 
 function switchTab(name) {{
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-  document.getElementById('tab-' + name).classList.add('active');
-  event.target.classList.add('active');
+  const target = document.getElementById('tab-' + name);
+  if (target) {{
+    target.classList.add('active');
+  }}
+  if (window.event && window.event.target && window.event.target.classList.contains('tab-btn')) {{
+    window.event.target.classList.add('active');
+  }}
 }}
 
 async function viewReport(reportId) {{
@@ -653,7 +686,11 @@ async function viewReport(reportId) {{
   document.getElementById('modalContent').innerText = 'Загрузка...';
   document.getElementById('reportModal').classList.add('active');
   try {{
-    const res = await fetch('/api/report/content?token=' + TOKEN + '&id=' + reportId);
+    const res = await fetch('/api/report/content?id=' + encodeURIComponent(reportId));
+    if (!res.ok) {{
+      document.getElementById('modalContent').innerText = 'Ошибка (' + res.status + '): ' + res.statusText;
+      return;
+    }}
     const text = await res.text();
     document.getElementById('modalContent').innerText = text;
   }} catch (e) {{
@@ -667,22 +704,88 @@ function closeModal(e) {{
 
 async function triggerDailyReport() {{
   if (!confirm('Сгенерировать суточный квантовый отчёт прямо сейчас?')) return;
-  const res = await fetch('/api/report/generate?token=' + TOKEN, {{ method: 'POST' }});
-  alert('Отчёт успешно сформирован!');
-  location.reload();
+  try {{
+    const res = await fetch('/api/report/generate', {{
+      method: 'POST',
+      headers: {{
+        'X-CSRF-Token': CSRF_TOKEN,
+        'Content-Type': 'application/json'
+      }}
+    }});
+    if (!res.ok) {{
+      const err = await res.json().catch(() => ({{}}));
+      alert('Ошибка (' + res.status + '): ' + (err.error || res.statusText));
+      return;
+    }}
+    alert('Отчёт успешно сформирован!');
+    location.reload();
+  }} catch (e) {{
+    alert('Ошибка сети: ' + e);
+  }}
 }}
 
 async function triggerCalibration() {{
   if (!confirm('Запустить алгоритмическую калибровку спредов по всем парам?')) return;
-  const res = await fetch('/api/thresholds/calibrate?token=' + TOKEN, {{ method: 'POST' }});
-  alert('Калибровка завершена!');
-  location.reload();
+  try {{
+    const res = await fetch('/api/thresholds/calibrate', {{
+      method: 'POST',
+      headers: {{
+        'X-CSRF-Token': CSRF_TOKEN,
+        'Content-Type': 'application/json'
+      }}
+    }});
+    if (!res.ok) {{
+      const err = await res.json().catch(() => ({{}}));
+      alert('Ошибка (' + res.status + '): ' + (err.error || res.statusText));
+      return;
+    }}
+    alert('Калибровка завершена!');
+    location.reload();
+  }} catch (e) {{
+    alert('Ошибка сети: ' + e);
+  }}
 }}
 
 async function runPipeline() {{
   if (!confirm('Запустить 24-часовой автономный пайплайн?')) return;
-  const res = await fetch('/api/daily-pipeline?token=' + TOKEN, {{ method: 'POST' }});
-  alert('Пайплайн запущен в фоне!');
+  try {{
+    const res = await fetch('/api/daily-pipeline', {{
+      method: 'POST',
+      headers: {{
+        'X-CSRF-Token': CSRF_TOKEN,
+        'Content-Type': 'application/json'
+      }}
+    }});
+    if (!res.ok) {{
+      const err = await res.json().catch(() => ({{}}));
+      alert('Ошибка (' + res.status + '): ' + (err.error || res.statusText));
+      return;
+    }}
+    alert('Пайплайн запущен в фоне!');
+  }} catch (e) {{
+    alert('Ошибка сети: ' + e);
+  }}
+}}
+
+async function toggleCoinPool(action, coin) {{
+  try {{
+    const res = await fetch('/pool/' + action, {{
+      method: 'POST',
+      headers: {{
+        'X-CSRF-Token': CSRF_TOKEN,
+        'Content-Type': 'application/json'
+      }},
+      body: JSON.stringify({{ coin: coin }})
+    }});
+    if (!res.ok) {{
+      const err = await res.json().catch(() => ({{}}));
+      alert('Ошибка (' + res.status + '): ' + (err.error || res.statusText));
+      return;
+    }}
+    location.reload();
+  }} catch (e) {{
+    alert('Ошибка сети: ' + e);
+  }}
 }}
 </script>
 </body>
@@ -702,9 +805,13 @@ def _render_battle_tags(pool_snapshot: Dict[str, Any]) -> str:
         name = html.escape(str(c.get("coin", "")))
         en = c.get("enabled", True)
         col = "#10b981" if en else "#64748b"
+        act_text = "Пауза ⏸" if en else "Старт ▶"
+        act_fn = "pause" if en else "resume"
+        btn_col = "#f59e0b" if en else "#10b981"
         tags.append(f"""
-        <div style="background:var(--bg-2);border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:13px;display:flex;align-items:center;gap:6px;">
+        <div style="background:var(--bg-2);border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:13px;display:flex;align-items:center;gap:10px;">
           <span style="color:{col};font-weight:700;">⚔️ {name}</span>
+          <button onclick="toggleCoinPool('{act_fn}', '{name}')" style="background:none;border:1px solid {btn_col};color:{btn_col};border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer;">{act_text}</button>
         </div>
         """)
     return "".join(tags)

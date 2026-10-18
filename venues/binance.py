@@ -123,9 +123,9 @@ class BinanceFuturesStream(BaseVenueStream):
         sym_map: Dict[str, Tuple[str, float]],
         callback: Callable[[OrderBookDepth5], None],
     ):
-        coins = sorted({coin for coin, _ in sym_map.values()})
+        coins = sorted({v[0] for v in sym_map.values()})
         super().__init__("binance", coins, callback)
-        self._sym_map: Dict[str, Tuple[str, float]] = dict(sym_map)
+        self._sym_map: Dict[str, Tuple[Any, ...]] = dict(sym_map)
         self._raw_symbols: List[str] = sorted(self._sym_map.keys())
         self.subscribed = list(coins)
         self._connected_chunks: Set[int] = set()
@@ -221,17 +221,38 @@ class BinanceFuturesStream(BaseVenueStream):
             mapped = self._sym_map.get(raw_sym)
             if not mapped:
                 return
-            coin, mult = mapped
+            coin = mapped[0]
+            mult = float(mapped[1])
+            c_size = float(mapped[2]) if len(mapped) >= 3 else 1.0
 
             raw_bids = data.get("b", [])[:5]
             raw_asks = data.get("a", [])[:5]
             if not raw_bids or not raw_asks:
                 return
 
-            if mult != 1.0:
-                inv_mult = 1.0 / mult
-                bids = [(float(p) * inv_mult, float(q) * mult) for p, q in raw_bids]
-                asks = [(float(p) * inv_mult, float(q) * mult) for p, q in raw_asks]
+            # Sequence gap / packet drop detection
+            curr_u = int(data.get("u") or 0)
+            prev_u = int(data.get("pu") or 0)
+            if curr_u > 0:
+                last_u = self._last_u.get(raw_sym)
+                if last_u is not None and prev_u > 0:
+                    if prev_u != last_u:
+                        self.seq_gaps += 1
+                        log.warning(
+                            f"[binance] Sequence gap for {raw_sym}: expected pu={last_u}, got {prev_u} (u={curr_u}). Dropping gap tick."
+                        )
+                        self._last_u[raw_sym] = curr_u
+                        return
+                    if curr_u <= last_u:
+                        self.seq_duplicates += 1
+                        return
+                self._last_u[raw_sym] = curr_u
+
+            inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
+            scale_qty = mult * c_size
+            if inv_mult != 1.0 or scale_qty != 1.0:
+                bids = [(float(p) * inv_mult, float(q) * scale_qty) for p, q in raw_bids]
+                asks = [(float(p) * inv_mult, float(q) * scale_qty) for p, q in raw_asks]
             else:
                 bids = [(float(p), float(q)) for p, q in raw_bids]
                 asks = [(float(p), float(q)) for p, q in raw_asks]

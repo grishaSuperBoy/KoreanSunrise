@@ -1,14 +1,18 @@
 """
 web/server.py - Built-in HTTP Server and API for Korean Sunrise Intelligence Hub.
-Provides live monitoring, reporting hub, threshold calibration, and 1-click dataset export.
+Provides live monitoring, reporting hub, threshold calibration, 1-click dataset export,
+and hardened security (zero-token URL leaks, SameSite HttpOnly cookies, and anti-CSRF protection).
 """
 from __future__ import annotations
 
 import datetime
+import hashlib
+import hmac
 import http.server
 import json
 import logging
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -17,7 +21,7 @@ import threading
 import time
 import urllib.parse
 import zipfile
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from web.reports_manager import list_available_reports, get_report_content
 from web.views import render_dashboard_html, render_login_html
@@ -42,9 +46,48 @@ class APIServer:
         self.host = host
         self.port = port
         self.token = token
+        self._csrf_secret: str = secrets.token_hex(16)
         self._server: Optional[http.server.ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._running = False
+
+        # In-memory mtime cache for matrix thresholds to avoid synchronous disk I/O on active dashboard
+        self._cached_thresholds: Dict[str, Any] = {}
+        self._thresholds_mtime: float = 0.0
+        self._thresholds_lock = threading.Lock()
+
+    def get_thresholds_doc(self) -> Dict[str, Any]:
+        """Returns cached matrix thresholds document, reloading from disk only when mtime changes."""
+        th_file = os.path.join(PROJECT_ROOT, "matrix_thresholds.json")
+        try:
+            if not os.path.isfile(th_file):
+                return {}
+            mtime = os.path.getmtime(th_file)
+            with self._thresholds_lock:
+                if mtime != self._thresholds_mtime or not self._cached_thresholds:
+                    with open(th_file, "r", encoding="utf-8") as tf:
+                        self._cached_thresholds = json.load(tf)
+                    self._thresholds_mtime = mtime
+                return self._cached_thresholds
+        except Exception as e:
+            log.warning(f"[api_server] Error reading thresholds: {e}")
+            with self._thresholds_lock:
+                return self._cached_thresholds or {}
+
+    def get_csrf_token(self, token: Optional[str] = None) -> str:
+        """Derives a cryptographically secure anti-CSRF token bound to the server session and token."""
+        tok = token or self.token
+        if not tok:
+            return ""
+        key = f"{tok}:{self._csrf_secret}".encode("utf-8")
+        return hmac.new(key, b"korean_sunrise_csrf_v1", hashlib.sha256).hexdigest()[:32]
+
+    def verify_csrf_token(self, candidate: str) -> bool:
+        """Validates candidate anti-CSRF token using timing-safe comparison."""
+        if not candidate or not self.token:
+            return False
+        expected = self.get_csrf_token()
+        return hmac.compare_digest(candidate, expected)
 
     def start(self) -> None:
         if self._running:
@@ -56,38 +99,73 @@ class APIServer:
             def log_message(self, format: str, *args: Any) -> None:
                 log.debug(f"[api] {self.address_string()} - {format % args}")
 
-            def _get_token(self, q: Dict[str, List[str]]) -> str:
-                if "token" in q and q["token"]:
-                    return q["token"][0]
+            def _get_auth_info(self) -> Tuple[str, str]:
+                """
+                Extracts authentication credentials and identifies the source ('header' or 'cookie').
+                Query parameter (?token=...) authentication is strictly rejected to prevent secret
+                leakage into web server access logs, reverse proxy logs, and browser history.
+                """
                 auth_hdr = self.headers.get("Authorization", "")
                 if auth_hdr.startswith("Bearer "):
-                    return auth_hdr.split(" ", 1)[1].strip()
+                    return auth_hdr.split(" ", 1)[1].strip(), "header"
                 if "X-Token" in self.headers:
-                    return self.headers["X-Token"].strip()
+                    return self.headers["X-Token"].strip(), "header"
                 cookies = self.headers.get("Cookie", "")
                 for part in cookies.split(";"):
                     if "=" in part:
                         k, v = part.strip().split("=", 1)
                         if k == "token":
-                            return v
-                return ""
+                            return v.strip(), "cookie"
+                return "", ""
 
-            def _is_authenticated(self, q: Dict[str, List[str]]) -> bool:
+            def _is_authenticated(self) -> bool:
                 if not server_ref.token:
                     return True
-                return self._get_token(q) == server_ref.token
+                tok, _ = self._get_auth_info()
+                return bool(tok) and hmac.compare_digest(tok, server_ref.token)
+
+            def _validate_csrf(self, body_bytes: bytes) -> bool:
+                """
+                Validates anti-CSRF tokens for state-changing requests originating from cookie sessions.
+                Checks X-CSRF-Token / X-CSRFToken header first, then inspects body payload.
+                """
+                header_csrf = self.headers.get("X-CSRF-Token") or self.headers.get("X-CSRFToken")
+                if header_csrf and server_ref.verify_csrf_token(header_csrf.strip()):
+                    return True
+
+                if body_bytes:
+                    content_type = self.headers.get("Content-Type", "")
+                    if "application/x-www-form-urlencoded" in content_type:
+                        try:
+                            form = urllib.parse.parse_qs(body_bytes.decode("utf-8", errors="replace"))
+                            cand = form.get("csrf_token", [""])[0]
+                            if cand and server_ref.verify_csrf_token(cand):
+                                return True
+                        except Exception:
+                            pass
+                    elif "application/json" in content_type:
+                        try:
+                            payload = json.loads(body_bytes.decode("utf-8", errors="replace"))
+                            if isinstance(payload, dict):
+                                cand = payload.get("csrf_token", "")
+                                if cand and server_ref.verify_csrf_token(str(cand)):
+                                    return True
+                        except Exception:
+                            pass
+
+                return False
 
             def do_GET(self) -> None:
                 parsed = urllib.parse.urlparse(self.path)
                 path = parsed.path.rstrip("/") or "/"
                 q = urllib.parse.parse_qs(parsed.query)
-                is_auth = self._is_authenticated(q)
+                is_auth = self._is_authenticated()
 
                 if path in ("/", "/dashboard", "/status"):
                     if not is_auth:
                         self._send_login()
                     else:
-                        self._handle_dashboard(q)
+                        self._handle_dashboard()
                 elif not is_auth:
                     self._send_unauthorized()
                 elif path == "/stats":
@@ -112,31 +190,128 @@ class APIServer:
             def do_POST(self) -> None:
                 parsed = urllib.parse.urlparse(self.path)
                 path = parsed.path.rstrip("/") or "/"
-                q = urllib.parse.parse_qs(parsed.query)
 
-                if not self._is_authenticated(q):
+                length = int(self.headers.get("Content-Length", 0))
+                body_bytes = self.rfile.read(length) if length > 0 else b""
+
+                # 1. Public Authentication Route
+                if path == "/login":
+                    self._handle_login(body_bytes)
+                    return
+
+                # 2. General Authentication Check
+                tok, auth_source = self._get_auth_info()
+                if not tok or not hmac.compare_digest(tok, server_ref.token):
                     self._send_unauthorized()
                     return
 
-                if path == "/api/report/generate":
+                # 3. Anti-CSRF Verification for Browser/Cookie Sessions
+                # Requests authenticated via custom headers (Bearer/X-Token) are exempt as
+                # browsers cannot forge custom cross-origin headers without CORS preflight.
+                if auth_source == "cookie":
+                    if not self._validate_csrf(body_bytes):
+                        self._send_forbidden("CSRF validation failed: missing or invalid anti-CSRF token")
+                        return
+
+                # 4. State-Changing Protected Routes
+                if path == "/logout":
+                    self._handle_logout()
+                elif path == "/api/report/generate":
                     self._handle_generate_report()
                 elif path == "/api/thresholds/calibrate":
                     self._handle_calibrate_thresholds()
                 elif path == "/api/daily-pipeline":
                     self._handle_trigger_pipeline()
                 elif path in ("/pool/pause", "/pool/resume"):
-                    self._handle_pool_toggle(path)
+                    self._handle_pool_toggle(path, body_bytes)
                 else:
                     self._send_404()
 
             # Handlers
-            def _send_login(self) -> None:
-                html_body = render_login_html()
-                self._send_html(html_body, code=200)
+            def _send_login(self, error: Optional[str] = None) -> None:
+                html_body = render_login_html(error=error)
+                self._send_html(html_body, code=200 if not error else 401)
 
-            def _handle_dashboard(self, q: Dict[str, List[str]]) -> None:
-                tok = self._get_token(q) or server_ref.token
-                cookie_hdr = f"token={tok}; Path=/; HttpOnly; SameSite=Strict"
+            def _handle_login(self, body_bytes: bytes) -> None:
+                content_type = self.headers.get("Content-Type", "")
+                submitted_token = ""
+                is_form = False
+
+                if "application/json" in content_type:
+                    try:
+                        payload = json.loads(body_bytes.decode("utf-8", errors="replace"))
+                        submitted_token = payload.get("token", "")
+                    except Exception:
+                        pass
+                elif "application/x-www-form-urlencoded" in content_type:
+                    is_form = True
+                    try:
+                        form = urllib.parse.parse_qs(body_bytes.decode("utf-8", errors="replace"))
+                        submitted_token = form.get("token", [""])[0]
+                    except Exception:
+                        pass
+                else:
+                    body_text = body_bytes.decode("utf-8", errors="replace").strip()
+                    if body_text.startswith("token="):
+                        is_form = True
+                        form = urllib.parse.parse_qs(body_text)
+                        submitted_token = form.get("token", [""])[0]
+                    else:
+                        submitted_token = body_text
+
+                if not server_ref.token or hmac.compare_digest(submitted_token, server_ref.token):
+                    csrf_tok = server_ref.get_csrf_token(server_ref.token)
+                    cookie_tok = f"token={server_ref.token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400"
+                    cookie_csrf = f"csrf_token={csrf_tok}; Path=/; SameSite=Strict; Max-Age=86400"
+
+                    if is_form or "text/html" in self.headers.get("Accept", ""):
+                        self.send_response(303)
+                        self.send_header("Location", "/dashboard")
+                        self.send_header("Set-Cookie", cookie_tok)
+                        self.send_header("Set-Cookie", cookie_csrf)
+                        self.end_headers()
+                    else:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Set-Cookie", cookie_tok)
+                        self.send_header("Set-Cookie", cookie_csrf)
+                        b = json.dumps({"ok": True, "csrf_token": csrf_tok}).encode("utf-8")
+                        self.send_header("Content-Length", str(len(b)))
+                        self.end_headers()
+                        self.wfile.write(b)
+                else:
+                    if is_form or "text/html" in self.headers.get("Accept", ""):
+                        self._send_login(error="Неверный ключ авторизации")
+                    else:
+                        self._send_json({"ok": False, "error": "Invalid authentication token"}, code=401)
+
+            def _handle_logout(self) -> None:
+                cookie_clear_tok = "token=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"
+                cookie_clear_csrf = "csrf_token=; Path=/; Max-Age=0; SameSite=Strict"
+
+                if "text/html" in self.headers.get("Accept", "") or "application/x-www-form-urlencoded" in self.headers.get("Content-Type", ""):
+                    self.send_response(303)
+                    self.send_header("Location", "/")
+                    self.send_header("Set-Cookie", cookie_clear_tok)
+                    self.send_header("Set-Cookie", cookie_clear_csrf)
+                    self.end_headers()
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Set-Cookie", cookie_clear_tok)
+                    self.send_header("Set-Cookie", cookie_clear_csrf)
+                    b = json.dumps({"ok": True, "message": "Logged out successfully"}).encode("utf-8")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+
+            def _handle_dashboard(self) -> None:
+                tok, _ = self._get_auth_info()
+                effective_tok = tok or server_ref.token
+                csrf_tok = server_ref.get_csrf_token(effective_tok)
+
+                cookie_tok_hdr = f"token={effective_tok}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400"
+                cookie_csrf_hdr = f"csrf_token={csrf_tok}; Path=/; SameSite=Strict; Max-Age=86400"
 
                 # Collect live status
                 status = {}
@@ -154,14 +329,7 @@ class APIServer:
                 if hasattr(server_ref.service, "profile_manager") and server_ref.service.profile_manager:
                     profile = server_ref.service.profile_manager.get_profile()
 
-                th_file = os.path.join(PROJECT_ROOT, "matrix_thresholds.json")
-                if os.path.exists(th_file):
-                    try:
-                        with open(th_file, "r", encoding="utf-8") as tf:
-                            thresholds = json.load(tf)
-                    except Exception:
-                        pass
-
+                thresholds = server_ref.get_thresholds_doc()
                 cards = list_available_reports()
                 html_body = render_dashboard_html(
                     service_status=status,
@@ -169,11 +337,12 @@ class APIServer:
                     profile_data=profile,
                     thresholds_doc=thresholds,
                     reports_cards=cards,
-                    auth_token=tok,
+                    csrf_token=csrf_tok,
                 )
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Set-Cookie", cookie_hdr)
+                self.send_header("Set-Cookie", cookie_tok_hdr)
+                self.send_header("Set-Cookie", cookie_csrf_hdr)
                 self.end_headers()
                 self.wfile.write(html_body.encode("utf-8"))
 
@@ -203,16 +372,7 @@ class APIServer:
                     self._send_json({})
 
             def _handle_thresholds(self) -> None:
-                th_file = os.path.join(PROJECT_ROOT, "matrix_thresholds.json")
-                if os.path.exists(th_file):
-                    try:
-                        with open(th_file, "r", encoding="utf-8") as tf:
-                            self._send_json(json.load(tf))
-                            return
-                    except Exception as e:
-                        self._send_json({"error": str(e)}, code=500)
-                        return
-                self._send_json({"thresholds": {}})
+                self._send_json(server_ref.get_thresholds_doc())
 
             def _handle_reports_list(self) -> None:
                 self._send_json(list_available_reports())
@@ -248,12 +408,13 @@ class APIServer:
                 subprocess.Popen(cmd)
                 self._send_json({"ok": True, "message": "Master 24h pipeline started in background"})
 
-            def _handle_pool_toggle(self, path: str) -> None:
-                length = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(length).decode("utf-8")
+            def _handle_pool_toggle(self, path: str, body_bytes: bytes) -> None:
                 try:
-                    payload = json.loads(body)
+                    payload = json.loads(body_bytes.decode("utf-8", errors="replace")) if body_bytes else {}
                     coin = payload.get("coin", "").upper()
+                    if not coin:
+                        self._send_json({"error": "Missing coin parameter"}, code=400)
+                        return
                     if hasattr(server_ref.service, "pool_state") and server_ref.service.pool_state:
                         if path == "/pool/pause":
                             server_ref.service.pool_state.pause_coin(coin)
@@ -343,7 +504,10 @@ class APIServer:
                 self.wfile.write(b)
 
             def _send_unauthorized(self) -> None:
-                self._send_json({"error": "Unauthorized. Provide valid ?token= or Bearer token"}, code=401)
+                self._send_json({"error": "Unauthorized. Provide Authorization header or session cookie"}, code=401)
+
+            def _send_forbidden(self, msg: str = "Forbidden") -> None:
+                self._send_json({"error": msg}, code=403)
 
             def _send_404(self) -> None:
                 self._send_json({"error": "Not Found"}, code=404)

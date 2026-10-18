@@ -144,6 +144,16 @@ class OKXStream(BaseCEXStream):
             inst_id = arg.get("instId", "").upper()
             if not inst_id:
                 return
+
+            seq_id = int(book_data.get("seqId") or 0)
+            if seq_id > 0:
+                last_seq = self._last_seq.get(inst_id)
+                if last_seq is not None:
+                    if seq_id <= last_seq:
+                        self.seq_duplicates += 1
+                        return
+                self._last_seq[inst_id] = seq_id
+
             sym, mult = self._resolve_coin_and_mult(inst_id)
             contract_size = self._get_contract_size(inst_id)
             bids = self._extract_levels(book_data.get("bids") or book_data.get("b"), 5, mult=mult, contract_size=contract_size)

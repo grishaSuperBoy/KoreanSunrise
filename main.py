@@ -57,6 +57,7 @@ class KoreanSunriseService:
             roundtrip_fee_bps=C.ROUNDTRIP_FEE_BPS,
             warmup_samples=C.MIN_WARMUP_SAMPLES,
             max_hold_sec=C.MAX_SIGNAL_HOLD_SEC,
+            require_trade_confirmation=True,
             pool_state=self.pool_state,
             profile_manager=self.profile_manager,
         )
@@ -73,6 +74,36 @@ class KoreanSunriseService:
         self.running = False
         self._shutdown_event = asyncio.Event()
 
+    @staticmethod
+    def _parse_universe_doc(doc: Dict[str, Any]) -> C.MatchedUniverse:
+        coins = doc.get("coins", [])
+        upbit_krw_to_coin = doc.get("upbit_krw_to_coin", {})
+        venue_sym_maps: Dict[str, Dict[str, Tuple[str, float, float]]] = {}
+        for k, v in doc.items():
+            if k.endswith("_sym_map") and isinstance(v, dict):
+                v_name = k.replace("_sym_map", "").lower()
+                venue_sym_maps[v_name] = {
+                    raw_sym: (
+                        str(tup[0]),
+                        float(tup[1]),
+                        float(tup[2]) if len(tup) >= 3 else 1.0,
+                    )
+                    for raw_sym, tup in v.items()
+                }
+
+        binance_sym_map = {k: (v[0], v[1]) for k, v in venue_sym_maps.get("binance", {}).items()}
+        bybit_sym_map = {k: (v[0], v[1]) for k, v in venue_sym_maps.get("bybit", {}).items()}
+
+        univ = C.MatchedUniverse(
+            coins=coins,
+            upbit_krw_to_coin=upbit_krw_to_coin,
+            venue_sym_maps=venue_sym_maps,
+            binance_sym_map=binance_sym_map,
+            bybit_sym_map=bybit_sym_map,
+        )
+        univ._raw_doc = doc
+        return univ
+
     async def run(self) -> None:
         self.running = True
         if self.api_server:
@@ -83,18 +114,8 @@ class KoreanSunriseService:
             try:
                 with open(univ_file, "r", encoding="utf-8") as f:
                     doc = json.load(f)
-                coins = doc.get("coins", [])
-                upbit_krw_to_coin = doc.get("upbit_krw_to_coin", {})
-                binance_sym_map = {k: tuple(v) for k, v in doc.get("binance_sym_map", {}).items()}
-                bybit_sym_map = {k: tuple(v) for k, v in doc.get("bybit_sym_map", {}).items()}
-                self.universe = C.MatchedUniverse(
-                    coins=coins,
-                    upbit_krw_to_coin=upbit_krw_to_coin,
-                    binance_sym_map=binance_sym_map,
-                    bybit_sym_map=bybit_sym_map,
-                )
-                self.universe._raw_doc = doc
-                log.info(f"=== Loaded {len(coins)} incubator coins from universe_live.json ===")
+                self.universe = self._parse_universe_doc(doc)
+                log.info(f"=== Loaded {len(self.universe.coins)} incubator coins across {len(self.universe.venue_sym_maps)} venues from universe_live.json ===")
             except Exception as e:
                 log.warning(f"Could not parse universe_live.json: {e}")
                 self.universe = None
@@ -104,17 +125,7 @@ class KoreanSunriseService:
             from screening.screener import UniverseScreener
             screener = UniverseScreener(output_file=univ_file)
             doc = await asyncio.to_thread(screener.run)
-            coins = doc.get("coins", [])
-            upbit_krw_to_coin = doc.get("upbit_krw_to_coin", {})
-            binance_sym_map = {k: tuple(v) for k, v in doc.get("binance_sym_map", {}).items()}
-            bybit_sym_map = {k: tuple(v) for k, v in doc.get("bybit_sym_map", {}).items()}
-            self.universe = C.MatchedUniverse(
-                coins=coins,
-                upbit_krw_to_coin=upbit_krw_to_coin,
-                binance_sym_map=binance_sym_map,
-                bybit_sym_map=bybit_sym_map,
-            )
-            self.universe._raw_doc = doc
+            self.universe = self._parse_universe_doc(doc)
 
         self.pool_state.reload()
 
@@ -126,17 +137,23 @@ class KoreanSunriseService:
         self.stream_manager = StreamManager(
             universe=self.universe,
             callback=self.engine.on_book_update,
+            trade_callback=self.engine.on_upbit_trade,
             active_venues=active_venues,
         )
         await self.stream_manager.start_all()
 
         last_heartbeat = time.time()
+        last_reload = time.time()
 
         try:
             while not self._shutdown_event.is_set():
                 now = time.time()
                 self.engine.sweep_timeouts(now)
                 await asyncio.to_thread(self.writer.maybe_flush, now)
+
+                if now - last_reload >= 30.0:
+                    last_reload = now
+                    await asyncio.to_thread(self.engine.maybe_reload_thresholds, now)
 
                 if now - last_heartbeat >= 15.0:
                     self._log_heartbeat()
@@ -172,7 +189,8 @@ class KoreanSunriseService:
         log.info(
             f"[HEARTBEAT] KRW/USDT: {krw_rate:.1f} | "
             f"Pool: Inc {summary['incubator']} | Battle {summary['battle']} (Active: {summary['battle_active']}) | "
-            f"Ticks: Up {c['ticks_upbit']} / Foll {c['ticks_followers']} | "
+            f"Ticks: Up {c['ticks_upbit']} (Trades: {c.get('trades_upbit', 0)}) / Foll {c['ticks_followers']} | "
+            f"Cancels Blocked: {c.get('cancels_blocked', 0)} | "
             f"Sigs: {c['signals_triggered']} (⚔️Battle: {c.get('signals_battle', 0)}, 🧪Inc: {c.get('signals_incubator', 0)}) | "
             f"Streams: [{conn_str}]"
         )

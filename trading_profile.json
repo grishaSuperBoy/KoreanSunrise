@@ -13,7 +13,9 @@
       "kucoin": 100.0,
       "bingx": 100.0,
       "htx": 100.0,
-      "pionex": 100.0
+      "pionex": 100.0,
+      "asterdex": 100.0,
+      "hyperliquid": 100.0
     },
     "reserve_margin_frac": 0.2
   },
@@ -26,7 +28,9 @@
     "kucoin",
     "bingx",
     "htx",
-    "pionex"
+    "pionex",
+    "asterdex",
+    "hyperliquid"
   ],
   "max_active_slots": 5,
   "min_order_usd": 10.0,

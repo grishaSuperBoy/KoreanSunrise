@@ -84,6 +84,66 @@ class OrderBookDepth5:
             return round(self.ts * 1000.0 - float(self.exchange_ts), 1)
         return 0.0
 
+    def vwap_ask_usd(self, notional_usd: float) -> float:
+        """
+        Calculates the VWAP execution fill price for buying notional_usd across available ask levels.
+        If notional exceeds available book depth, the remaining portion is filled at the worst available ask price.
+        """
+        if not self.asks or notional_usd <= 0:
+            return self.best_ask
+        remaining = notional_usd
+        total_qty = 0.0
+        filled_usd = 0.0
+        for p, q in self.asks:
+            level_usd = p * q
+            if level_usd <= 0:
+                continue
+            if remaining <= level_usd:
+                total_qty += remaining / p
+                filled_usd += remaining
+                remaining = 0.0
+                break
+            else:
+                total_qty += q
+                filled_usd += level_usd
+                remaining -= level_usd
+        if remaining > 0 and self.asks:
+            worst_p = self.asks[-1][0]
+            if worst_p > 0:
+                total_qty += remaining / worst_p
+                filled_usd += remaining
+        return (filled_usd / total_qty) if total_qty > 0 else self.best_ask
+
+    def vwap_bid_usd(self, notional_usd: float) -> float:
+        """
+        Calculates the VWAP execution fill price for selling notional_usd across available bid levels.
+        If notional exceeds available book depth, the remaining portion is filled at the worst available bid price.
+        """
+        if not self.bids or notional_usd <= 0:
+            return self.best_bid
+        remaining = notional_usd
+        total_qty = 0.0
+        filled_usd = 0.0
+        for p, q in self.bids:
+            level_usd = p * q
+            if level_usd <= 0:
+                continue
+            if remaining <= level_usd:
+                total_qty += remaining / p
+                filled_usd += remaining
+                remaining = 0.0
+                break
+            else:
+                total_qty += q
+                filled_usd += level_usd
+                remaining -= level_usd
+        if remaining > 0 and self.bids:
+            worst_p = self.bids[-1][0]
+            if worst_p > 0:
+                total_qty += remaining / worst_p
+                filled_usd += remaining
+        return (filled_usd / total_qty) if total_qty > 0 else self.best_bid
+
 
 @dataclass
 class SunriseSignal:
@@ -130,8 +190,11 @@ class SunriseSignal:
     follower_latency_ms: float
     follower_book_age_ms: float
 
-    # Sizing
+    # Sizing & Physical Capacity
     suggested_size_usd: float
+    stealth_capacity_usd: float = 0.0
+    follower_entry_px: float = 0.0
+    leader_recent_buys_usd: float = 0.0
 
     # Pool routing
     basket: str = "incubator"

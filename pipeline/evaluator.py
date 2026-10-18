@@ -65,7 +65,7 @@ class CoinSignalAccumulator:
     """Accumulates verified trading statistics for a single coin across signals."""
     __slots__ = (
         "coin", "venues", "net_pnls", "mfes", "t_peaks",
-        "top3_depths", "valid_sweeps", "total_signals",
+        "top3_depths", "stealth_caps", "valid_sweeps", "total_signals",
     )
 
     def __init__(self, coin: str) -> None:
@@ -75,6 +75,7 @@ class CoinSignalAccumulator:
         self.mfes: List[float] = []
         self.t_peaks: List[float] = []
         self.top3_depths: List[float] = []
+        self.stealth_caps: List[float] = []
         self.valid_sweeps: int = 0
         self.total_signals: int = 0
 
@@ -97,6 +98,10 @@ class CoinSignalAccumulator:
         f_top3_ask = float(row.get("follower_top3_ask_usd", 0.0))
         cross_ratio = (swept_usd / f_top3_ask) if f_top3_ask > 0 else 0.0
 
+        stealth_cap = float(row.get("stealth_capacity_usd", 0.0))
+        if stealth_cap <= 0.0 and f_top3_ask > 0.0:
+            stealth_cap = round(0.15 * f_top3_ask, 2)
+
         # Discard microscopic noise where Upbit sweep was insignificant vs follower
         if drain_ratio < 0.40 and cross_ratio < 0.50:
             return
@@ -115,6 +120,7 @@ class CoinSignalAccumulator:
 
         if f_top3_ask > 0:
             self.top3_depths.append(f_top3_ask)
+            self.stealth_caps.append(stealth_cap)
 
     def finalize(self) -> Optional[Dict[str, Any]]:
         n = len(self.net_pnls)
@@ -132,6 +138,7 @@ class CoinSignalAccumulator:
         mean_pnl = statistics.mean(self.net_pnls)
         median_pnl = statistics.median(self.net_pnls)
         median_depth = statistics.median(self.top3_depths) if self.top3_depths else 0.0
+        median_stealth_cap = statistics.median(self.stealth_caps) if self.stealth_caps else 0.0
         mean_mfe = statistics.mean(self.mfes) if self.mfes else 0.0
         med_t_peak = statistics.median(self.t_peaks) if self.t_peaks else 0.0
 
@@ -145,6 +152,7 @@ class CoinSignalAccumulator:
             "win_rate_pct": round(win_rate, 1),
             "profit_factor": round(profit_factor, 2),
             "top3_depth_usd": round(median_depth, 1),
+            "stealth_capacity_usd": round(median_stealth_cap, 1),
             "mean_mfe_bps": round(mean_mfe, 2),
             "median_t_peak_sec": round(med_t_peak, 2),
             # Rank score = Expected Edge * Statistical Confidence
@@ -234,7 +242,8 @@ class SunriseEvaluator:
             log.info(
                 f"  #{i:2d} {q['coin']:<10} | Exp: {q['mean_net_pnl_bps']:>+6.2f} bps | "
                 f"PF: {q['profit_factor']:>4.2f} | Win: {q['win_rate_pct']:>4.1f}% | "
-                f"N={q['event_count']} | Depth: ${q['top3_depth_usd']:>6.0f} | MFE: +{q['mean_mfe_bps']:.1f} bps"
+                f"N={q['event_count']} | Depth: ${q['top3_depth_usd']:>6.0f} | "
+                f"Cap15%: ${q['stealth_capacity_usd']:>5.0f} | MFE: +{q['mean_mfe_bps']:.1f} bps"
             )
 
         if not dry_run:

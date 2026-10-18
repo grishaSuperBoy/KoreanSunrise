@@ -10,12 +10,13 @@ from typing import Any, Callable, Dict, List, Optional
 
 from config import MatchedUniverse
 from models import OrderBookDepth5
-from venues.base import BaseVenueStream
+from venues.asterdex import AsterdexStream
 from venues.bingx import BingXStream
 from venues.binance import BinanceFuturesStream
 from venues.bybit import BybitPerpStream
 from venues.gateio import GateioStream
 from venues.htx import HTXStream
+from venues.hyperliquid import HyperliquidStream
 from venues.kucoin import KucoinStream
 from venues.mexc import MEXCStream
 from venues.okx import OKXStream
@@ -32,28 +33,38 @@ class StreamManager:
         self,
         universe: MatchedUniverse,
         callback: Callable[[OrderBookDepth5], None],
+        trade_callback: Optional[Callable[[str, float, bool, float], None]] = None,
         active_venues: Optional[List[str]] = None,
     ):
         self.universe = universe
         self.callback = callback
+        self.trade_callback = trade_callback
         self.streams: Dict[str, BaseVenueStream] = {}
 
         # 1. Leader stream: Upbit (Spot KRW)
         if universe.upbit_krw_to_coin:
-            self.streams["upbit"] = UpbitSpotStream(universe.upbit_krw_to_coin, callback)
+            self.streams["upbit"] = UpbitSpotStream(
+                universe.upbit_krw_to_coin,
+                callback=callback,
+                trade_callback=trade_callback,
+            )
 
         # 2. Dynamic Follower streams
         allowed_venues = [v.lower() for v in active_venues] if active_venues else None
 
         # Binance
-        if universe.binance_sym_map and (allowed_venues is None or "binance" in allowed_venues):
-            self.streams["binance"] = BinanceFuturesStream(universe.binance_sym_map, callback)
+        if allowed_venues is None or "binance" in allowed_venues:
+            b_map = universe.get_sym_map("binance") or universe.binance_sym_map
+            if b_map:
+                self.streams["binance"] = BinanceFuturesStream(b_map, callback)
 
         # Bybit
-        if universe.bybit_sym_map and (allowed_venues is None or "bybit" in allowed_venues):
-            self.streams["bybit"] = BybitPerpStream(universe.bybit_sym_map, callback)
+        if allowed_venues is None or "bybit" in allowed_venues:
+            by_map = universe.get_sym_map("bybit") or universe.bybit_sym_map
+            if by_map:
+                self.streams["bybit"] = BybitPerpStream(by_map, callback)
 
-        # Map of additional CEX stream classes that take (symbols, callback)
+        # Map of additional follower stream classes that take (symbols, callback)
         cex_classes = {
             "okx": OKXStream,
             "gateio": GateioStream,
@@ -62,6 +73,8 @@ class StreamManager:
             "bingx": BingXStream,
             "htx": HTXStream,
             "pionex": PionexStream,
+            "asterdex": AsterdexStream,
+            "hyperliquid": HyperliquidStream,
         }
 
         # Check universe for other venue sym maps
@@ -70,10 +83,13 @@ class StreamManager:
             if allowed_venues is not None and v_name not in allowed_venues:
                 continue
 
-            v_sym_map = raw_doc.get(f"{v_name}_sym_map", {})
+            v_sym_map = universe.get_sym_map(v_name)
+            if not v_sym_map:
+                v_sym_map = raw_doc.get(f"{v_name}_sym_map", {})
+
             if v_sym_map:
                 norm_map = {
-                    k: (v[0], float(v[1]), float(v[2])) if len(v) >= 3 else (v[0], float(v[1]))
+                    k: (v[0], float(v[1]), float(v[2])) if len(v) >= 3 else (v[0], float(v[1]), 1.0)
                     for k, v in v_sym_map.items()
                 }
                 try:
@@ -126,6 +142,8 @@ class StreamManager:
                 "symbols_seen": len(s.symbols_seen),
                 "subscribed": len(s.subscribed),
                 "books_dropped": s.books_dropped,
+                "seq_gaps": getattr(s, "seq_gaps", 0),
+                "seq_duplicates": getattr(s, "seq_duplicates", 0),
             }
             if isinstance(s, UpbitSpotStream):
                 info["usdt_krw_rate"] = round(s.usdt_krw_rate, 2) if s.rate_ready else 0.0

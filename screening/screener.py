@@ -16,12 +16,14 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from config import EXCLUDED_COINS, TICKER_ALIASES
 from screening.metrics import evaluate_pair_klines
-from venues.base import create_http_session, normalize_symbol
+from venues.base import create_http_session
+from venues.asterdex import AsterdexRestClient
 from venues.bingx import BingXRestClient
 from venues.binance import BinanceRestClient
 from venues.bybit import BybitRestClient
 from venues.gateio import GateioRestClient
 from venues.htx import HTXRestClient
+from venues.hyperliquid import HyperliquidRestClient
 from venues.kucoin import KucoinRestClient
 from venues.mexc import MEXCRestClient
 from venues.okx import OKXRestClient
@@ -39,7 +41,7 @@ DEFAULT_MAX_PRICE_DIFF_PCT = 15.0       # Max 15% price diff (eliminates namesak
 DEFAULT_MIN_CORR = 0.65                 # Min correlation of minute log-returns
 DEFAULT_MIN_BOTH_TRADE = 0.15           # Min 15% of minutes traded on both sides
 DEFAULT_MIN_DEV_BPS = 8.0               # Min 8.0 bps P90 spread volatility
-DEFAULT_KLINE_LIMIT = 200               # 200 1-minute candles (~3.3h, uniform across all 10 CEXs without rate-limit pagination)
+DEFAULT_KLINE_LIMIT = 200               # 200 1-minute candles (~3.3h, uniform across all follower venues)
 
 CLIENT_FACTORIES: Dict[str, Any] = {
     "binance": BinanceRestClient,
@@ -51,6 +53,8 @@ CLIENT_FACTORIES: Dict[str, Any] = {
     "bingx": BingXRestClient,
     "htx": HTXRestClient,
     "pionex": PionexRestClient,
+    "asterdex": AsterdexRestClient,
+    "hyperliquid": HyperliquidRestClient,
 }
 
 
@@ -63,6 +67,7 @@ class UniverseScreener:
     def __init__(
         self,
         venues: Optional[List[str]] = None,
+        coins: Optional[List[str]] = None,
         min_vol_usd: float = DEFAULT_MIN_VOL_USD,
         max_price_diff_pct: float = DEFAULT_MAX_PRICE_DIFF_PCT,
         min_corr: float = DEFAULT_MIN_CORR,
@@ -73,6 +78,7 @@ class UniverseScreener:
         max_workers: int = 10,
     ) -> None:
         self.target_venues = [v.lower() for v in (venues or list(CLIENT_FACTORIES.keys())) if v.lower() in CLIENT_FACTORIES]
+        self.target_coins = [c.upper() for c in coins] if coins else None
         self.min_vol_usd = min_vol_usd
         self.max_price_diff_pct = max_price_diff_pct
         self.min_corr = min_corr
@@ -143,6 +149,8 @@ class UniverseScreener:
         rejected_volume = 0
 
         for coin, mkt_code in up_mkts.items():
+            if self.target_coins and coin not in self.target_coins:
+                continue
             if coin in EXCLUDED_COINS:
                 continue
 

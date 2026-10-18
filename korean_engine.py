@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import asdict
@@ -131,6 +132,8 @@ class KoreanEngine:
         roundtrip_fee_bps: float = C.ROUNDTRIP_FEE_BPS,
         warmup_samples: int = C.MIN_WARMUP_SAMPLES,
         max_hold_sec: float = C.MAX_SIGNAL_HOLD_SEC,
+        max_follower_book_age_sec: float = getattr(C, "MAX_FOLLOWER_BOOK_AGE_SEC", 0.30),
+        require_trade_confirmation: bool = False,
         pool_state: Any = None,
         profile_manager: Any = None,
         thresholds_file: Optional[str] = None,
@@ -145,12 +148,19 @@ class KoreanEngine:
         self.roundtrip_fee_bps = roundtrip_fee_bps
         self.warmup_samples = warmup_samples
         self.max_hold_sec = max_hold_sec
+        self.max_follower_book_age_sec = max_follower_book_age_sec
+        self.require_trade_confirmation = require_trade_confirmation
         self.pool_state = pool_state
         self.profile_manager = profile_manager
 
         # (exchange, coin) -> OrderBookDepth5
         self._books: Dict[Tuple[str, str], OrderBookDepth5] = {}
         self._recv_ts: Dict[Tuple[str, str], float] = {}
+
+        # Upbit recent taker buys: coin -> deque of (ts, trade_usd)
+        self._buys_lock = threading.Lock()
+        self._upbit_recent_buys: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=200))
+        self._has_upbit_trades: Dict[str, bool] = defaultdict(bool)
 
         # Upbit normalisation state per coin:
         # coin -> {"depth_ask": float, "best_ask_usd": float, "spread_bps": float, "t": float}
@@ -167,6 +177,8 @@ class KoreanEngine:
         self.counters = {
             "ticks_upbit": 0,
             "ticks_followers": 0,
+            "trades_upbit": 0,
+            "cancels_blocked": 0,
             "signals_triggered": 0,
             "signals_battle": 0,
             "signals_incubator": 0,
@@ -237,7 +249,6 @@ class KoreanEngine:
 
     def on_book_update(self, snap: OrderBookDepth5) -> None:
         now = time.time()
-        self.maybe_reload_thresholds(now)
         ex = snap.exchange.lower()
         coin = snap.symbol.upper()
         key = (ex, coin)
@@ -262,6 +273,36 @@ class KoreanEngine:
                         st.learn(raw_diff_bps, now)
 
             self._track_follower_move(coin, ex, snap, now)
+
+    def on_upbit_trade(self, coin: str, trade_usd: float, is_taker_buy: bool, ts: float) -> None:
+        """
+        Real-time trade stream ingestion from Upbit.
+        Records taker buys to verify liquidity sweeps and reject MM quote cancellations.
+        Thread-safe across concurrent WebSocket worker threads.
+        """
+        c = coin.upper()
+        with self._buys_lock:
+            self.counters["trades_upbit"] = self.counters.get("trades_upbit", 0) + 1
+            self._has_upbit_trades[c] = True
+            if is_taker_buy and trade_usd > 0.0:
+                self._upbit_recent_buys[c].append((ts, trade_usd))
+
+    def get_recent_upbit_buys(self, coin: str, cutoff: float) -> Tuple[float, bool]:
+        """
+        Thread-safe retrieval and pruning of recent taker buys for a coin.
+        Returns (recent_buys_usd, has_trades).
+        Prevents race conditions (IndexError / deque mutation during iteration).
+        """
+        c = coin.upper()
+        with self._buys_lock:
+            buys_deque = self._upbit_recent_buys.get(c)
+            recent_buys_usd = 0.0
+            if buys_deque:
+                while buys_deque and buys_deque[0][0] < cutoff:
+                    buys_deque.popleft()
+                recent_buys_usd = sum(b[1] for b in buys_deque)
+            has_trades = self._has_upbit_trades.get(c, False)
+            return recent_buys_usd, has_trades
 
     # ----------------------------------------------------------- Upbit Norm
     def _update_upbit_norm(self, coin: str, snap: OrderBookDepth5, now: float) -> None:
@@ -351,11 +392,35 @@ class KoreanEngine:
             trigger_type = "spread_blowout"
             swept_usd = max(prev_upbit_snap.best_ask_usd, max(0.0, prev_upbit_snap.depth_ask_usd - cur_depth))
 
+        # Cancel vs. Sweep Discrimination (Anti-Ghosting Guard)
+        # If Upbit trade feed is available or trade confirmation is required,
+        # verify that the liquidity drop was backed by real taker buys rather than MM cancels/quote pullbacks.
+        recent_buys_usd = 0.0
+        if trigger_type is not None:
+            cutoff = now - 2.5
+            recent_buys_usd, has_trades = self.get_recent_upbit_buys(coin, cutoff)
+
+            should_verify_trades = self.require_trade_confirmation or has_trades
+            if should_verify_trades:
+                ratio_needed = 0.40 if ask_held else 0.25
+                min_buys_needed = max(20.0, swept_usd * ratio_needed)
+
+                if recent_buys_usd < min_buys_needed:
+                    self.counters["cancels_blocked"] = self.counters.get("cancels_blocked", 0) + 1
+                    log.debug(
+                        f"[engine] Blocked false sweep / MM cancel on Upbit {coin}: "
+                        f"swept_usd=${swept_usd:.1f}, but recent taker buys=${recent_buys_usd:.1f} "
+                        f"(needed ${min_buys_needed:.1f})"
+                    )
+                    trigger_type = None
+                    swept_usd = 0.0
+                    drain_ratio = 0.0
+
         follower_exchanges = [ex for (ex, c) in self._books.keys() if ex != "upbit" and c == coin]
         for follower_ex in follower_exchanges:
             f_snap = self._books.get((follower_ex, coin))
             f_recv = self._recv_ts.get((follower_ex, coin), 0.0)
-            if f_snap is None or (now - f_recv) > 2.0:
+            if f_snap is None or (now - f_recv) > self.max_follower_book_age_sec:
                 continue
 
             st = self._get_or_create_pair_state(coin, follower_ex)
@@ -382,6 +447,7 @@ class KoreanEngine:
                     drain_ratio=drain_ratio,
                     blowout_ratio=blowout_ratio,
                     now=now,
+                    recent_buys_usd=recent_buys_usd,
                 )
 
             if st.open_signal is None:
@@ -402,6 +468,7 @@ class KoreanEngine:
         drain_ratio: float,
         blowout_ratio: float,
         now: float,
+        recent_buys_usd: float = 0.0,
     ) -> None:
         sigma = st.sigma(now)
         upbit_mid = upbit_snap.mid_price
@@ -410,6 +477,10 @@ class KoreanEngine:
         f_ask = f_snap.best_ask
 
         if f_ask <= 0 or f_bid <= 0:
+            return
+
+        # Stale quote guard: reject follower books older than max allowed age (default 300ms)
+        if f_book_age_ms > (self.max_follower_book_age_sec * 1000.0):
             return
 
         raw_diff_bps = (upbit_mid - f_mid) / f_mid * 1e4
@@ -429,22 +500,14 @@ class KoreanEngine:
         if dev_z < min_dev_z:
             return
 
-        f_ask_diff_bps = (upbit_mid - f_ask) / f_ask * 1e4
-        gross_exec_edge_bps = f_ask_diff_bps - st.baseline_bps
-        net_edge = gross_exec_edge_bps - self.taker_fee_bps
-
-        req_edge = float(pair_cfg.get("min_spread_bps", self.min_edge_bps))
-        if net_edge < req_edge:
-            return
-
         pair_hold_sec = float(pair_cfg.get("max_hold_sec", self.max_hold_sec))
-
-        if f_snap.spread_bps >= gross_exec_edge_bps * 0.8:
-            return
 
         top3_ask_depth_usd = f_snap.top_n_ask_depth_usd(3)
         if top3_ask_depth_usd < 50.0:
             return
+
+        # Physical 15% order book capacity (independent of current wallet budget)
+        stealth_capacity_usd = round(self.stealth_fraction * top3_ask_depth_usd, 2)
 
         # Determine pool basket and actionable status
         is_battle = self.pool_state.is_battle_coin(coin) if self.pool_state else False
@@ -456,16 +519,33 @@ class KoreanEngine:
             sized = self.profile_manager.calculate_stealth_order_size(follower_ex, top3_ask_depth_usd)
             suggested_size_usd = sized if sized is not None else min(
                 self.max_position_budget_usd,
-                self.stealth_fraction * top3_ask_depth_usd,
+                stealth_capacity_usd,
             )
         else:
             suggested_size_usd = min(
                 self.max_position_budget_usd,
-                self.stealth_fraction * top3_ask_depth_usd,
+                stealth_capacity_usd,
             )
 
-        # Initial executable PnL at t=0 (if bought at f_ask and immediately sold at f_bid)
-        init_exec_move_bps = (f_bid - f_ask) / f_ask * 1e4
+        # True VWAP execution fill price across ask levels for suggested size
+        f_entry_px = f_snap.vwap_ask_usd(suggested_size_usd)
+        if f_entry_px <= 0:
+            return
+
+        f_ask_diff_bps = (upbit_mid - f_entry_px) / f_entry_px * 1e4
+        gross_exec_edge_bps = f_ask_diff_bps - st.baseline_bps
+        net_edge = gross_exec_edge_bps - self.roundtrip_fee_bps
+
+        req_edge = float(pair_cfg.get("min_spread_bps", self.min_edge_bps))
+        if net_edge < req_edge:
+            return
+
+        if f_snap.spread_bps >= gross_exec_edge_bps * 0.8:
+            return
+
+        # Initial executable PnL at t=0 (if bought at f_entry_px and immediately sold at VWAP bid)
+        init_exit_px = f_snap.vwap_bid_usd(suggested_size_usd)
+        init_exec_move_bps = (init_exit_px - f_entry_px) / f_entry_px * 1e4
         init_net_pnl_bps = round(init_exec_move_bps - self.roundtrip_fee_bps, 2)
 
         self._seq += 1
@@ -504,6 +584,9 @@ class KoreanEngine:
             follower_latency_ms=f_snap.network_latency_ms,
             follower_book_age_ms=round(f_book_age_ms, 1),
             suggested_size_usd=round(suggested_size_usd, 2),
+            stealth_capacity_usd=round(stealth_capacity_usd, 2),
+            follower_entry_px=round(f_entry_px, 8),
+            leader_recent_buys_usd=round(recent_buys_usd, 2),
             basket=basket,
             is_actionable=is_actionable,
             max_hold_sec=pair_hold_sec,
@@ -524,10 +607,12 @@ class KoreanEngine:
             self.counters["signals_incubator"] += 1
             tag = "[SIGNAL-INCUBATOR] 🧪"
 
+        buys_str = f", UpBuys: ${sig.leader_recent_buys_usd:.0f}" if sig.leader_recent_buys_usd > 0 else ""
         log.info(
             f"{tag} {sig.coin} ({sig.follower_contract}) | Upbit -> {sig.follower_exchange} | "
-            f"Trig: {sig.trigger_type} (Swept: ${sig.leader_swept_usd:.0f}) | "
-            f"Edge: +{sig.net_exec_edge_bps:.1f} bps | Z: {sig.dev_z:.1f}σ | Size: ${sig.suggested_size_usd:.0f}"
+            f"Trig: {sig.trigger_type} (Swept: ${sig.leader_swept_usd:.0f}{buys_str}) | "
+            f"Edge: +{sig.net_exec_edge_bps:.1f} bps | Z: {sig.dev_z:.1f}σ | "
+            f"Size: ${sig.suggested_size_usd:.0f} (Cap15%: ${sig.stealth_capacity_usd:.0f})"
         )
 
     # ----------------------------------------------------------- Tracking & Closure
@@ -561,8 +646,10 @@ class KoreanEngine:
             f_mid_move = (f_snap.mid_price - sig.follower_mid) / sig.follower_mid * 1e4
             up_mid_move = (upbit_snap.mid_price - sig.leader_mid) / sig.leader_mid * 1e4
 
-            # 2. True executable move on follower: Entry at best_ask -> Exit at current best_bid (bps)
-            f_exec_move = (f_snap.best_bid - sig.follower_best_ask) / sig.follower_best_ask * 1e4
+            # 2. True executable move on follower: Entry at VWAP ask -> Exit at current VWAP bid (bps)
+            entry_px = getattr(sig, "follower_entry_px", 0.0) or sig.follower_best_ask
+            exit_px = f_snap.vwap_bid_usd(sig.suggested_size_usd) if sig.suggested_size_usd > 0 else f_snap.best_bid
+            f_exec_move = (exit_px - entry_px) / entry_px * 1e4
             cur_net_pnl = round(f_exec_move - self.roundtrip_fee_bps, 2)
 
             # 3. Update MFE / MAE excursion metrics
@@ -589,7 +676,7 @@ class KoreanEngine:
 
             # Closure evaluation:
             hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
-            if f_exec_move >= (sig.net_exec_edge_bps * 0.8):
+            if cur_net_pnl >= (sig.net_exec_edge_bps * 0.8) and cur_net_pnl > 0.0:
                 self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
             elif rem_edge <= 0.0:
                 if cur_net_pnl > 0.0:
@@ -640,7 +727,6 @@ class KoreanEngine:
         Sweeps and closes any active signals that exceeded max_hold_sec even if no new ticks arrived.
         Prevents open signals from lingering on illiquid or inactive coins.
         """
-        self.maybe_reload_thresholds(now)
         for coin, signals in list(self._active_signals.items()):
             for sig in list(signals):
                 hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
@@ -648,7 +734,9 @@ class KoreanEngine:
                     f_snap = self._books.get((sig.follower_exchange, coin))
                     if f_snap:
                         f_mid_move = (f_snap.mid_price - sig.follower_mid) / sig.follower_mid * 1e4
-                        f_exec_move = (f_snap.best_bid - sig.follower_best_ask) / sig.follower_best_ask * 1e4
+                        entry_px = getattr(sig, "follower_entry_px", 0.0) or sig.follower_best_ask
+                        exit_px = f_snap.vwap_bid_usd(sig.suggested_size_usd) if sig.suggested_size_usd > 0 else f_snap.best_bid
+                        f_exec_move = (exit_px - entry_px) / entry_px * 1e4
                     else:
                         f_mid_move = 0.0
                         f_exec_move = 0.0

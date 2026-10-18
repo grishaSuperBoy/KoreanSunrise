@@ -36,6 +36,8 @@ DEFAULT_PROFILE: Dict[str, Any] = {
             "bingx": 100.0,
             "htx": 100.0,
             "pionex": 100.0,
+            "asterdex": 100.0,
+            "hyperliquid": 100.0,
         },
         "reserve_margin_frac": 0.20,  # 20% margin cushion against drawdowns
     },
@@ -49,6 +51,8 @@ DEFAULT_PROFILE: Dict[str, Any] = {
         "bingx",
         "htx",
         "pionex",
+        "asterdex",
+        "hyperliquid",
     ],
     "max_active_slots": 5,           # Max concurrent positions
     "min_order_usd": 10.0,           # Exchange min notional

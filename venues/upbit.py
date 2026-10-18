@@ -174,11 +174,13 @@ class UpbitSpotStream(BaseVenueStream):
         self,
         krw_to_coin: Dict[str, str],
         callback: Callable[[OrderBookDepth5], None],
+        trade_callback: Optional[Callable[[str, float, bool, float], None]] = None,
     ):
         coins = sorted(set(krw_to_coin.values()))
         super().__init__("upbit", coins, callback)
         self._krw_to_coin: Dict[str, str] = dict(krw_to_coin)
         self.subscribed: List[str] = list(coins)
+        self.trade_callback = trade_callback
 
         self.usdt_krw_rate: float = 0.0
         self.rate_ready: bool = False
@@ -244,11 +246,13 @@ class UpbitSpotStream(BaseVenueStream):
 
                 log.info(f"[upbit] Connecting to {self.WS_URL} ({len(self._krw_to_coin)} matched KRW coins)...")
 
-                sub_msg = [
+                sub_msg: List[Dict[str, Any]] = [
                     {"ticket": f"upbit-sunrise-{int(time.time())}"},
                     {"type": "orderbook", "codes": target_codes},
-                    {"format": "DEFAULT"},
                 ]
+                if self.trade_callback:
+                    sub_msg.append({"type": "trade", "codes": target_codes})
+                sub_msg.append({"format": "DEFAULT"})
 
                 async with websockets.connect(
                     self.WS_URL,
@@ -259,7 +263,8 @@ class UpbitSpotStream(BaseVenueStream):
                 ) as ws:
                     self._note_connect()
                     self.last_msg_ts = time.time()
-                    log.info(f"[upbit] Connected! Subscribed to {len(target_codes)} order books (incl. KRW-USDT).")
+                    trades_note = " + trades" if self.trade_callback else ""
+                    log.info(f"[upbit] Connected! Subscribed to {len(target_codes)} order books{trades_note} (incl. KRW-USDT).")
                     await ws.send(json.dumps(sub_msg))
                     backoff = self.BACKOFF_MIN
 
@@ -299,11 +304,26 @@ class UpbitSpotStream(BaseVenueStream):
 
     def _handle_msg(self, raw: str | bytes) -> None:
         try:
-            snap = self._parse_msg(raw)
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            data = json.loads(raw)
         except Exception:
             self._parse_errors += 1
             if self._parse_errors == 1 or self._parse_errors % self.PARSE_ERR_LOG_EVERY == 0:
                 log.warning(f"[upbit] parse error #{self._parse_errors}", exc_info=True)
+            return
+
+        msg_type = data.get("type")
+        if msg_type == "trade":
+            self._handle_trade(data)
+            return
+
+        try:
+            snap = self._parse_orderbook_data(data)
+        except Exception:
+            self._parse_errors += 1
+            if self._parse_errors == 1 or self._parse_errors % self.PARSE_ERR_LOG_EVERY == 0:
+                log.warning(f"[upbit] orderbook parse error #{self._parse_errors}", exc_info=True)
             return
 
         if snap is None:
@@ -316,11 +336,43 @@ class UpbitSpotStream(BaseVenueStream):
             if self._callback_errors == 1 or self._callback_errors % self.PARSE_ERR_LOG_EVERY == 0:
                 log.error(f"[upbit] callback error #{self._callback_errors}", exc_info=True)
 
+    def _handle_trade(self, data: Dict[str, Any]) -> None:
+        if not self.trade_callback or not self.rate_ready or self.usdt_krw_rate <= 0:
+            return
+        code = data.get("code")
+        if not code:
+            return
+        coin = self._krw_to_coin.get(code)
+        if not coin:
+            return
+
+        trade_price = float(data.get("trade_price", 0.0) or 0.0)
+        trade_volume = float(data.get("trade_volume", 0.0) or 0.0)
+        if trade_price <= 0.0 or trade_volume <= 0.0:
+            return
+
+        ask_bid = str(data.get("ask_bid", "")).upper()
+        # In Upbit protocol:
+        # "BID" indicates taker bought from ask (market buy)
+        # "ASK" indicates taker sold to bid (market sell)
+        is_taker_buy = (ask_bid == "BID")
+        trade_usd = (trade_price * trade_volume) / self.usdt_krw_rate
+        now_ts = time.time()
+
+        try:
+            self.trade_callback(coin, trade_usd, is_taker_buy, now_ts)
+        except Exception:
+            self._callback_errors += 1
+            if self._callback_errors == 1 or self._callback_errors % self.PARSE_ERR_LOG_EVERY == 0:
+                log.error(f"[upbit] trade callback error #{self._callback_errors}", exc_info=True)
+
     def _parse_msg(self, raw: str | bytes) -> OrderBookDepth5 | None:
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8")
         data = json.loads(raw)
+        return self._parse_orderbook_data(data)
 
+    def _parse_orderbook_data(self, data: Dict[str, Any]) -> OrderBookDepth5 | None:
         code = data.get("code")
         if not code:
             return None

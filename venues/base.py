@@ -32,14 +32,56 @@ _CONTRACT_SUFFIXES = ("PERP", "SWAP")
 
 import re
 
+_KNOWN_BASE_TOKENS = {
+    # Genuine tokens starting with K, M, B that must not be stripped as metric multiplier prefixes
+    "KAS", "KAVA", "KLAY", "KDA", "KSM", "KEY", "KNC", "KP3R", "KMD", "KUB",
+    "MKR", "MANA", "MATIC", "MEME", "MINA", "MOVE", "ME", "MOVR", "MDT", "MAGIC", "MASK", "MBL", "MTL", "MBOX", "MYRO", "MOG", "MELANIA",
+    "BTC", "BCH", "BNB", "BOME", "BONK", "BLUR", "BAT", "BICO", "BAND", "BADGER", "BEL", "BETA", "BAKE", "BEAM", "BSV", "BTT", "BIGTIME",
+}
+
+_SCALE_PREFIX_MAP: List[Tuple[re.Pattern, float]] = [
+    (re.compile(r"^1000000000([A-Z0-9]+)$"), 1_000_000_000.0),
+    (re.compile(r"^1B([A-Z0-9]+)$"), 1_000_000_000.0),
+    (re.compile(r"^1000000([A-Z0-9]+)$"), 1_000_000.0),
+    (re.compile(r"^1M([A-Z0-9]+)$"), 1_000_000.0),
+    (re.compile(r"^100000([A-Z0-9]+)$"), 100_000.0),
+    (re.compile(r"^10000([A-Z0-9]+)$"), 10_000.0),
+    (re.compile(r"^1000([A-Z0-9]+)$"), 1_000.0),
+    (re.compile(r"^1K([A-Z0-9]+)$"), 1_000.0),
+    (re.compile(r"^100([A-Z0-9]+)$"), 100.0),
+]
+
 _MULT_PREFIX_RE = re.compile(r"^(1000000|100000|10000|1000|100)([A-Z0-9]+)$")
 
 
 def parse_symbol_and_mult(raw: str) -> Tuple[str, float]:
-    """Returns (canonical_base_coin, multiplier) e.g. '1000PEPE-USDT' -> ('PEPE', 1000.0)."""
+    """
+    Returns (canonical_base_coin, multiplier)
+    e.g. '1000PEPE-USDT' -> ('PEPE', 1000.0)
+         '1MPEPE_USDT'   -> ('PEPE', 1000000.0)
+         'kPEPE'         -> ('PEPE', 1000.0)
+         'kSHIB'         -> ('SHIB', 1000.0)
+         'mPEPE'         -> ('PEPE', 1000000.0)
+         'bLUNC'         -> ('LUNC', 1000000000.0)
+         'KASUSDT'       -> ('KAS', 1.0)
+    """
     s_raw = str(raw).strip()
-    if len(s_raw) > 1 and s_raw[0] == "k" and s_raw[1].isupper():
-        s_raw = "1000" + s_raw[1:]
+    if not s_raw:
+        return "", 1.0
+
+    # Hyperliquid / DEX single-letter prefix convention ('k' for 1000, 'm' for 1M, 'b' for 1B)
+    prefix_mult = 1.0
+    if len(s_raw) > 2 and s_raw[0] in ("k", "m", "b") and s_raw[1].isupper():
+        if s_raw.upper() not in _KNOWN_BASE_TOKENS:
+            p_char = s_raw[0]
+            if p_char == "k":
+                prefix_mult = 1000.0
+            elif p_char == "m":
+                prefix_mult = 1_000_000.0
+            elif p_char == "b":
+                prefix_mult = 1_000_000_000.0
+            s_raw = s_raw[1:]
+
     s = s_raw.upper()
     if ":" in s:
         s = s.split(":", 1)[0]
@@ -57,9 +99,18 @@ def parse_symbol_and_mult(raw: str) -> Tuple[str, float]:
             s = s[:-len(suf)]
     if s == "XBT":
         s = "BTC"
-    m = _MULT_PREFIX_RE.match(s)
-    if m:
-        return m.group(2), float(m.group(1))
+
+    if prefix_mult != 1.0:
+        return s, prefix_mult
+
+    # Check numeric and metric prefix multipliers (1000, 1M, 1B, 1000000, etc.)
+    for pattern, mult in _SCALE_PREFIX_MAP:
+        m = pattern.match(s)
+        if m:
+            candidate_coin = m.group(1)
+            if candidate_coin:
+                return candidate_coin, mult
+
     return s, 1.0
 
 
@@ -129,6 +180,10 @@ class BaseVenueStream:
         self.symbols_seen: Set[str] = set()
         self.books_dropped = 0
         self.levels_dropped = 0
+        self.seq_gaps = 0
+        self.seq_duplicates = 0
+        self._last_u: Dict[str, int] = {}
+        self._last_seq: Dict[str, int] = {}
         self._first_ts = 0.0
 
     def _note_connect(self) -> None:
@@ -211,6 +266,8 @@ class BaseVenueStream:
             ),
             "books_dropped": self.books_dropped,
             "levels_dropped": self.levels_dropped,
+            "seq_gaps": self.seq_gaps,
+            "seq_duplicates": self.seq_duplicates,
         }
 
 

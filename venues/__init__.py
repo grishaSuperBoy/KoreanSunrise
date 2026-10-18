@@ -29,6 +29,8 @@ from venues.kucoin import KucoinRestClient, KucoinStream
 from venues.bingx import BingXRestClient, BingXStream
 from venues.htx import HTXRestClient, HTXStream
 from venues.pionex import PionexRestClient, PionexStream
+from venues.asterdex import AsterdexRestClient, AsterdexStream
+from venues.hyperliquid import HyperliquidRestClient, HyperliquidStream
 from venues.manager import StreamManager
 
 __all__ = [
@@ -36,25 +38,29 @@ __all__ = [
     "BaseCEXStream",
     "create_http_session",
     "normalize_symbol",
-    "UpbitRestClient",
     "UpbitSpotStream",
-    "BinanceRestClient",
+    "UpbitRestClient",
     "BinanceFuturesStream",
-    "BybitRestClient",
+    "BinanceRestClient",
     "BybitPerpStream",
-    "OKXRestClient",
+    "BybitRestClient",
     "OKXStream",
-    "GateioRestClient",
+    "OKXRestClient",
     "GateioStream",
-    "MEXCRestClient",
+    "GateioRestClient",
     "MEXCStream",
-    "KucoinRestClient",
+    "MEXCRestClient",
     "KucoinStream",
-    "BingXRestClient",
+    "KucoinRestClient",
     "BingXStream",
-    "HTXRestClient",
+    "BingXRestClient",
     "HTXStream",
-    "PionexRestClient",
+    "HTXRestClient",
     "PionexStream",
+    "PionexRestClient",
+    "AsterdexStream",
+    "AsterdexRestClient",
+    "HyperliquidStream",
+    "HyperliquidRestClient",
     "StreamManager",
 ]

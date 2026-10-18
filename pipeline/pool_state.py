@@ -69,7 +69,7 @@ class CoinEntry:
     """In-memory representation of a coin in either Incubator or Battle basket."""
     __slots__ = (
         "coin", "venues", "basket", "enabled", "pause_reason",
-        "top3_depth_usd", "min_order_usd", "max_order_usd",
+        "top3_depth_usd", "stealth_capacity_usd", "min_order_usd", "max_order_usd",
         "mean_net_pnl_bps", "median_net_pnl_bps", "win_rate_pct",
         "profit_factor", "promoted_at", "event_count",
     )
@@ -82,6 +82,7 @@ class CoinEntry:
         enabled: bool = True,
         pause_reason: Optional[str] = None,
         top3_depth_usd: float = 0.0,
+        stealth_capacity_usd: float = 0.0,
         min_order_usd: float = DEFAULT_MIN_ORDER_USD,
         max_order_usd: float = DEFAULT_SIZE_CAP_USD,
         mean_net_pnl_bps: float = 0.0,
@@ -97,6 +98,7 @@ class CoinEntry:
         self.enabled = enabled
         self.pause_reason = pause_reason
         self.top3_depth_usd = top3_depth_usd
+        self.stealth_capacity_usd = stealth_capacity_usd if stealth_capacity_usd > 0.0 else round(top3_depth_usd * DEFAULT_STEALTH_FRAC, 2)
         self.min_order_usd = min_order_usd
         self.max_order_usd = max_order_usd
         self.mean_net_pnl_bps = mean_net_pnl_bps
@@ -132,6 +134,7 @@ class CoinEntry:
             "enabled": self.enabled,
             "pause_reason": self.pause_reason,
             "top3_depth_usd": round(self.top3_depth_usd, 1),
+            "stealth_capacity_usd": round(self.stealth_capacity_usd, 1),
             "min_order_usd": round(self.min_order_usd, 2),
             "max_order_usd": round(self.max_order_usd, 2),
             "mean_net_pnl_bps": round(self.mean_net_pnl_bps, 2),
@@ -383,6 +386,10 @@ class PoolStateManager:
                 entry.basket = "battle"
                 entry.venues = stat.get("venues", entry.venues)
                 entry.top3_depth_usd = float(stat.get("top3_depth_usd", 0.0))
+                entry.stealth_capacity_usd = float(
+                    stat.get("stealth_capacity_usd")
+                    or round(entry.top3_depth_usd * DEFAULT_STEALTH_FRAC, 2)
+                )
                 entry.mean_net_pnl_bps = float(stat.get("mean_net_pnl_bps", 0.0))
                 entry.median_net_pnl_bps = float(stat.get("median_net_pnl_bps", 0.0))
                 entry.win_rate_pct = float(stat.get("win_rate_pct", 0.0))
@@ -394,6 +401,7 @@ class PoolStateManager:
             for coin, entry in self._coins.items():
                 if entry.basket == "battle" and coin not in qualified_coins:
                     entry.basket = "incubator"
+                    entry.stealth_capacity_usd = 0.0
                     entry.mean_net_pnl_bps = 0.0
                     entry.median_net_pnl_bps = 0.0
                     entry.win_rate_pct = 0.0

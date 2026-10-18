@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
@@ -18,6 +19,7 @@ from venues.base import (
     BaseVenueStream,
     create_http_session,
     normalize_symbol,
+    parse_symbol_and_mult,
     _secs_until_daily_reconnect_for,
     log,
 )
@@ -51,11 +53,7 @@ class BybitRestClient:
                     if quote != "USDT":
                         continue
                     base_coin = item.get("baseCoin", "").upper()
-                    mult = 1.0
-                    m = _MULT_PREFIX_RE.match(base_coin)
-                    if m:
-                        mult = float(m.group(1))
-                        base_coin = m.group(2)
+                    base_coin, mult = parse_symbol_and_mult(base_coin)
                     out[raw_sym] = (base_coin, mult)
         except Exception as e:
             log.error(f"[bybit_rest] Failed to fetch linear instruments: {e}")
@@ -123,12 +121,24 @@ class BybitPerpStream(BaseVenueStream):
         sym_map: Dict[str, Tuple[str, float]],
         callback: Callable[[OrderBookDepth5], None],
     ):
-        coins = sorted({coin for coin, _ in sym_map.values()})
+        coins = sorted({v[0] for v in sym_map.values()})
         super().__init__("bybit", coins, callback)
-        self._sym_map: Dict[str, Tuple[str, float]] = dict(sym_map)
+        self._sym_map: Dict[str, Tuple[Any, ...]] = dict(sym_map)
         self._raw_symbols: List[str] = sorted(self._sym_map.keys())
         self.subscribed = list(coins)
         self._books: Dict[str, Dict[str, Dict[float, float]]] = {}
+        self._lock = threading.RLock()
+        self._last_u: Dict[str, int] = {}
+        self._last_seq: Dict[str, int] = {}
+        self._synced: Dict[str, bool] = {}
+
+    def get_book_snapshot(self, raw_sym: str) -> Optional[Dict[str, Dict[float, float]]]:
+        """Thread-safe snapshot copy of the current L2 book for raw_sym."""
+        with self._lock:
+            b = self._books.get(raw_sym)
+            if not b:
+                return None
+            return {"bids": dict(b["bids"]), "asks": dict(b["asks"])}
 
     async def _ping_loop(self, ws: Any) -> None:
         try:
@@ -145,7 +155,11 @@ class BybitPerpStream(BaseVenueStream):
 
         while self._running:
             try:
-                self._books.clear()
+                with self._lock:
+                    self._books.clear()
+                    self._last_u.clear()
+                    self._last_seq.clear()
+                    self._synced.clear()
                 log.info(f"[bybit] Connecting to {self.WS_URL} ({len(self._raw_symbols)} contracts)...")
                 async with websockets.connect(
                     self.WS_URL,
@@ -214,49 +228,92 @@ class BybitPerpStream(BaseVenueStream):
             mapped = self._sym_map.get(raw_sym)
             if not mapped:
                 return
-            coin, mult = mapped
+            coin = mapped[0]
+            mult = float(mapped[1])
+            c_size = float(mapped[2]) if len(mapped) >= 3 else 1.0
 
             mtype = data.get("type", "delta")
-            if raw_sym not in self._books or mtype == "snapshot":
-                self._books[raw_sym] = {"bids": {}, "asks": {}}
-            book = self._books[raw_sym]
-            bids_dict = book["bids"]
-            asks_dict = book["asks"]
+            u = int(d.get("u") or 0)
+            seq = int(d.get("seq") or 0)
 
-            for row in d.get("b", []):
-                p, q = float(row[0]), float(row[1])
-                if q <= 0.0 or p <= 0.0:
-                    bids_dict.pop(p, None)
+            with self._lock:
+                cur_book = self._books.get(raw_sym)
+                is_desynced = (self._synced.get(raw_sym) is False)
+                if mtype == "snapshot" or (cur_book is None and not is_desynced):
+                    self._synced[raw_sym] = True
+                    self._last_u[raw_sym] = u
+                    if seq > 0:
+                        self._last_seq[raw_sym] = seq
+                    new_bids: Dict[float, float] = {}
+                    new_asks: Dict[float, float] = {}
                 else:
-                    bids_dict[p] = q
+                    if is_desynced:
+                        # Waiting for a fresh snapshot after gap
+                        self.seq_gaps += 1
+                        return
 
-            for row in d.get("a", []):
-                p, q = float(row[0]), float(row[1])
-                if q <= 0.0 or p <= 0.0:
-                    asks_dict.pop(p, None)
-                else:
-                    asks_dict[p] = q
+                    last_u = self._last_u.get(raw_sym, 0)
+                    if u > 0 and last_u > 0:
+                        if u <= last_u:
+                            self.seq_duplicates += 1
+                            return
+                        pu = d.get("pu")
+                        if pu is not None and int(pu) != last_u:
+                            self.seq_gaps += 1
+                            log.warning(f"[bybit] Sequence gap on {raw_sym}: expected pu={last_u}, got {pu}. Desyncing book.")
+                            self._synced[raw_sym] = False
+                            self._books.pop(raw_sym, None)
+                            return
 
-            if not bids_dict or not asks_dict:
-                return
+                    self._last_u[raw_sym] = u
+                    if seq > 0:
+                        self._last_seq[raw_sym] = seq
 
-            sorted_bids_raw = sorted(bids_dict.items(), key=lambda x: x[0], reverse=True)
-            sorted_asks_raw = sorted(asks_dict.items(), key=lambda x: x[0])
+                    new_bids = dict(cur_book.get("bids", {}))
+                    new_asks = dict(cur_book.get("asks", {}))
 
-            if len(bids_dict) > 100:
-                book["bids"] = dict(sorted_bids_raw[:50])
-            if len(asks_dict) > 100:
-                book["asks"] = dict(sorted_asks_raw[:50])
+                for row in d.get("b", []):
+                    p, q = float(row[0]), float(row[1])
+                    if q <= 0.0 or p <= 0.0:
+                        new_bids.pop(p, None)
+                    else:
+                        new_bids[p] = q
 
-            top_bids = sorted_bids_raw[:5]
-            top_asks = sorted_asks_raw[:5]
+                for row in d.get("a", []):
+                    p, q = float(row[0]), float(row[1])
+                    if q <= 0.0 or p <= 0.0:
+                        new_asks.pop(p, None)
+                    else:
+                        new_asks[p] = q
+
+                if not new_bids or not new_asks:
+                    return
+
+                sorted_bids_raw = sorted(new_bids.items(), key=lambda x: x[0], reverse=True)
+                sorted_asks_raw = sorted(new_asks.items(), key=lambda x: x[0])
+
+                # Memory leak / GC protection: strictly cap depth to MAX_BOOK_DEPTH (25)
+                # whenever dictionary size exceeds 25, instead of letting it balloon to 100+
+                MAX_BOOK_DEPTH = 25
+                if len(new_bids) > MAX_BOOK_DEPTH:
+                    new_bids = dict(sorted_bids_raw[:MAX_BOOK_DEPTH])
+                if len(new_asks) > MAX_BOOK_DEPTH:
+                    new_asks = dict(sorted_asks_raw[:MAX_BOOK_DEPTH])
+
+                # Atomic Copy-on-Write assignment
+                self._books[raw_sym] = {"bids": new_bids, "asks": new_asks}
+
+                top_bids = sorted_bids_raw[:5]
+                top_asks = sorted_asks_raw[:5]
+
             if not top_bids or not top_asks:
                 return
 
-            if mult != 1.0:
-                inv_mult = 1.0 / mult
-                norm_bids = [(p * inv_mult, q * mult) for p, q in top_bids]
-                norm_asks = [(p * inv_mult, q * mult) for p, q in top_asks]
+            inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
+            scale_qty = mult * c_size
+            if inv_mult != 1.0 or scale_qty != 1.0:
+                norm_bids = [(p * inv_mult, q * scale_qty) for p, q in top_bids]
+                norm_asks = [(p * inv_mult, q * scale_qty) for p, q in top_asks]
             else:
                 norm_bids = [(p, q) for p, q in top_bids]
                 norm_asks = [(p, q) for p, q in top_asks]

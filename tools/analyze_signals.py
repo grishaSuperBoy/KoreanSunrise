@@ -84,19 +84,23 @@ def main() -> None:
     print("\n[1] BREAKDOWN BY FOLLOWER EXCHANGE & TRIGGER TYPE:")
     print(
         f"{'Venue   | Trigger':<24} | {'Count':>5} | {'Conv%':>5} | {'Win%':>5} | "
-        f"{'MeanPnL':>8} | {'MedPnL':>7} | {'MeanMFE':>8} | {'PeakT(s)':>8}"
+        f"{'MeanPnL':>8} | {'MedPnL':>7} | {'MedTop3':>8} | {'MedCap15':>8}"
     )
-    print("-" * 88)
+    print("-" * 92)
     for k, rows in sorted(groups.items()):
         n = len(rows)
         pnls = [float(r.get("net_pnl_bps", 0.0)) for r in rows]
-        mfes = [float(r.get("mfe_exec_pnl_bps", r.get("net_pnl_bps", 0.0))) for r in rows]
-        t_peaks = [float(r.get("time_to_peak_sec", 0.0)) for r in rows]
+        top3s = [float(r.get("follower_top3_ask_usd", 0.0)) for r in rows if float(r.get("follower_top3_ask_usd", 0.0)) > 0]
+        caps = [
+            float(r.get("stealth_capacity_usd") or (0.15 * float(r.get("follower_top3_ask_usd", 0.0))))
+            for r in rows
+            if float(r.get("follower_top3_ask_usd", 0.0)) > 0
+        ]
         conv_pct = sum(1 for r in rows if r.get("close_reason") == "converged") / n * 100.0
         win_pct = sum(1 for p in pnls if p > 0.0) / n * 100.0
         print(
             f"{k:<24} | {n:>5d} | {conv_pct:>4.1f}% | {win_pct:>4.1f}% | "
-            f"{_mean(pnls):>+7.2f} | {_med(pnls):>+6.2f} | {_mean(mfes):>+7.2f} | {_med(t_peaks):>7.2f}s"
+            f"{_mean(pnls):>+7.2f} | {_med(pnls):>+6.2f} | ${_med(top3s):>7.0f} | ${_med(caps):>7.0f}"
         )
 
     # 2. Sub-second Markout Curve across horizons
@@ -148,6 +152,12 @@ def main() -> None:
         pnls = [float(r.get("net_pnl_bps", 0.0)) for r in rows]
         mfes = [float(r.get("mfe_exec_pnl_bps", 0.0)) for r in rows]
         spreads = [float(r.get("follower_spread_bps", 0.0)) for r in rows]
+        top3s = [float(r.get("follower_top3_ask_usd", 0.0)) for r in rows if float(r.get("follower_top3_ask_usd", 0.0)) > 0]
+        caps = [
+            float(r.get("stealth_capacity_usd") or (0.15 * float(r.get("follower_top3_ask_usd", 0.0))))
+            for r in rows
+            if float(r.get("follower_top3_ask_usd", 0.0)) > 0
+        ]
         win_pct = sum(1 for p in pnls if p > 0.0) / n * 100.0
         mfe_pos_pct = sum(1 for m in mfes if m > 2.0) / n * 100.0
         coin_stats.append({
@@ -157,6 +167,8 @@ def main() -> None:
             "mfe_pos_pct": mfe_pos_pct,
             "mean_pnl": _mean(pnls),
             "sum_pnl": sum(pnls),
+            "med_top3": _med(top3s),
+            "med_cap": _med(caps),
             "mean_mfe": _mean(mfes),
             "mean_spread": _mean(spreads),
         })
@@ -165,14 +177,15 @@ def main() -> None:
 
     print("\n[4] COIN PERFORMANCE RANKING (Sorted by Mean Realized Net PnL):")
     print(
-        f"{'Coin':<10} | {'Trades':>6} | {'Win%':>6} | {'MFE>2bps%':>9} | "
-        f"{'MeanPnL':>8} | {'TotalPnL':>9} | {'MeanMFE':>8} | {'F_Spread':>8}"
+        f"{'Coin':<10} | {'Trades':>6} | {'Win%':>6} | "
+        f"{'MeanPnL':>8} | {'MedTop3':>8} | {'MedCap15':>8} | {'MeanMFE':>8} | {'F_Spread':>8}"
     )
-    print("-" * 88)
+    print("-" * 92)
     for st in coin_stats:
         print(
-            f"{st['coin']:<10} | {st['n']:>6d} | {st['win_pct']:>5.1f}% | {st['mfe_pos_pct']:>8.1f}% | "
-            f"{st['mean_pnl']:>+7.2f} | {st['sum_pnl']:>+8.1f} | {st['mean_mfe']:>+7.2f} | {st['mean_spread']:>7.2f}"
+            f"{st['coin']:<10} | {st['n']:>6d} | {st['win_pct']:>5.1f}% | "
+            f"{st['mean_pnl']:>+7.2f} | ${st['med_top3']:>7.0f} | ${st['med_cap']:>7.0f} | "
+            f"{st['mean_mfe']:>+7.2f} | {st['mean_spread']:>7.2f}"
         )
 
     # Suggest automatic blacklist for coins with >= 3 signals and negative MFE/PnL

@@ -194,6 +194,13 @@ class TestPipelineE2E(unittest.TestCase):
         self.assertTrue(psm.is_battle_coin("SOL"))
         self.assertFalse(psm.is_battle_coin("MEME"))
 
+        # Verify physical capacity metrics are captured and persisted
+        sol_q = next(q for q in qualified if q["coin"] == "SOL")
+        self.assertIn("stealth_capacity_usd", sol_q)
+        self.assertAlmostEqual(sol_q["stealth_capacity_usd"], 450.0, places=1) # 15% of 3000
+        sol_entry = psm.get_coin_entry("SOL")
+        self.assertAlmostEqual(sol_entry.stealth_capacity_usd, 450.0, places=1)
+
     def test_engine_integration_with_basket_and_actionability(self):
         psm = PoolStateManager(
             universe_file=self.universe_file,
@@ -353,6 +360,7 @@ class TestPipelineE2E(unittest.TestCase):
         sig = st.open_signal
         # Personalized max_hold_sec assigned!
         self.assertEqual(sig.max_hold_sec, 3.2)
+        self.assertGreater(sig.stealth_capacity_usd, 0.0)
 
         # 4. Sweep timeouts before 3.2s -> signal stays open
         engine.sweep_timeouts(now + 50 + 2.0)
@@ -364,6 +372,7 @@ class TestPipelineE2E(unittest.TestCase):
         self.assertEqual(sig.close_reason, "timeout")
         self.assertEqual(len(emitted), 1)
         self.assertEqual(emitted[0]["max_hold_sec"], 3.2)
+        self.assertEqual(emitted[0]["stealth_capacity_usd"], sig.stealth_capacity_usd)
 
     def test_engine_hot_reload_pool_and_profile(self):
         # 1. Initialize fresh PoolStateManager and TradingProfileManager
@@ -712,6 +721,426 @@ class TestPipelineE2E(unittest.TestCase):
         self.assertEqual(sol_entry.mean_net_pnl_bps, 0.0)
         self.assertEqual(sol_entry.profit_factor, 0.0)
         self.assertEqual(sol_entry.promoted_at, 0.0)
+
+    def test_daily_report_stealth_capacity(self):
+        import tools.full_daily_report as fdr
+        # Write mock signals in test_dir/signals
+        sig_file = os.path.join(self.signals_dir, "signals_2026-10-18.jsonl.gz")
+        mock_signals = [
+            {
+                "coin": "SOL",
+                "follower_exchange": "binance",
+                "drain_ratio": 0.65,
+                "leader_swept_usd": 3000.0,
+                "follower_top3_ask_usd": 2000.0,
+                "stealth_capacity_usd": 300.0,
+                "net_pnl_bps": 12.0,
+                "gross_exec_edge_bps": 22.0,
+                "mfe_exec_pnl_bps": 15.0,
+                "time_to_peak_sec": 0.5,
+                "close_reason": "converged",
+                "trigger_type": "depth_drain",
+            },
+            {
+                "coin": "SOL",
+                "follower_exchange": "binance",
+                "drain_ratio": 0.70,
+                "leader_swept_usd": 4000.0,
+                "follower_top3_ask_usd": 3000.0,
+                "stealth_capacity_usd": 450.0,
+                "net_pnl_bps": 18.0,
+                "gross_exec_edge_bps": 28.0,
+                "mfe_exec_pnl_bps": 20.0,
+                "time_to_peak_sec": 0.8,
+                "close_reason": "converged",
+                "trigger_type": "depth_drain",
+            },
+        ]
+        with gzip.open(sig_file, "wt", encoding="utf-8") as f:
+            for s in mock_signals:
+                f.write(json.dumps(s) + "\n")
+
+        with patch.object(fdr, "DATA_ROOT", self.test_dir), \
+             patch.object(fdr, "REPORTS_DIR", os.path.join(self.test_dir, "reports")):
+            doc = fdr.generate_daily_report(days_back=1.0, as_json=True)
+
+        self.assertIn("venue_capacities", doc)
+        self.assertEqual(len(doc["venue_capacities"]), 1)
+        v_binance = doc["venue_capacities"][0]
+        self.assertEqual(v_binance["venue"], "binance")
+        self.assertEqual(v_binance["signals"], 2)
+        # Median of 2000 and 3000 is 2500
+        self.assertAlmostEqual(v_binance["med_top3_depth_usd"], 2500.0, places=1)
+        # Median of 300 and 450 is 375
+        self.assertAlmostEqual(v_binance["med_stealth_cap_usd"], 375.0, places=1)
+
+        # Check top_coins
+        self.assertGreater(len(doc["top_coins"]), 0)
+        c_sol = doc["top_coins"][0]
+        self.assertEqual(c_sol["coin"], "SOL")
+        self.assertAlmostEqual(c_sol["med_stealth_cap_usd"], 375.0, places=1)
+
+        # Check top_pairs
+        self.assertGreater(len(doc["top_pairs"]), 0)
+        p_sol = doc["top_pairs"][0]
+        self.assertAlmostEqual(p_sol["med_stealth_cap_usd"], 375.0, places=1)
+
+    def test_orderbook_vwap_and_true_roundtrip_math(self):
+        """Verifies VWAP book depth fills and true roundtrip fee subtraction in KoreanEngine."""
+        # 1. OrderBookDepth5 VWAP math
+        snap = OrderBookDepth5(
+            exchange="binance", symbol="TEST", raw_symbol="TESTUSDT",
+            ts=1000.0, exchange_ts=1000000,
+            # L1: $10 @ 100.0, L2: $40.4 @ 101.0, L3: $1020 @ 102.0
+            asks=[(100.0, 0.1), (101.0, 0.4), (102.0, 10.0)],
+            # L1: $9.9 @ 99.0, L2: $39.2 @ 98.0, L3: $970 @ 97.0
+            bids=[(99.0, 0.1), (98.0, 0.4), (97.0, 10.0)],
+        )
+
+        # Buying $100 fills: $10 @ 100.0 (qty 0.1) + $40.4 @ 101.0 (qty 0.4) + $49.6 @ 102.0 (qty 49.6/102.0)
+        expected_qty = 0.1 + 0.4 + (49.6 / 102.0)
+        expected_vwap_ask = 100.0 / expected_qty
+        self.assertAlmostEqual(snap.vwap_ask_usd(100.0), expected_vwap_ask, places=4)
+        self.assertGreater(snap.vwap_ask_usd(100.0), snap.best_ask)
+
+        # Selling $100 fills: $9.9 @ 99.0 (qty 0.1) + $39.2 @ 98.0 (qty 0.4) + $50.9 @ 97.0 (qty 50.9/97.0)
+        expected_sell_qty = 0.1 + 0.4 + (50.9 / 97.0)
+        expected_vwap_bid = 100.0 / expected_sell_qty
+        self.assertAlmostEqual(snap.vwap_bid_usd(100.0), expected_vwap_bid, places=4)
+        self.assertLess(snap.vwap_bid_usd(100.0), snap.best_bid)
+
+        # 2. KoreanEngine: Net edge must account for full roundtrip_fee_bps (10.0 bps) & VWAP
+        from korean_engine import KoreanEngine, PairState
+        emitted = []
+        engine = KoreanEngine(emit_callback=emitted.append, min_edge_bps=12.0)
+        st = PairState("TEST", "binance", warmup_samples=1)
+        st.learn(0.0, 1000.0)  # baseline = 0.0
+
+        # Upbit jumps: mid = 102.0
+        upbit_snap = OrderBookDepth5(
+            exchange="upbit", symbol="TEST", raw_symbol="KRW-TEST",
+            ts=1000.0, exchange_ts=1000000,
+            bids=[(101.95, 10.0)], asks=[(102.05, 10.0)]
+        )
+
+        # Follower snap has deep book: L1=100.0 ($10), L2=100.5 ($100), L3=101.0 ($1000)
+        f_snap = OrderBookDepth5(
+            exchange="binance", symbol="TEST", raw_symbol="TESTUSDT",
+            ts=1000.0, exchange_ts=1000000,
+            bids=[(99.5, 10.0), (99.0, 10.0)],
+            asks=[(100.0, 0.1), (100.5, 1.0), (101.0, 10.0)],
+        )
+
+        engine._books[("upbit", "TEST")] = upbit_snap
+        engine._books[("binance", "TEST")] = f_snap
+
+        engine._check_entry(
+            coin="TEST",
+            follower_ex="binance",
+            st=st,
+            upbit_snap=upbit_snap,
+            f_snap=f_snap,
+            f_book_age_ms=5.0,
+            norm_depth=1000.0,
+            norm_spread=5.0,
+            swept_usd=5000.0,
+            trigger_type="depth_drain",
+            drain_ratio=0.8,
+            blowout_ratio=3.0,
+            now=1000.0,
+        )
+
+        self.assertIsNotNone(st.open_signal)
+        sig = st.open_signal
+        # Real entry price is VWAP fill, higher than best_ask (100.0)
+        self.assertGreater(sig.follower_entry_px, 100.0)
+        # Net edge is gross_exec_edge - 10.0 bps (roundtrip fee)
+        self.assertAlmostEqual(sig.net_exec_edge_bps, sig.gross_exec_edge_bps - 10.0, places=2)
+
+        # 3. Follower moves slightly: gross move is +8.0 bps, but net PnL is 8 - 10 = -2 bps < 0.
+        # Engine MUST NOT close as "converged"!
+        f_slight_move = OrderBookDepth5(
+            exchange="binance", symbol="TEST", raw_symbol="TESTUSDT",
+            ts=1001.0, exchange_ts=1001000,
+            # Bid shifted up slightly
+            bids=[(sig.follower_entry_px * (1 + 0.0008), 20.0)],
+            asks=[(sig.follower_entry_px * (1 + 0.0015), 20.0)],
+        )
+        engine._books[("binance", "TEST")] = f_slight_move
+        engine._track_follower_move("TEST", "binance", f_slight_move, 1001.0)
+
+        # Signal remains open because net PnL is negative!
+        self.assertFalse(sig.closed)
+
+    def test_follower_book_age_guard(self):
+        """Verifies that KoreanEngine strictly rejects stale follower order books (> 300ms)."""
+        from korean_engine import KoreanEngine, PairState
+        emitted = []
+        engine = KoreanEngine(emit_callback=emitted.append, max_follower_book_age_sec=0.30)
+        st = PairState("BTC", "binance", warmup_samples=1)
+        st.learn(0.0, 1000.0)
+
+        upbit_snap = OrderBookDepth5(
+            exchange="upbit", symbol="BTC", raw_symbol="KRW-BTC",
+            ts=1000.0, exchange_ts=1000000,
+            bids=[(105000.0, 1.0)], asks=[(105100.0, 1.0)]
+        )
+        f_snap = OrderBookDepth5(
+            exchange="binance", symbol="BTC", raw_symbol="BTCUSDT",
+            ts=1000.0, exchange_ts=1000000,
+            bids=[(99000.0, 1.0)], asks=[(99100.0, 1.0)]
+        )
+        engine._books[("upbit", "BTC")] = upbit_snap
+        engine._books[("binance", "BTC")] = f_snap
+
+        # 1. Book age is 350ms (> 300ms threshold) -> REJECTED
+        engine._recv_ts[("binance", "BTC")] = 1000.0 - 0.35
+        engine._check_entry(
+            coin="BTC", follower_ex="binance", st=st,
+            upbit_snap=upbit_snap, f_snap=f_snap,
+            f_book_age_ms=350.0, norm_depth=1000.0, norm_spread=5.0,
+            swept_usd=5000.0, trigger_type="depth_drain", drain_ratio=0.8,
+            blowout_ratio=3.0, now=1000.0
+        )
+        self.assertIsNone(st.open_signal)
+
+        # 2. Book age is 150ms (< 300ms threshold) -> ACCEPTED
+        engine._recv_ts[("binance", "BTC")] = 1000.0 - 0.15
+        engine._check_entry(
+            coin="BTC", follower_ex="binance", st=st,
+            upbit_snap=upbit_snap, f_snap=f_snap,
+            f_book_age_ms=150.0, norm_depth=1000.0, norm_spread=5.0,
+            swept_usd=5000.0, trigger_type="depth_drain", drain_ratio=0.8,
+            blowout_ratio=3.0, now=1000.0
+        )
+        self.assertIsNotNone(st.open_signal)
+        self.assertEqual(st.open_signal.follower_book_age_ms, 150.0)
+
+    def test_matched_universe_multi_venue_typing(self):
+        """Verifies MatchedUniverse loads all 11 venues with typed (coin, mult, c_size) mappings."""
+        from main import KoreanSunriseService
+        from venues.manager import StreamManager
+        doc = {
+            "coins": ["BTC", "PEPE", "SOL"],
+            "upbit_krw_to_coin": {"KRW-BTC": "BTC", "KRW-PEPE": "PEPE", "KRW-SOL": "SOL"},
+            "binance_sym_map": {"BTCUSDT": ["BTC", 1.0, 1.0], "1000PEPEUSDT": ["PEPE", 1000.0, 1.0]},
+            "gateio_sym_map": {"BTC_USDT": ["BTC", 1.0, 0.0001]},
+            "okx_sym_map": {"BTC-USDT-SWAP": ["BTC", 1.0, 0.01]},
+            "hyperliquid_sym_map": {"kBONKUSDT": ["BONK", 1000.0, 1.0]},
+        }
+        univ = KoreanSunriseService._parse_universe_doc(doc)
+        self.assertEqual(univ.coins, ["BTC", "PEPE", "SOL"])
+        self.assertIn("gateio", univ.venue_sym_maps)
+        self.assertIn("okx", univ.venue_sym_maps)
+        self.assertIn("hyperliquid", univ.venue_sym_maps)
+
+        # Check get_sym_map preserves contract size
+        self.assertEqual(univ.get_sym_map("gateio")["BTC_USDT"], ("BTC", 1.0, 0.0001))
+        self.assertEqual(univ.get_sym_map("okx")["BTC-USDT-SWAP"], ("BTC", 1.0, 0.01))
+        self.assertEqual(univ.get_sym_map("hyperliquid")["kBONKUSDT"], ("BONK", 1000.0, 1.0))
+
+        # Check StreamManager initializes feeds using typed universe
+        sm = StreamManager(universe=univ, callback=lambda x: None, active_venues=["upbit", "gateio", "okx"])
+        self.assertIn("upbit", sm.streams)
+        self.assertIn("gateio", sm.streams)
+        self.assertIn("okx", sm.streams)
+        self.assertNotIn("binance", sm.streams)
+
+    def test_upbit_trade_stream_parsing(self):
+        """Verifies UpbitSpotStream parses trades and order books correctly."""
+        from venues.upbit import UpbitSpotStream
+        krw_to_coin = {"KRW-BTC": "BTC"}
+        received_books = []
+        received_trades = []
+
+        stream = UpbitSpotStream(
+            krw_to_coin=krw_to_coin,
+            callback=received_books.append,
+            trade_callback=lambda c, usd, buy, ts: received_trades.append((c, usd, buy, ts)),
+        )
+        stream.usdt_krw_rate = 1400.0
+        stream.rate_ready = True
+
+        # 1. Trade message from Upbit: Taker BUY (ask_bid == "BID")
+        trade_msg = json.dumps({
+            "type": "trade",
+            "code": "KRW-BTC",
+            "trade_price": 140000000.0,  # 140,000,000 KRW / 1400 = $100,000
+            "trade_volume": 0.05,        # 0.05 BTC = $5,000
+            "ask_bid": "BID",            # Taker Buy
+            "trade_timestamp": 1700000000000,
+        })
+        stream._handle_msg(trade_msg)
+
+        self.assertEqual(len(received_trades), 1)
+        coin, usd, is_buy, ts = received_trades[0]
+        self.assertEqual(coin, "BTC")
+        self.assertAlmostEqual(usd, 5000.0, places=2)
+        self.assertTrue(is_buy)
+
+        # 2. Trade message: Taker SELL (ask_bid == "ASK")
+        sell_msg = json.dumps({
+            "type": "trade",
+            "code": "KRW-BTC",
+            "trade_price": 140000000.0,
+            "trade_volume": 0.02,        # $2,000
+            "ask_bid": "ASK",            # Taker Sell
+            "trade_timestamp": 1700000001000,
+        })
+        stream._handle_msg(sell_msg)
+        self.assertEqual(len(received_trades), 2)
+        self.assertFalse(received_trades[1][2])  # is_taker_buy == False
+
+        # 3. Orderbook message
+        ob_msg = json.dumps({
+            "type": "orderbook",
+            "code": "KRW-BTC",
+            "timestamp": 1700000002000,
+            "orderbook_units": [
+                {"bid_price": 139900000.0, "bid_size": 1.0, "ask_price": 140100000.0, "ask_size": 1.0}
+            ]
+        })
+        stream._handle_msg(ob_msg)
+        self.assertEqual(len(received_books), 1)
+        self.assertEqual(received_books[0].symbol, "BTC")
+
+    def test_upbit_cancel_vs_sweep_guard(self):
+        """
+        Verifies that KoreanEngine discriminates between MM quote cancellations
+        and genuine market sweeps using the Upbit trade stream.
+        """
+        import time
+        from korean_engine import KoreanEngine, PairState
+        emitted = []
+        engine = KoreanEngine(
+            emit_callback=emitted.append,
+            require_trade_confirmation=True,
+            drain_threshold=0.30,
+        )
+
+        st = engine._get_or_create_pair_state("BTC", "binance")
+        st.warmup_samples = 1
+        st.dev_window.append(0.0)
+        st.n_obs = 10
+        st.baseline_bps = 0.0
+
+        # Follower orderbook (calm, ready to be sniped)
+        t0 = time.time()
+        f_snap = OrderBookDepth5(
+            exchange="binance", symbol="BTC", raw_symbol="BTCUSDT",
+            ts=t0, exchange_ts=int(t0 * 1000),
+            bids=[(99000.0, 1.0)], asks=[(99100.0, 1.0), (99200.0, 1.0), (99300.0, 1.0)]
+        )
+        engine._books[("binance", "BTC")] = f_snap
+        engine._recv_ts[("binance", "BTC")] = t0
+
+        # Upbit baseline book with a heavy $10,000 ask plate at 105,000
+        upbit_t0 = OrderBookDepth5(
+            exchange="upbit", symbol="BTC", raw_symbol="KRW-BTC",
+            ts=t0 - 0.1, exchange_ts=int((t0 - 0.1) * 1000),
+            bids=[(104900.0, 1.0)],
+            asks=[(105000.0, 0.0952), (105500.0, 0.5)]  # ~10,000 USD at best ask
+        )
+        engine._books[("upbit", "BTC")] = upbit_t0
+        engine._recv_ts[("upbit", "BTC")] = t0 - 0.1
+        engine._update_upbit_norm("BTC", upbit_t0, t0 - 0.1)
+
+        # SCENARIO A: Market-maker CANCELS the 105,000 ask plate!
+        # Best ask lifts to 105,500 with zero taker trades on Upbit.
+        t_cancel = time.time()
+        upbit_cancel = OrderBookDepth5(
+            exchange="upbit", symbol="BTC", raw_symbol="KRW-BTC",
+            ts=t_cancel, exchange_ts=int(t_cancel * 1000),
+            bids=[(104900.0, 1.0)],
+            asks=[(105500.0, 0.5)]
+        )
+        # Process orderbook update with no preceding trades
+        engine.on_book_update(upbit_cancel)
+
+        # Result: Blocked! cancels_blocked increments, no false signal opened!
+        self.assertEqual(engine.counters["cancels_blocked"], 1)
+        self.assertIsNone(st.open_signal)
+        self.assertEqual(engine.counters["signals_triggered"], 0)
+
+        # SCENARIO B: REAL SWEEP! Aggressive buyer sweeps the 105,000 ask plate!
+        # Reset Upbit book back to baseline and reset baseline_bps to 0.0
+        st.baseline_bps = 0.0
+        t_sweep = time.time()
+        engine._books[("binance", "BTC")] = f_snap
+        engine._recv_ts[("binance", "BTC")] = t_sweep
+        engine._books[("upbit", "BTC")] = upbit_t0
+        engine._recv_ts[("upbit", "BTC")] = t_sweep - 0.05
+
+        # First, real-time taker buy trades hit the tape:
+        engine.on_upbit_trade("BTC", trade_usd=10000.0, is_taker_buy=True, ts=t_sweep)
+        self.assertEqual(engine.counters["trades_upbit"], 1)
+
+        # Now the orderbook update arrives reflecting the swept plate
+        upbit_swept = OrderBookDepth5(
+            exchange="upbit", symbol="BTC", raw_symbol="KRW-BTC",
+            ts=t_sweep, exchange_ts=int(t_sweep * 1000),
+            bids=[(104900.0, 1.0)],
+            asks=[(105500.0, 0.5)]
+        )
+        engine.on_book_update(upbit_swept)
+
+        # Result: Confirmed! Signal fires with verified taker buys!
+        self.assertEqual(engine.counters["cancels_blocked"], 1)  # unchanged
+        self.assertEqual(engine.counters["signals_triggered"], 1)
+        self.assertIsNotNone(st.open_signal)
+        self.assertEqual(st.open_signal.leader_recent_buys_usd, 10000.0)
+
+    def test_concurrent_upbit_trade_stream_thread_safety(self):
+        """Stress-tests concurrent on_upbit_trade and get_recent_upbit_buys across multiple threads."""
+        import threading
+        import time
+
+        engine = KoreanEngine(
+            emit_callback=lambda sig: None,
+            thresholds_file=os.path.join(self.test_dir, "matrix_thresholds.json")
+        )
+
+        coin = "ETH"
+        num_writers = 8
+        trades_per_writer = 250
+        num_readers = 8
+        reads_per_reader = 250
+        errors = []
+
+        now = time.time()
+
+        def writer_worker(w_id: int):
+            try:
+                for i in range(trades_per_writer):
+                    t = now + (i * 0.001)
+                    engine.on_upbit_trade(coin, trade_usd=50.0 + (i % 10), is_taker_buy=True, ts=t)
+            except Exception as e:
+                errors.append(f"Writer-{w_id} failed: {e}")
+
+        def reader_worker(r_id: int):
+            try:
+                for i in range(reads_per_reader):
+                    cutoff = now + (i * 0.001) - 1.0
+                    buys_usd, has_trades = engine.get_recent_upbit_buys(coin, cutoff)
+                    self.assertIsInstance(buys_usd, float)
+                    self.assertIsInstance(has_trades, bool)
+            except Exception as e:
+                errors.append(f"Reader-{r_id} failed: {e}")
+
+        threads = []
+        for w in range(num_writers):
+            threads.append(threading.Thread(target=writer_worker, args=(w,)))
+        for r in range(num_readers):
+            threads.append(threading.Thread(target=reader_worker, args=(r,)))
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5.0)
+
+        self.assertEqual(errors, [], f"Encountered thread race errors: {errors}")
+        expected_total_trades = num_writers * trades_per_writer
+        self.assertEqual(engine.counters["trades_upbit"], expected_total_trades)
 
 
 if __name__ == "__main__":

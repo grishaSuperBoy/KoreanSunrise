@@ -22,6 +22,7 @@ import glob
 import gzip
 import json
 import os
+import statistics
 import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -40,7 +41,7 @@ UNIVERSE_FILE = os.path.join(PROJECT_ROOT, "universe_live.json")
 THRESHOLDS_FILE = os.path.join(PROJECT_ROOT, "matrix_thresholds.json")
 
 SWEEP_THRESHOLDS = (10, 15, 20, 25, 30, 35, 40, 50, 60)
-FUNDED_VENUES = {"binance", "bybit", "okx", "gateio", "mexc", "kucoin", "bingx"}
+FUNDED_VENUES = {"binance", "bybit", "okx", "gateio", "mexc", "kucoin", "bingx", "htx", "pionex", "asterdex", "hyperliquid"}
 
 
 def _collect_files(days_back: float = 1.0) -> List[str]:
@@ -112,8 +113,15 @@ def generate_daily_report(
     }
 
     sweep = {t: {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0} for t in SWEEP_THRESHOLDS}
-    pair_stats = collections.defaultdict(lambda: {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0})
-    coin_stats = collections.defaultdict(lambda: {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0, "mfes": [], "t_peaks": []})
+    pair_stats = collections.defaultdict(lambda: {
+        "count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0,
+        "top3_depths": [], "stealth_caps": []
+    })
+    coin_stats = collections.defaultdict(lambda: {
+        "count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0,
+        "mfes": [], "t_peaks": [], "top3_depths": [], "stealth_caps": []
+    })
+    venue_capacities = collections.defaultdict(lambda: {"count": 0, "top3_depths": [], "stealth_caps": []})
 
     for fpath in files:
         try:
@@ -175,6 +183,10 @@ def generate_daily_report(
                     if drain_ratio < 0.40 and cross_ratio < 0.50:
                         continue
 
+                    stealth_cap = float(d.get("stealth_capacity_usd", 0.0))
+                    if stealth_cap <= 0.0 and f_top3_ask > 0.0:
+                        stealth_cap = round(0.15 * f_top3_ask, 2)
+
                     pk = f"{coin}:upbit-{f_ex}"
                     req_edge = calibrated_thresholds.get(pk, 20.0)
                     if gross_edge_bps >= req_edge:
@@ -203,6 +215,9 @@ def generate_daily_report(
                     ps["fee"] += fee_usd
                     ps["net"] += net
                     ps["wins"] += is_win
+                    if f_top3_ask > 0:
+                        ps["top3_depths"].append(f_top3_ask)
+                        ps["stealth_caps"].append(stealth_cap)
 
                     # Coin stats
                     cs = coin_stats[coin]
@@ -211,12 +226,22 @@ def generate_daily_report(
                     cs["fee"] += fee_usd
                     cs["net"] += net
                     cs["wins"] += is_win
+                    if f_top3_ask > 0:
+                        cs["top3_depths"].append(f_top3_ask)
+                        cs["stealth_caps"].append(stealth_cap)
                     mfe = d.get("mfe_exec_pnl_bps")
                     if mfe is not None:
                         cs["mfes"].append(float(mfe))
                     t_pk = d.get("time_to_peak_sec")
                     if t_pk is not None:
                         cs["t_peaks"].append(float(t_pk))
+
+                    # Venue capacity stats
+                    if f_top3_ask > 0:
+                        vc = venue_capacities[f_ex]
+                        vc["count"] += 1
+                        vc["top3_depths"].append(f_top3_ask)
+                        vc["stealth_caps"].append(stealth_cap)
 
         except Exception as e:
             if not as_json:
@@ -243,12 +268,16 @@ def generate_daily_report(
     sorted_pairs = []
     for pk, ps in sorted(pair_stats.items(), key=lambda x: x[1]["net"], reverse=True):
         cnt = ps["count"]
+        med_top3 = statistics.median(ps["top3_depths"]) if ps["top3_depths"] else 0.0
+        med_cap = statistics.median(ps["stealth_caps"]) if ps["stealth_caps"] else 0.0
         sorted_pairs.append({
             "pair": pk,
             "trades": cnt,
             "winrate_pct": round((ps["wins"] / cnt) * 100.0, 1) if cnt else 0.0,
             "net_pnl_usd": round(ps["net"], 2),
             "gross_usd": round(ps["gross"], 2),
+            "med_top3_depth_usd": round(med_top3, 1),
+            "med_stealth_cap_usd": round(med_cap, 1),
         })
 
     # Format top coins
@@ -257,6 +286,8 @@ def generate_daily_report(
         cnt = cs["count"]
         avg_mfe = sum(cs["mfes"]) / len(cs["mfes"]) if cs["mfes"] else 0.0
         med_tpk = sorted(cs["t_peaks"])[len(cs["t_peaks"]) // 2] if cs["t_peaks"] else 0.0
+        med_top3 = statistics.median(cs["top3_depths"]) if cs["top3_depths"] else 0.0
+        med_cap = statistics.median(cs["stealth_caps"]) if cs["stealth_caps"] else 0.0
         sorted_coins.append({
             "coin": c,
             "trades": cnt,
@@ -264,6 +295,31 @@ def generate_daily_report(
             "net_pnl_usd": round(cs["net"], 2),
             "avg_mfe_bps": round(avg_mfe, 1),
             "median_t_peak_sec": round(med_tpk, 2),
+            "med_top3_depth_usd": round(med_top3, 1),
+            "med_stealth_cap_usd": round(med_cap, 1),
+        })
+
+    # Format venue physical capacities
+    venue_summary = []
+    for vex, vdata in sorted(venue_capacities.items(), key=lambda x: len(x[1]["stealth_caps"]), reverse=True):
+        if not vdata["stealth_caps"]:
+            continue
+        caps = sorted(vdata["stealth_caps"])
+        depths = sorted(vdata["top3_depths"])
+        n_c = len(caps)
+        med_cap = statistics.median(caps)
+        med_depth = statistics.median(depths)
+        p25_cap = caps[n_c // 4]
+        p75_cap = caps[(3 * n_c) // 4]
+        venue_summary.append({
+            "venue": vex,
+            "signals": vdata["count"],
+            "med_top3_depth_usd": round(med_depth, 1),
+            "med_stealth_cap_usd": round(med_cap, 1),
+            "p25_stealth_cap_usd": round(p25_cap, 1),
+            "p75_stealth_cap_usd": round(p75_cap, 1),
+            "min_stealth_cap_usd": round(caps[0], 1),
+            "max_stealth_cap_usd": round(caps[-1], 1),
         })
 
     doc = {
@@ -283,6 +339,7 @@ def generate_daily_report(
         "close_reasons": dict(close_reasons),
         "trigger_types": dict(trigger_types),
         "pnl_scenarios": pnl_summary,
+        "venue_capacities": venue_summary,
         "sweep_thresholds": {
             t: {
                 "trades": sweep[t]["count"],
@@ -318,6 +375,7 @@ def generate_daily_report(
 def _render_markdown_report(doc: Dict[str, Any]) -> str:
     m = doc["metadata"]
     p = doc["pnl_scenarios"]
+    vc = doc.get("venue_capacities", [])
     lines = [
         f"# Korean Sunrise: Суточный Квантовый Отчёт ({m['report_date']})",
         f"*Сгенерирован:* `{m['generated_at']}` | *Окно:* `{m['days_analyzed']} d` | *Размер слота:* `${m['order_size_usd']}` | *Комиссия:* `{m['roundtrip_fee_bps']} bps`",
@@ -347,9 +405,26 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
             f"${row['gross_usd']:.2f} | ${row['fee_usd']:.2f} | **${row['net_pnl_usd']:.2f}** | {row['profit_factor']} |"
         )
 
+    # Section 3: Physical order book capacity
     lines.extend([
         "",
-        "## 3. Оптимизация порогов спреда (Threshold Sweep)",
+        "## 3. Физическая ёмкость стакана по биржам (Real Order Book Capacity)",
+        "| Биржа | Сигналов | Мед. Top-3 стакан ($) | Мед. 15% Ёмкость ($) | P25 Ёмкость ($) | P75 Ёмкость ($) | Мин. ($) | Макс. ($) |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+    ])
+    if vc:
+        for v in vc:
+            lines.append(
+                f"| `{v['venue']}` | {v['signals']:,} | ${v['med_top3_depth_usd']:,.1f} | "
+                f"**${v['med_stealth_cap_usd']:,.1f}** | ${v['p25_stealth_cap_usd']:,.1f} | "
+                f"${v['p75_stealth_cap_usd']:,.1f} | ${v['min_stealth_cap_usd']:,.1f} | ${v['max_stealth_cap_usd']:,.1f} |"
+            )
+    else:
+        lines.append("| *Нет накопленных данных по стаканам* | - | - | - | - | - | - | - |")
+
+    lines.extend([
+        "",
+        "## 4. Оптимизация порогов спреда (Threshold Sweep)",
         "| Порог (bps) | Сигналов | Win Rate | Net PnL USD |",
         "| :---: | :---: | :---: | :---: |",
     ])
@@ -358,27 +433,35 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "## 4. Топ прибыльных связок (Upbit Leader <-> Perp Follower)",
-        "| Связка (Coin:Upbit-Follower) | Сделок | Win Rate | Gross USD | Net PnL USD |",
-        "| :--- | :---: | :---: | :---: | :---: |",
+        "## 5. Топ прибыльных связок (Upbit Leader <-> Perp Follower)",
+        "| Связка (Coin:Upbit-Follower) | Сделок | Win Rate | Gross USD | Net PnL USD | Мед. Top-3 ($) | Мед. 15% Ёмкость ($) |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
     ])
     if doc["top_pairs"]:
         for pr in doc["top_pairs"][:15]:
-            lines.append(f"| `{pr['pair']}` | {pr['trades']} | {pr['winrate_pct']}% | ${pr['gross_usd']:.2f} | **${pr['net_pnl_usd']:.2f}** |")
+            lines.append(
+                f"| `{pr['pair']}` | {pr['trades']} | {pr['winrate_pct']}% | "
+                f"${pr['gross_usd']:.2f} | **${pr['net_pnl_usd']:.2f}** | "
+                f"${pr.get('med_top3_depth_usd', 0.0):,.1f} | **${pr.get('med_stealth_cap_usd', 0.0):,.1f}** |"
+            )
     else:
-        lines.append("| *Нет накопленных сделок за выбранный период* | - | - | - | - |")
+        lines.append("| *Нет накопленных сделок за выбранный период* | - | - | - | - | - | - |")
 
     lines.extend([
         "",
-        "## 5. Топ монет по эффективности опережения",
-        "| Монета | Сделок | Win Rate | Net PnL USD | Ср. MFE (bps) | Медиана $T_{peak}$ |",
-        "| :--- | :---: | :---: | :---: | :---: | :---: |",
+        "## 6. Топ монет по эффективности опережения",
+        "| Монета | Сделок | Win Rate | Net PnL USD | Мед. Top-3 ($) | Мед. 15% Ёмкость ($) | Ср. MFE (bps) | Медиана $T_{peak}$ |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ])
     if doc["top_coins"]:
         for c in doc["top_coins"][:15]:
-            lines.append(f"| **{c['coin']}** | {c['trades']} | {c['winrate_pct']}% | **${c['net_pnl_usd']:.2f}** | +{c['avg_mfe_bps']} bps | {c['median_t_peak_sec']} s |")
+            lines.append(
+                f"| **{c['coin']}** | {c['trades']} | {c['winrate_pct']}% | **${c['net_pnl_usd']:.2f}** | "
+                f"${c.get('med_top3_depth_usd', 0.0):,.1f} | **${c.get('med_stealth_cap_usd', 0.0):,.1f}** | "
+                f"+{c['avg_mfe_bps']} bps | {c['median_t_peak_sec']} s |"
+            )
     else:
-        lines.append("| *Нет накопленных данных по монетам* | - | - | - | - | - |")
+        lines.append("| *Нет накопленных данных по монетам* | - | - | - | - | - | - | - |")
 
     return "\n".join(lines)
 

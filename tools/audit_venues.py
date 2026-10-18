@@ -34,6 +34,8 @@ ALL_VENUES = [
     "bingx",
     "htx",
     "pionex",
+    "asterdex",
+    "hyperliquid",
 ]
 
 HERE = os.path.dirname(os.path.abspath(__file__))

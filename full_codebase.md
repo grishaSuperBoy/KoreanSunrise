@@ -283,27 +283,59 @@ TAKER_FEE_BPS = 5.0             # Single-leg VIP0 taker fee (bps) on Binance/Byb
 ROUNDTRIP_FEE_BPS = 10.0        # Entry + Exit taker fee (bps) for net realized PnL
 MIN_WARMUP_SAMPLES = 30         # Minimum 1s MAD samples before firing signals
 MAX_SIGNAL_HOLD_SEC = 6.0       # Maximum holding horizon before timeout closure
+MAX_FOLLOWER_BOOK_AGE_SEC = 0.30 # Maximum 300ms staleness allowed for follower book snapshots
 
 # Regex to detect multiplier prefixes on Binance/Bybit perps: 1000PEPE, 1000000MOG, etc.
 _MULT_PREFIX_RE = re.compile(r"^(1000000|100000|10000|1000|100)([A-Z0-9]+)$")
 
+ALL_SUPPORTED_VENUES = [
+    "binance",
+    "bybit",
+    "okx",
+    "gateio",
+    "mexc",
+    "kucoin",
+    "bingx",
+    "htx",
+    "pionex",
+    "asterdex",
+    "hyperliquid",
+]
+
 
 @dataclass
 class MatchedUniverse:
-    """Holds the dynamically matched universe of coins across Upbit, Binance, and Bybit."""
+    """Holds the dynamically matched universe of coins across Upbit and all 11 follower perp venues."""
     # Canonical base coin list (Upbit base names, e.g. ["PEPE", "DOGE", "SAND", ...])
     coins: List[str] = field(default_factory=list)
 
     # Upbit mapping: KRW market code -> canonical coin (e.g. "KRW-PEPE" -> "PEPE")
     upbit_krw_to_coin: Dict[str, str] = field(default_factory=dict)
 
-    # Binance Futures mapping: raw exchange symbol -> (canonical coin, price_multiplier)
-    # e.g. "1000PEPEUSDT" -> ("PEPE", 1000.0), "SANDUSDT" -> ("SAND", 1.0)
-    binance_sym_map: Dict[str, Tuple[str, float]] = field(default_factory=dict)
+    # First-class typed dictionary for all follower venue symbol maps:
+    # venue -> {raw_symbol: (canonical_coin, mult, contract_size)}
+    venue_sym_maps: Dict[str, Dict[str, Tuple[str, float, float]]] = field(default_factory=dict)
 
-    # Bybit Linear mapping: raw exchange symbol -> (canonical coin, price_multiplier)
-    # e.g. "1000PEPEUSDT" -> ("PEPE", 1000.0), "SANDUSDT" -> ("SAND", 1.0)
+    # Legacy convenience attributes for Binance & Bybit backward-compatibility
+    binance_sym_map: Dict[str, Tuple[str, float]] = field(default_factory=dict)
     bybit_sym_map: Dict[str, Tuple[str, float]] = field(default_factory=dict)
+
+    def get_sym_map(self, venue: str) -> Dict[str, Tuple[str, float, float]]:
+        """Returns the symbol mapping for any supported venue with (coin, mult, c_size)."""
+        v = venue.lower()
+        if v in self.venue_sym_maps:
+            return self.venue_sym_maps[v]
+        if v == "binance":
+            return {
+                k: (val[0], float(val[1]), float(val[2]) if len(val) >= 3 else 1.0)
+                for k, val in self.binance_sym_map.items()
+            }
+        if v == "bybit":
+            return {
+                k: (val[0], float(val[1]), float(val[2]) if len(val) >= 3 else 1.0)
+                for k, val in self.bybit_sym_map.items()
+            }
+        return {}
 
 
 def _http_get_json(url: str, timeout: float = 12.0):
@@ -481,6 +513,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import asdict
@@ -603,6 +636,8 @@ class KoreanEngine:
         roundtrip_fee_bps: float = C.ROUNDTRIP_FEE_BPS,
         warmup_samples: int = C.MIN_WARMUP_SAMPLES,
         max_hold_sec: float = C.MAX_SIGNAL_HOLD_SEC,
+        max_follower_book_age_sec: float = getattr(C, "MAX_FOLLOWER_BOOK_AGE_SEC", 0.30),
+        require_trade_confirmation: bool = False,
         pool_state: Any = None,
         profile_manager: Any = None,
         thresholds_file: Optional[str] = None,
@@ -617,12 +652,19 @@ class KoreanEngine:
         self.roundtrip_fee_bps = roundtrip_fee_bps
         self.warmup_samples = warmup_samples
         self.max_hold_sec = max_hold_sec
+        self.max_follower_book_age_sec = max_follower_book_age_sec
+        self.require_trade_confirmation = require_trade_confirmation
         self.pool_state = pool_state
         self.profile_manager = profile_manager
 
         # (exchange, coin) -> OrderBookDepth5
         self._books: Dict[Tuple[str, str], OrderBookDepth5] = {}
         self._recv_ts: Dict[Tuple[str, str], float] = {}
+
+        # Upbit recent taker buys: coin -> deque of (ts, trade_usd)
+        self._buys_lock = threading.Lock()
+        self._upbit_recent_buys: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=200))
+        self._has_upbit_trades: Dict[str, bool] = defaultdict(bool)
 
         # Upbit normalisation state per coin:
         # coin -> {"depth_ask": float, "best_ask_usd": float, "spread_bps": float, "t": float}
@@ -639,6 +681,8 @@ class KoreanEngine:
         self.counters = {
             "ticks_upbit": 0,
             "ticks_followers": 0,
+            "trades_upbit": 0,
+            "cancels_blocked": 0,
             "signals_triggered": 0,
             "signals_battle": 0,
             "signals_incubator": 0,
@@ -709,7 +753,6 @@ class KoreanEngine:
 
     def on_book_update(self, snap: OrderBookDepth5) -> None:
         now = time.time()
-        self.maybe_reload_thresholds(now)
         ex = snap.exchange.lower()
         coin = snap.symbol.upper()
         key = (ex, coin)
@@ -734,6 +777,36 @@ class KoreanEngine:
                         st.learn(raw_diff_bps, now)
 
             self._track_follower_move(coin, ex, snap, now)
+
+    def on_upbit_trade(self, coin: str, trade_usd: float, is_taker_buy: bool, ts: float) -> None:
+        """
+        Real-time trade stream ingestion from Upbit.
+        Records taker buys to verify liquidity sweeps and reject MM quote cancellations.
+        Thread-safe across concurrent WebSocket worker threads.
+        """
+        c = coin.upper()
+        with self._buys_lock:
+            self.counters["trades_upbit"] = self.counters.get("trades_upbit", 0) + 1
+            self._has_upbit_trades[c] = True
+            if is_taker_buy and trade_usd > 0.0:
+                self._upbit_recent_buys[c].append((ts, trade_usd))
+
+    def get_recent_upbit_buys(self, coin: str, cutoff: float) -> Tuple[float, bool]:
+        """
+        Thread-safe retrieval and pruning of recent taker buys for a coin.
+        Returns (recent_buys_usd, has_trades).
+        Prevents race conditions (IndexError / deque mutation during iteration).
+        """
+        c = coin.upper()
+        with self._buys_lock:
+            buys_deque = self._upbit_recent_buys.get(c)
+            recent_buys_usd = 0.0
+            if buys_deque:
+                while buys_deque and buys_deque[0][0] < cutoff:
+                    buys_deque.popleft()
+                recent_buys_usd = sum(b[1] for b in buys_deque)
+            has_trades = self._has_upbit_trades.get(c, False)
+            return recent_buys_usd, has_trades
 
     # ----------------------------------------------------------- Upbit Norm
     def _update_upbit_norm(self, coin: str, snap: OrderBookDepth5, now: float) -> None:
@@ -823,11 +896,35 @@ class KoreanEngine:
             trigger_type = "spread_blowout"
             swept_usd = max(prev_upbit_snap.best_ask_usd, max(0.0, prev_upbit_snap.depth_ask_usd - cur_depth))
 
+        # Cancel vs. Sweep Discrimination (Anti-Ghosting Guard)
+        # If Upbit trade feed is available or trade confirmation is required,
+        # verify that the liquidity drop was backed by real taker buys rather than MM cancels/quote pullbacks.
+        recent_buys_usd = 0.0
+        if trigger_type is not None:
+            cutoff = now - 2.5
+            recent_buys_usd, has_trades = self.get_recent_upbit_buys(coin, cutoff)
+
+            should_verify_trades = self.require_trade_confirmation or has_trades
+            if should_verify_trades:
+                ratio_needed = 0.40 if ask_held else 0.25
+                min_buys_needed = max(20.0, swept_usd * ratio_needed)
+
+                if recent_buys_usd < min_buys_needed:
+                    self.counters["cancels_blocked"] = self.counters.get("cancels_blocked", 0) + 1
+                    log.debug(
+                        f"[engine] Blocked false sweep / MM cancel on Upbit {coin}: "
+                        f"swept_usd=${swept_usd:.1f}, but recent taker buys=${recent_buys_usd:.1f} "
+                        f"(needed ${min_buys_needed:.1f})"
+                    )
+                    trigger_type = None
+                    swept_usd = 0.0
+                    drain_ratio = 0.0
+
         follower_exchanges = [ex for (ex, c) in self._books.keys() if ex != "upbit" and c == coin]
         for follower_ex in follower_exchanges:
             f_snap = self._books.get((follower_ex, coin))
             f_recv = self._recv_ts.get((follower_ex, coin), 0.0)
-            if f_snap is None or (now - f_recv) > 2.0:
+            if f_snap is None or (now - f_recv) > self.max_follower_book_age_sec:
                 continue
 
             st = self._get_or_create_pair_state(coin, follower_ex)
@@ -854,6 +951,7 @@ class KoreanEngine:
                     drain_ratio=drain_ratio,
                     blowout_ratio=blowout_ratio,
                     now=now,
+                    recent_buys_usd=recent_buys_usd,
                 )
 
             if st.open_signal is None:
@@ -874,6 +972,7 @@ class KoreanEngine:
         drain_ratio: float,
         blowout_ratio: float,
         now: float,
+        recent_buys_usd: float = 0.0,
     ) -> None:
         sigma = st.sigma(now)
         upbit_mid = upbit_snap.mid_price
@@ -882,6 +981,10 @@ class KoreanEngine:
         f_ask = f_snap.best_ask
 
         if f_ask <= 0 or f_bid <= 0:
+            return
+
+        # Stale quote guard: reject follower books older than max allowed age (default 300ms)
+        if f_book_age_ms > (self.max_follower_book_age_sec * 1000.0):
             return
 
         raw_diff_bps = (upbit_mid - f_mid) / f_mid * 1e4
@@ -901,22 +1004,14 @@ class KoreanEngine:
         if dev_z < min_dev_z:
             return
 
-        f_ask_diff_bps = (upbit_mid - f_ask) / f_ask * 1e4
-        gross_exec_edge_bps = f_ask_diff_bps - st.baseline_bps
-        net_edge = gross_exec_edge_bps - self.taker_fee_bps
-
-        req_edge = float(pair_cfg.get("min_spread_bps", self.min_edge_bps))
-        if net_edge < req_edge:
-            return
-
         pair_hold_sec = float(pair_cfg.get("max_hold_sec", self.max_hold_sec))
-
-        if f_snap.spread_bps >= gross_exec_edge_bps * 0.8:
-            return
 
         top3_ask_depth_usd = f_snap.top_n_ask_depth_usd(3)
         if top3_ask_depth_usd < 50.0:
             return
+
+        # Physical 15% order book capacity (independent of current wallet budget)
+        stealth_capacity_usd = round(self.stealth_fraction * top3_ask_depth_usd, 2)
 
         # Determine pool basket and actionable status
         is_battle = self.pool_state.is_battle_coin(coin) if self.pool_state else False
@@ -928,16 +1023,33 @@ class KoreanEngine:
             sized = self.profile_manager.calculate_stealth_order_size(follower_ex, top3_ask_depth_usd)
             suggested_size_usd = sized if sized is not None else min(
                 self.max_position_budget_usd,
-                self.stealth_fraction * top3_ask_depth_usd,
+                stealth_capacity_usd,
             )
         else:
             suggested_size_usd = min(
                 self.max_position_budget_usd,
-                self.stealth_fraction * top3_ask_depth_usd,
+                stealth_capacity_usd,
             )
 
-        # Initial executable PnL at t=0 (if bought at f_ask and immediately sold at f_bid)
-        init_exec_move_bps = (f_bid - f_ask) / f_ask * 1e4
+        # True VWAP execution fill price across ask levels for suggested size
+        f_entry_px = f_snap.vwap_ask_usd(suggested_size_usd)
+        if f_entry_px <= 0:
+            return
+
+        f_ask_diff_bps = (upbit_mid - f_entry_px) / f_entry_px * 1e4
+        gross_exec_edge_bps = f_ask_diff_bps - st.baseline_bps
+        net_edge = gross_exec_edge_bps - self.roundtrip_fee_bps
+
+        req_edge = float(pair_cfg.get("min_spread_bps", self.min_edge_bps))
+        if net_edge < req_edge:
+            return
+
+        if f_snap.spread_bps >= gross_exec_edge_bps * 0.8:
+            return
+
+        # Initial executable PnL at t=0 (if bought at f_entry_px and immediately sold at VWAP bid)
+        init_exit_px = f_snap.vwap_bid_usd(suggested_size_usd)
+        init_exec_move_bps = (init_exit_px - f_entry_px) / f_entry_px * 1e4
         init_net_pnl_bps = round(init_exec_move_bps - self.roundtrip_fee_bps, 2)
 
         self._seq += 1
@@ -976,6 +1088,9 @@ class KoreanEngine:
             follower_latency_ms=f_snap.network_latency_ms,
             follower_book_age_ms=round(f_book_age_ms, 1),
             suggested_size_usd=round(suggested_size_usd, 2),
+            stealth_capacity_usd=round(stealth_capacity_usd, 2),
+            follower_entry_px=round(f_entry_px, 8),
+            leader_recent_buys_usd=round(recent_buys_usd, 2),
             basket=basket,
             is_actionable=is_actionable,
             max_hold_sec=pair_hold_sec,
@@ -996,10 +1111,12 @@ class KoreanEngine:
             self.counters["signals_incubator"] += 1
             tag = "[SIGNAL-INCUBATOR] 🧪"
 
+        buys_str = f", UpBuys: ${sig.leader_recent_buys_usd:.0f}" if sig.leader_recent_buys_usd > 0 else ""
         log.info(
             f"{tag} {sig.coin} ({sig.follower_contract}) | Upbit -> {sig.follower_exchange} | "
-            f"Trig: {sig.trigger_type} (Swept: ${sig.leader_swept_usd:.0f}) | "
-            f"Edge: +{sig.net_exec_edge_bps:.1f} bps | Z: {sig.dev_z:.1f}σ | Size: ${sig.suggested_size_usd:.0f}"
+            f"Trig: {sig.trigger_type} (Swept: ${sig.leader_swept_usd:.0f}{buys_str}) | "
+            f"Edge: +{sig.net_exec_edge_bps:.1f} bps | Z: {sig.dev_z:.1f}σ | "
+            f"Size: ${sig.suggested_size_usd:.0f} (Cap15%: ${sig.stealth_capacity_usd:.0f})"
         )
 
     # ----------------------------------------------------------- Tracking & Closure
@@ -1033,8 +1150,10 @@ class KoreanEngine:
             f_mid_move = (f_snap.mid_price - sig.follower_mid) / sig.follower_mid * 1e4
             up_mid_move = (upbit_snap.mid_price - sig.leader_mid) / sig.leader_mid * 1e4
 
-            # 2. True executable move on follower: Entry at best_ask -> Exit at current best_bid (bps)
-            f_exec_move = (f_snap.best_bid - sig.follower_best_ask) / sig.follower_best_ask * 1e4
+            # 2. True executable move on follower: Entry at VWAP ask -> Exit at current VWAP bid (bps)
+            entry_px = getattr(sig, "follower_entry_px", 0.0) or sig.follower_best_ask
+            exit_px = f_snap.vwap_bid_usd(sig.suggested_size_usd) if sig.suggested_size_usd > 0 else f_snap.best_bid
+            f_exec_move = (exit_px - entry_px) / entry_px * 1e4
             cur_net_pnl = round(f_exec_move - self.roundtrip_fee_bps, 2)
 
             # 3. Update MFE / MAE excursion metrics
@@ -1061,7 +1180,7 @@ class KoreanEngine:
 
             # Closure evaluation:
             hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
-            if f_exec_move >= (sig.net_exec_edge_bps * 0.8):
+            if cur_net_pnl >= (sig.net_exec_edge_bps * 0.8) and cur_net_pnl > 0.0:
                 self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
             elif rem_edge <= 0.0:
                 if cur_net_pnl > 0.0:
@@ -1112,7 +1231,6 @@ class KoreanEngine:
         Sweeps and closes any active signals that exceeded max_hold_sec even if no new ticks arrived.
         Prevents open signals from lingering on illiquid or inactive coins.
         """
-        self.maybe_reload_thresholds(now)
         for coin, signals in list(self._active_signals.items()):
             for sig in list(signals):
                 hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
@@ -1120,7 +1238,9 @@ class KoreanEngine:
                     f_snap = self._books.get((sig.follower_exchange, coin))
                     if f_snap:
                         f_mid_move = (f_snap.mid_price - sig.follower_mid) / sig.follower_mid * 1e4
-                        f_exec_move = (f_snap.best_bid - sig.follower_best_ask) / sig.follower_best_ask * 1e4
+                        entry_px = getattr(sig, "follower_entry_px", 0.0) or sig.follower_best_ask
+                        exit_px = f_snap.vwap_bid_usd(sig.suggested_size_usd) if sig.suggested_size_usd > 0 else f_snap.best_bid
+                        f_exec_move = (exit_px - entry_px) / entry_px * 1e4
                     else:
                         f_mid_move = 0.0
                         f_exec_move = 0.0
@@ -1189,6 +1309,7 @@ class KoreanSunriseService:
             roundtrip_fee_bps=C.ROUNDTRIP_FEE_BPS,
             warmup_samples=C.MIN_WARMUP_SAMPLES,
             max_hold_sec=C.MAX_SIGNAL_HOLD_SEC,
+            require_trade_confirmation=True,
             pool_state=self.pool_state,
             profile_manager=self.profile_manager,
         )
@@ -1205,6 +1326,36 @@ class KoreanSunriseService:
         self.running = False
         self._shutdown_event = asyncio.Event()
 
+    @staticmethod
+    def _parse_universe_doc(doc: Dict[str, Any]) -> C.MatchedUniverse:
+        coins = doc.get("coins", [])
+        upbit_krw_to_coin = doc.get("upbit_krw_to_coin", {})
+        venue_sym_maps: Dict[str, Dict[str, Tuple[str, float, float]]] = {}
+        for k, v in doc.items():
+            if k.endswith("_sym_map") and isinstance(v, dict):
+                v_name = k.replace("_sym_map", "").lower()
+                venue_sym_maps[v_name] = {
+                    raw_sym: (
+                        str(tup[0]),
+                        float(tup[1]),
+                        float(tup[2]) if len(tup) >= 3 else 1.0,
+                    )
+                    for raw_sym, tup in v.items()
+                }
+
+        binance_sym_map = {k: (v[0], v[1]) for k, v in venue_sym_maps.get("binance", {}).items()}
+        bybit_sym_map = {k: (v[0], v[1]) for k, v in venue_sym_maps.get("bybit", {}).items()}
+
+        univ = C.MatchedUniverse(
+            coins=coins,
+            upbit_krw_to_coin=upbit_krw_to_coin,
+            venue_sym_maps=venue_sym_maps,
+            binance_sym_map=binance_sym_map,
+            bybit_sym_map=bybit_sym_map,
+        )
+        univ._raw_doc = doc
+        return univ
+
     async def run(self) -> None:
         self.running = True
         if self.api_server:
@@ -1215,18 +1366,8 @@ class KoreanSunriseService:
             try:
                 with open(univ_file, "r", encoding="utf-8") as f:
                     doc = json.load(f)
-                coins = doc.get("coins", [])
-                upbit_krw_to_coin = doc.get("upbit_krw_to_coin", {})
-                binance_sym_map = {k: tuple(v) for k, v in doc.get("binance_sym_map", {}).items()}
-                bybit_sym_map = {k: tuple(v) for k, v in doc.get("bybit_sym_map", {}).items()}
-                self.universe = C.MatchedUniverse(
-                    coins=coins,
-                    upbit_krw_to_coin=upbit_krw_to_coin,
-                    binance_sym_map=binance_sym_map,
-                    bybit_sym_map=bybit_sym_map,
-                )
-                self.universe._raw_doc = doc
-                log.info(f"=== Loaded {len(coins)} incubator coins from universe_live.json ===")
+                self.universe = self._parse_universe_doc(doc)
+                log.info(f"=== Loaded {len(self.universe.coins)} incubator coins across {len(self.universe.venue_sym_maps)} venues from universe_live.json ===")
             except Exception as e:
                 log.warning(f"Could not parse universe_live.json: {e}")
                 self.universe = None
@@ -1236,17 +1377,7 @@ class KoreanSunriseService:
             from screening.screener import UniverseScreener
             screener = UniverseScreener(output_file=univ_file)
             doc = await asyncio.to_thread(screener.run)
-            coins = doc.get("coins", [])
-            upbit_krw_to_coin = doc.get("upbit_krw_to_coin", {})
-            binance_sym_map = {k: tuple(v) for k, v in doc.get("binance_sym_map", {}).items()}
-            bybit_sym_map = {k: tuple(v) for k, v in doc.get("bybit_sym_map", {}).items()}
-            self.universe = C.MatchedUniverse(
-                coins=coins,
-                upbit_krw_to_coin=upbit_krw_to_coin,
-                binance_sym_map=binance_sym_map,
-                bybit_sym_map=bybit_sym_map,
-            )
-            self.universe._raw_doc = doc
+            self.universe = self._parse_universe_doc(doc)
 
         self.pool_state.reload()
 
@@ -1258,17 +1389,23 @@ class KoreanSunriseService:
         self.stream_manager = StreamManager(
             universe=self.universe,
             callback=self.engine.on_book_update,
+            trade_callback=self.engine.on_upbit_trade,
             active_venues=active_venues,
         )
         await self.stream_manager.start_all()
 
         last_heartbeat = time.time()
+        last_reload = time.time()
 
         try:
             while not self._shutdown_event.is_set():
                 now = time.time()
                 self.engine.sweep_timeouts(now)
                 await asyncio.to_thread(self.writer.maybe_flush, now)
+
+                if now - last_reload >= 30.0:
+                    last_reload = now
+                    await asyncio.to_thread(self.engine.maybe_reload_thresholds, now)
 
                 if now - last_heartbeat >= 15.0:
                     self._log_heartbeat()
@@ -1304,7 +1441,8 @@ class KoreanSunriseService:
         log.info(
             f"[HEARTBEAT] KRW/USDT: {krw_rate:.1f} | "
             f"Pool: Inc {summary['incubator']} | Battle {summary['battle']} (Active: {summary['battle_active']}) | "
-            f"Ticks: Up {c['ticks_upbit']} / Foll {c['ticks_followers']} | "
+            f"Ticks: Up {c['ticks_upbit']} (Trades: {c.get('trades_upbit', 0)}) / Foll {c['ticks_followers']} | "
+            f"Cancels Blocked: {c.get('cancels_blocked', 0)} | "
             f"Sigs: {c['signals_triggered']} (⚔️Battle: {c.get('signals_battle', 0)}, 🧪Inc: {c.get('signals_incubator', 0)}) | "
             f"Streams: [{conn_str}]"
         )
@@ -4423,6 +4561,66 @@ class OrderBookDepth5:
             return round(self.ts * 1000.0 - float(self.exchange_ts), 1)
         return 0.0
 
+    def vwap_ask_usd(self, notional_usd: float) -> float:
+        """
+        Calculates the VWAP execution fill price for buying notional_usd across available ask levels.
+        If notional exceeds available book depth, the remaining portion is filled at the worst available ask price.
+        """
+        if not self.asks or notional_usd <= 0:
+            return self.best_ask
+        remaining = notional_usd
+        total_qty = 0.0
+        filled_usd = 0.0
+        for p, q in self.asks:
+            level_usd = p * q
+            if level_usd <= 0:
+                continue
+            if remaining <= level_usd:
+                total_qty += remaining / p
+                filled_usd += remaining
+                remaining = 0.0
+                break
+            else:
+                total_qty += q
+                filled_usd += level_usd
+                remaining -= level_usd
+        if remaining > 0 and self.asks:
+            worst_p = self.asks[-1][0]
+            if worst_p > 0:
+                total_qty += remaining / worst_p
+                filled_usd += remaining
+        return (filled_usd / total_qty) if total_qty > 0 else self.best_ask
+
+    def vwap_bid_usd(self, notional_usd: float) -> float:
+        """
+        Calculates the VWAP execution fill price for selling notional_usd across available bid levels.
+        If notional exceeds available book depth, the remaining portion is filled at the worst available bid price.
+        """
+        if not self.bids or notional_usd <= 0:
+            return self.best_bid
+        remaining = notional_usd
+        total_qty = 0.0
+        filled_usd = 0.0
+        for p, q in self.bids:
+            level_usd = p * q
+            if level_usd <= 0:
+                continue
+            if remaining <= level_usd:
+                total_qty += remaining / p
+                filled_usd += remaining
+                remaining = 0.0
+                break
+            else:
+                total_qty += q
+                filled_usd += level_usd
+                remaining -= level_usd
+        if remaining > 0 and self.bids:
+            worst_p = self.bids[-1][0]
+            if worst_p > 0:
+                total_qty += remaining / worst_p
+                filled_usd += remaining
+        return (filled_usd / total_qty) if total_qty > 0 else self.best_bid
+
 
 @dataclass
 class SunriseSignal:
@@ -4469,8 +4667,11 @@ class SunriseSignal:
     follower_latency_ms: float
     follower_book_age_ms: float
 
-    # Sizing
+    # Sizing & Physical Capacity
     suggested_size_usd: float
+    stealth_capacity_usd: float = 0.0
+    follower_entry_px: float = 0.0
+    leader_recent_buys_usd: float = 0.0
 
     # Pool routing
     basket: str = "incubator"
@@ -4591,7 +4792,7 @@ class CoinSignalAccumulator:
     """Accumulates verified trading statistics for a single coin across signals."""
     __slots__ = (
         "coin", "venues", "net_pnls", "mfes", "t_peaks",
-        "top3_depths", "valid_sweeps", "total_signals",
+        "top3_depths", "stealth_caps", "valid_sweeps", "total_signals",
     )
 
     def __init__(self, coin: str) -> None:
@@ -4601,6 +4802,7 @@ class CoinSignalAccumulator:
         self.mfes: List[float] = []
         self.t_peaks: List[float] = []
         self.top3_depths: List[float] = []
+        self.stealth_caps: List[float] = []
         self.valid_sweeps: int = 0
         self.total_signals: int = 0
 
@@ -4623,6 +4825,10 @@ class CoinSignalAccumulator:
         f_top3_ask = float(row.get("follower_top3_ask_usd", 0.0))
         cross_ratio = (swept_usd / f_top3_ask) if f_top3_ask > 0 else 0.0
 
+        stealth_cap = float(row.get("stealth_capacity_usd", 0.0))
+        if stealth_cap <= 0.0 and f_top3_ask > 0.0:
+            stealth_cap = round(0.15 * f_top3_ask, 2)
+
         # Discard microscopic noise where Upbit sweep was insignificant vs follower
         if drain_ratio < 0.40 and cross_ratio < 0.50:
             return
@@ -4641,6 +4847,7 @@ class CoinSignalAccumulator:
 
         if f_top3_ask > 0:
             self.top3_depths.append(f_top3_ask)
+            self.stealth_caps.append(stealth_cap)
 
     def finalize(self) -> Optional[Dict[str, Any]]:
         n = len(self.net_pnls)
@@ -4658,6 +4865,7 @@ class CoinSignalAccumulator:
         mean_pnl = statistics.mean(self.net_pnls)
         median_pnl = statistics.median(self.net_pnls)
         median_depth = statistics.median(self.top3_depths) if self.top3_depths else 0.0
+        median_stealth_cap = statistics.median(self.stealth_caps) if self.stealth_caps else 0.0
         mean_mfe = statistics.mean(self.mfes) if self.mfes else 0.0
         med_t_peak = statistics.median(self.t_peaks) if self.t_peaks else 0.0
 
@@ -4671,6 +4879,7 @@ class CoinSignalAccumulator:
             "win_rate_pct": round(win_rate, 1),
             "profit_factor": round(profit_factor, 2),
             "top3_depth_usd": round(median_depth, 1),
+            "stealth_capacity_usd": round(median_stealth_cap, 1),
             "mean_mfe_bps": round(mean_mfe, 2),
             "median_t_peak_sec": round(med_t_peak, 2),
             # Rank score = Expected Edge * Statistical Confidence
@@ -4760,7 +4969,8 @@ class SunriseEvaluator:
             log.info(
                 f"  #{i:2d} {q['coin']:<10} | Exp: {q['mean_net_pnl_bps']:>+6.2f} bps | "
                 f"PF: {q['profit_factor']:>4.2f} | Win: {q['win_rate_pct']:>4.1f}% | "
-                f"N={q['event_count']} | Depth: ${q['top3_depth_usd']:>6.0f} | MFE: +{q['mean_mfe_bps']:.1f} bps"
+                f"N={q['event_count']} | Depth: ${q['top3_depth_usd']:>6.0f} | "
+                f"Cap15%: ${q['stealth_capacity_usd']:>5.0f} | MFE: +{q['mean_mfe_bps']:.1f} bps"
             )
 
         if not dry_run:
@@ -4844,7 +5054,7 @@ class CoinEntry:
     """In-memory representation of a coin in either Incubator or Battle basket."""
     __slots__ = (
         "coin", "venues", "basket", "enabled", "pause_reason",
-        "top3_depth_usd", "min_order_usd", "max_order_usd",
+        "top3_depth_usd", "stealth_capacity_usd", "min_order_usd", "max_order_usd",
         "mean_net_pnl_bps", "median_net_pnl_bps", "win_rate_pct",
         "profit_factor", "promoted_at", "event_count",
     )
@@ -4857,6 +5067,7 @@ class CoinEntry:
         enabled: bool = True,
         pause_reason: Optional[str] = None,
         top3_depth_usd: float = 0.0,
+        stealth_capacity_usd: float = 0.0,
         min_order_usd: float = DEFAULT_MIN_ORDER_USD,
         max_order_usd: float = DEFAULT_SIZE_CAP_USD,
         mean_net_pnl_bps: float = 0.0,
@@ -4872,6 +5083,7 @@ class CoinEntry:
         self.enabled = enabled
         self.pause_reason = pause_reason
         self.top3_depth_usd = top3_depth_usd
+        self.stealth_capacity_usd = stealth_capacity_usd if stealth_capacity_usd > 0.0 else round(top3_depth_usd * DEFAULT_STEALTH_FRAC, 2)
         self.min_order_usd = min_order_usd
         self.max_order_usd = max_order_usd
         self.mean_net_pnl_bps = mean_net_pnl_bps
@@ -4907,6 +5119,7 @@ class CoinEntry:
             "enabled": self.enabled,
             "pause_reason": self.pause_reason,
             "top3_depth_usd": round(self.top3_depth_usd, 1),
+            "stealth_capacity_usd": round(self.stealth_capacity_usd, 1),
             "min_order_usd": round(self.min_order_usd, 2),
             "max_order_usd": round(self.max_order_usd, 2),
             "mean_net_pnl_bps": round(self.mean_net_pnl_bps, 2),
@@ -5158,6 +5371,10 @@ class PoolStateManager:
                 entry.basket = "battle"
                 entry.venues = stat.get("venues", entry.venues)
                 entry.top3_depth_usd = float(stat.get("top3_depth_usd", 0.0))
+                entry.stealth_capacity_usd = float(
+                    stat.get("stealth_capacity_usd")
+                    or round(entry.top3_depth_usd * DEFAULT_STEALTH_FRAC, 2)
+                )
                 entry.mean_net_pnl_bps = float(stat.get("mean_net_pnl_bps", 0.0))
                 entry.median_net_pnl_bps = float(stat.get("median_net_pnl_bps", 0.0))
                 entry.win_rate_pct = float(stat.get("win_rate_pct", 0.0))
@@ -5169,6 +5386,7 @@ class PoolStateManager:
             for coin, entry in self._coins.items():
                 if entry.basket == "battle" and coin not in qualified_coins:
                     entry.basket = "incubator"
+                    entry.stealth_capacity_usd = 0.0
                     entry.mean_net_pnl_bps = 0.0
                     entry.median_net_pnl_bps = 0.0
                     entry.win_rate_pct = 0.0
@@ -5318,6 +5536,8 @@ DEFAULT_PROFILE: Dict[str, Any] = {
             "bingx": 100.0,
             "htx": 100.0,
             "pionex": 100.0,
+            "asterdex": 100.0,
+            "hyperliquid": 100.0,
         },
         "reserve_margin_frac": 0.20,  # 20% margin cushion against drawdowns
     },
@@ -5331,6 +5551,8 @@ DEFAULT_PROFILE: Dict[str, Any] = {
         "bingx",
         "htx",
         "pionex",
+        "asterdex",
+        "hyperliquid",
     ],
     "max_active_slots": 5,           # Max concurrent positions
     "min_order_usd": 10.0,           # Exchange min notional
@@ -5495,7 +5717,7 @@ class TradingProfileManager:
 {
   "metadata": {
     "report_date": "2026-10-18",
-    "generated_at": "2026-10-18T14:09:54.306603+00:00",
+    "generated_at": "2026-10-18T18:09:44.940632+00:00",
     "days_analyzed": 1.0,
     "order_size_usd": 10.0,
     "roundtrip_fee_bps": 10.0,
@@ -5504,7 +5726,7 @@ class TradingProfileManager:
     "total_signals_recorded": 0,
     "coins_active": 0,
     "venues_active": [],
-    "elapsed_sec": 0.015
+    "elapsed_sec": 0.006
   },
   "close_reasons": {},
   "trigger_types": {},
@@ -5546,6 +5768,7 @@ class TradingProfileManager:
       "profit_factor": 0.0
     }
   },
+  "venue_capacities": [],
   "sweep_thresholds": {
     "10": {
       "trades": 0,
@@ -5602,7 +5825,7 @@ class TradingProfileManager:
 
 ```md
 # Korean Sunrise: Суточный Квантовый Отчёт (2026-10-18)
-*Сгенерирован:* `2026-10-18T14:09:54.306603+00:00` | *Окно:* `1.0 d` | *Размер слота:* `$10.0` | *Комиссия:* `10.0 bps`
+*Сгенерирован:* `2026-10-18T18:09:44.940632+00:00` | *Окно:* `1.0 d` | *Размер слота:* `$10.0` | *Комиссия:* `10.0 bps`
 
 ## 1. Сводные метрики телеметрии
 - **Всего зафиксировано сигналов:** `0`
@@ -5620,7 +5843,12 @@ class TradingProfileManager:
 | **Только проверенные монеты (Battle Pool)** | 0 | 0.0% | $0.00 | $0.00 | **$0.00** | 0.0 |
 | **Только фондированные биржи (Funded CEXs)** | 0 | 0.0% | $0.00 | $0.00 | **$0.00** | 0.0 |
 
-## 3. Оптимизация порогов спреда (Threshold Sweep)
+## 3. Физическая ёмкость стакана по биржам (Real Order Book Capacity)
+| Биржа | Сигналов | Мед. Top-3 стакан ($) | Мед. 15% Ёмкость ($) | P25 Ёмкость ($) | P75 Ёмкость ($) | Мин. ($) | Макс. ($) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| *Нет накопленных данных по стаканам* | - | - | - | - | - | - | - |
+
+## 4. Оптимизация порогов спреда (Threshold Sweep)
 | Порог (bps) | Сигналов | Win Rate | Net PnL USD |
 | :---: | :---: | :---: | :---: |
 | >=10 bps | 0 | 0.0% | $0.00 |
@@ -5633,15 +5861,15 @@ class TradingProfileManager:
 | >=50 bps | 0 | 0.0% | $0.00 |
 | >=60 bps | 0 | 0.0% | $0.00 |
 
-## 4. Топ прибыльных связок (Upbit Leader <-> Perp Follower)
-| Связка (Coin:Upbit-Follower) | Сделок | Win Rate | Gross USD | Net PnL USD |
-| :--- | :---: | :---: | :---: | :---: |
-| *Нет накопленных сделок за выбранный период* | - | - | - | - |
+## 5. Топ прибыльных связок (Upbit Leader <-> Perp Follower)
+| Связка (Coin:Upbit-Follower) | Сделок | Win Rate | Gross USD | Net PnL USD | Мед. Top-3 ($) | Мед. 15% Ёмкость ($) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| *Нет накопленных сделок за выбранный период* | - | - | - | - | - | - |
 
-## 5. Топ монет по эффективности опережения
-| Монета | Сделок | Win Rate | Net PnL USD | Ср. MFE (bps) | Медиана $T_{peak}$ |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| *Нет накопленных данных по монетам* | - | - | - | - | - |
+## 6. Топ монет по эффективности опережения
+| Монета | Сделок | Win Rate | Net PnL USD | Мед. Top-3 ($) | Мед. 15% Ёмкость ($) | Ср. MFE (bps) | Медиана $T_{peak}$ |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| *Нет накопленных данных по монетам* | - | - | - | - | - | - | - |
 ```
 
 ## runtime_overrides.json
@@ -5808,12 +6036,14 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from config import EXCLUDED_COINS, TICKER_ALIASES
 from screening.metrics import evaluate_pair_klines
-from venues.base import create_http_session, normalize_symbol
+from venues.base import create_http_session
+from venues.asterdex import AsterdexRestClient
 from venues.bingx import BingXRestClient
 from venues.binance import BinanceRestClient
 from venues.bybit import BybitRestClient
 from venues.gateio import GateioRestClient
 from venues.htx import HTXRestClient
+from venues.hyperliquid import HyperliquidRestClient
 from venues.kucoin import KucoinRestClient
 from venues.mexc import MEXCRestClient
 from venues.okx import OKXRestClient
@@ -5831,7 +6061,7 @@ DEFAULT_MAX_PRICE_DIFF_PCT = 15.0       # Max 15% price diff (eliminates namesak
 DEFAULT_MIN_CORR = 0.65                 # Min correlation of minute log-returns
 DEFAULT_MIN_BOTH_TRADE = 0.15           # Min 15% of minutes traded on both sides
 DEFAULT_MIN_DEV_BPS = 8.0               # Min 8.0 bps P90 spread volatility
-DEFAULT_KLINE_LIMIT = 200               # 200 1-minute candles (~3.3h, uniform across all 10 CEXs without rate-limit pagination)
+DEFAULT_KLINE_LIMIT = 200               # 200 1-minute candles (~3.3h, uniform across all follower venues)
 
 CLIENT_FACTORIES: Dict[str, Any] = {
     "binance": BinanceRestClient,
@@ -5843,6 +6073,8 @@ CLIENT_FACTORIES: Dict[str, Any] = {
     "bingx": BingXRestClient,
     "htx": HTXRestClient,
     "pionex": PionexRestClient,
+    "asterdex": AsterdexRestClient,
+    "hyperliquid": HyperliquidRestClient,
 }
 
 
@@ -5855,6 +6087,7 @@ class UniverseScreener:
     def __init__(
         self,
         venues: Optional[List[str]] = None,
+        coins: Optional[List[str]] = None,
         min_vol_usd: float = DEFAULT_MIN_VOL_USD,
         max_price_diff_pct: float = DEFAULT_MAX_PRICE_DIFF_PCT,
         min_corr: float = DEFAULT_MIN_CORR,
@@ -5865,6 +6098,7 @@ class UniverseScreener:
         max_workers: int = 10,
     ) -> None:
         self.target_venues = [v.lower() for v in (venues or list(CLIENT_FACTORIES.keys())) if v.lower() in CLIENT_FACTORIES]
+        self.target_coins = [c.upper() for c in coins] if coins else None
         self.min_vol_usd = min_vol_usd
         self.max_price_diff_pct = max_price_diff_pct
         self.min_corr = min_corr
@@ -5935,6 +6169,8 @@ class UniverseScreener:
         rejected_volume = 0
 
         for coin, mkt_code in up_mkts.items():
+            if self.target_coins and coin not in self.target_coins:
+                continue
             if coin in EXCLUDED_COINS:
                 continue
 
@@ -6346,6 +6582,13 @@ class TestPipelineE2E(unittest.TestCase):
         self.assertTrue(psm.is_battle_coin("SOL"))
         self.assertFalse(psm.is_battle_coin("MEME"))
 
+        # Verify physical capacity metrics are captured and persisted
+        sol_q = next(q for q in qualified if q["coin"] == "SOL")
+        self.assertIn("stealth_capacity_usd", sol_q)
+        self.assertAlmostEqual(sol_q["stealth_capacity_usd"], 450.0, places=1) # 15% of 3000
+        sol_entry = psm.get_coin_entry("SOL")
+        self.assertAlmostEqual(sol_entry.stealth_capacity_usd, 450.0, places=1)
+
     def test_engine_integration_with_basket_and_actionability(self):
         psm = PoolStateManager(
             universe_file=self.universe_file,
@@ -6505,6 +6748,7 @@ class TestPipelineE2E(unittest.TestCase):
         sig = st.open_signal
         # Personalized max_hold_sec assigned!
         self.assertEqual(sig.max_hold_sec, 3.2)
+        self.assertGreater(sig.stealth_capacity_usd, 0.0)
 
         # 4. Sweep timeouts before 3.2s -> signal stays open
         engine.sweep_timeouts(now + 50 + 2.0)
@@ -6516,6 +6760,7 @@ class TestPipelineE2E(unittest.TestCase):
         self.assertEqual(sig.close_reason, "timeout")
         self.assertEqual(len(emitted), 1)
         self.assertEqual(emitted[0]["max_hold_sec"], 3.2)
+        self.assertEqual(emitted[0]["stealth_capacity_usd"], sig.stealth_capacity_usd)
 
     def test_engine_hot_reload_pool_and_profile(self):
         # 1. Initialize fresh PoolStateManager and TradingProfileManager
@@ -6865,6 +7110,426 @@ class TestPipelineE2E(unittest.TestCase):
         self.assertEqual(sol_entry.profit_factor, 0.0)
         self.assertEqual(sol_entry.promoted_at, 0.0)
 
+    def test_daily_report_stealth_capacity(self):
+        import tools.full_daily_report as fdr
+        # Write mock signals in test_dir/signals
+        sig_file = os.path.join(self.signals_dir, "signals_2026-10-18.jsonl.gz")
+        mock_signals = [
+            {
+                "coin": "SOL",
+                "follower_exchange": "binance",
+                "drain_ratio": 0.65,
+                "leader_swept_usd": 3000.0,
+                "follower_top3_ask_usd": 2000.0,
+                "stealth_capacity_usd": 300.0,
+                "net_pnl_bps": 12.0,
+                "gross_exec_edge_bps": 22.0,
+                "mfe_exec_pnl_bps": 15.0,
+                "time_to_peak_sec": 0.5,
+                "close_reason": "converged",
+                "trigger_type": "depth_drain",
+            },
+            {
+                "coin": "SOL",
+                "follower_exchange": "binance",
+                "drain_ratio": 0.70,
+                "leader_swept_usd": 4000.0,
+                "follower_top3_ask_usd": 3000.0,
+                "stealth_capacity_usd": 450.0,
+                "net_pnl_bps": 18.0,
+                "gross_exec_edge_bps": 28.0,
+                "mfe_exec_pnl_bps": 20.0,
+                "time_to_peak_sec": 0.8,
+                "close_reason": "converged",
+                "trigger_type": "depth_drain",
+            },
+        ]
+        with gzip.open(sig_file, "wt", encoding="utf-8") as f:
+            for s in mock_signals:
+                f.write(json.dumps(s) + "\n")
+
+        with patch.object(fdr, "DATA_ROOT", self.test_dir), \
+             patch.object(fdr, "REPORTS_DIR", os.path.join(self.test_dir, "reports")):
+            doc = fdr.generate_daily_report(days_back=1.0, as_json=True)
+
+        self.assertIn("venue_capacities", doc)
+        self.assertEqual(len(doc["venue_capacities"]), 1)
+        v_binance = doc["venue_capacities"][0]
+        self.assertEqual(v_binance["venue"], "binance")
+        self.assertEqual(v_binance["signals"], 2)
+        # Median of 2000 and 3000 is 2500
+        self.assertAlmostEqual(v_binance["med_top3_depth_usd"], 2500.0, places=1)
+        # Median of 300 and 450 is 375
+        self.assertAlmostEqual(v_binance["med_stealth_cap_usd"], 375.0, places=1)
+
+        # Check top_coins
+        self.assertGreater(len(doc["top_coins"]), 0)
+        c_sol = doc["top_coins"][0]
+        self.assertEqual(c_sol["coin"], "SOL")
+        self.assertAlmostEqual(c_sol["med_stealth_cap_usd"], 375.0, places=1)
+
+        # Check top_pairs
+        self.assertGreater(len(doc["top_pairs"]), 0)
+        p_sol = doc["top_pairs"][0]
+        self.assertAlmostEqual(p_sol["med_stealth_cap_usd"], 375.0, places=1)
+
+    def test_orderbook_vwap_and_true_roundtrip_math(self):
+        """Verifies VWAP book depth fills and true roundtrip fee subtraction in KoreanEngine."""
+        # 1. OrderBookDepth5 VWAP math
+        snap = OrderBookDepth5(
+            exchange="binance", symbol="TEST", raw_symbol="TESTUSDT",
+            ts=1000.0, exchange_ts=1000000,
+            # L1: $10 @ 100.0, L2: $40.4 @ 101.0, L3: $1020 @ 102.0
+            asks=[(100.0, 0.1), (101.0, 0.4), (102.0, 10.0)],
+            # L1: $9.9 @ 99.0, L2: $39.2 @ 98.0, L3: $970 @ 97.0
+            bids=[(99.0, 0.1), (98.0, 0.4), (97.0, 10.0)],
+        )
+
+        # Buying $100 fills: $10 @ 100.0 (qty 0.1) + $40.4 @ 101.0 (qty 0.4) + $49.6 @ 102.0 (qty 49.6/102.0)
+        expected_qty = 0.1 + 0.4 + (49.6 / 102.0)
+        expected_vwap_ask = 100.0 / expected_qty
+        self.assertAlmostEqual(snap.vwap_ask_usd(100.0), expected_vwap_ask, places=4)
+        self.assertGreater(snap.vwap_ask_usd(100.0), snap.best_ask)
+
+        # Selling $100 fills: $9.9 @ 99.0 (qty 0.1) + $39.2 @ 98.0 (qty 0.4) + $50.9 @ 97.0 (qty 50.9/97.0)
+        expected_sell_qty = 0.1 + 0.4 + (50.9 / 97.0)
+        expected_vwap_bid = 100.0 / expected_sell_qty
+        self.assertAlmostEqual(snap.vwap_bid_usd(100.0), expected_vwap_bid, places=4)
+        self.assertLess(snap.vwap_bid_usd(100.0), snap.best_bid)
+
+        # 2. KoreanEngine: Net edge must account for full roundtrip_fee_bps (10.0 bps) & VWAP
+        from korean_engine import KoreanEngine, PairState
+        emitted = []
+        engine = KoreanEngine(emit_callback=emitted.append, min_edge_bps=12.0)
+        st = PairState("TEST", "binance", warmup_samples=1)
+        st.learn(0.0, 1000.0)  # baseline = 0.0
+
+        # Upbit jumps: mid = 102.0
+        upbit_snap = OrderBookDepth5(
+            exchange="upbit", symbol="TEST", raw_symbol="KRW-TEST",
+            ts=1000.0, exchange_ts=1000000,
+            bids=[(101.95, 10.0)], asks=[(102.05, 10.0)]
+        )
+
+        # Follower snap has deep book: L1=100.0 ($10), L2=100.5 ($100), L3=101.0 ($1000)
+        f_snap = OrderBookDepth5(
+            exchange="binance", symbol="TEST", raw_symbol="TESTUSDT",
+            ts=1000.0, exchange_ts=1000000,
+            bids=[(99.5, 10.0), (99.0, 10.0)],
+            asks=[(100.0, 0.1), (100.5, 1.0), (101.0, 10.0)],
+        )
+
+        engine._books[("upbit", "TEST")] = upbit_snap
+        engine._books[("binance", "TEST")] = f_snap
+
+        engine._check_entry(
+            coin="TEST",
+            follower_ex="binance",
+            st=st,
+            upbit_snap=upbit_snap,
+            f_snap=f_snap,
+            f_book_age_ms=5.0,
+            norm_depth=1000.0,
+            norm_spread=5.0,
+            swept_usd=5000.0,
+            trigger_type="depth_drain",
+            drain_ratio=0.8,
+            blowout_ratio=3.0,
+            now=1000.0,
+        )
+
+        self.assertIsNotNone(st.open_signal)
+        sig = st.open_signal
+        # Real entry price is VWAP fill, higher than best_ask (100.0)
+        self.assertGreater(sig.follower_entry_px, 100.0)
+        # Net edge is gross_exec_edge - 10.0 bps (roundtrip fee)
+        self.assertAlmostEqual(sig.net_exec_edge_bps, sig.gross_exec_edge_bps - 10.0, places=2)
+
+        # 3. Follower moves slightly: gross move is +8.0 bps, but net PnL is 8 - 10 = -2 bps < 0.
+        # Engine MUST NOT close as "converged"!
+        f_slight_move = OrderBookDepth5(
+            exchange="binance", symbol="TEST", raw_symbol="TESTUSDT",
+            ts=1001.0, exchange_ts=1001000,
+            # Bid shifted up slightly
+            bids=[(sig.follower_entry_px * (1 + 0.0008), 20.0)],
+            asks=[(sig.follower_entry_px * (1 + 0.0015), 20.0)],
+        )
+        engine._books[("binance", "TEST")] = f_slight_move
+        engine._track_follower_move("TEST", "binance", f_slight_move, 1001.0)
+
+        # Signal remains open because net PnL is negative!
+        self.assertFalse(sig.closed)
+
+    def test_follower_book_age_guard(self):
+        """Verifies that KoreanEngine strictly rejects stale follower order books (> 300ms)."""
+        from korean_engine import KoreanEngine, PairState
+        emitted = []
+        engine = KoreanEngine(emit_callback=emitted.append, max_follower_book_age_sec=0.30)
+        st = PairState("BTC", "binance", warmup_samples=1)
+        st.learn(0.0, 1000.0)
+
+        upbit_snap = OrderBookDepth5(
+            exchange="upbit", symbol="BTC", raw_symbol="KRW-BTC",
+            ts=1000.0, exchange_ts=1000000,
+            bids=[(105000.0, 1.0)], asks=[(105100.0, 1.0)]
+        )
+        f_snap = OrderBookDepth5(
+            exchange="binance", symbol="BTC", raw_symbol="BTCUSDT",
+            ts=1000.0, exchange_ts=1000000,
+            bids=[(99000.0, 1.0)], asks=[(99100.0, 1.0)]
+        )
+        engine._books[("upbit", "BTC")] = upbit_snap
+        engine._books[("binance", "BTC")] = f_snap
+
+        # 1. Book age is 350ms (> 300ms threshold) -> REJECTED
+        engine._recv_ts[("binance", "BTC")] = 1000.0 - 0.35
+        engine._check_entry(
+            coin="BTC", follower_ex="binance", st=st,
+            upbit_snap=upbit_snap, f_snap=f_snap,
+            f_book_age_ms=350.0, norm_depth=1000.0, norm_spread=5.0,
+            swept_usd=5000.0, trigger_type="depth_drain", drain_ratio=0.8,
+            blowout_ratio=3.0, now=1000.0
+        )
+        self.assertIsNone(st.open_signal)
+
+        # 2. Book age is 150ms (< 300ms threshold) -> ACCEPTED
+        engine._recv_ts[("binance", "BTC")] = 1000.0 - 0.15
+        engine._check_entry(
+            coin="BTC", follower_ex="binance", st=st,
+            upbit_snap=upbit_snap, f_snap=f_snap,
+            f_book_age_ms=150.0, norm_depth=1000.0, norm_spread=5.0,
+            swept_usd=5000.0, trigger_type="depth_drain", drain_ratio=0.8,
+            blowout_ratio=3.0, now=1000.0
+        )
+        self.assertIsNotNone(st.open_signal)
+        self.assertEqual(st.open_signal.follower_book_age_ms, 150.0)
+
+    def test_matched_universe_multi_venue_typing(self):
+        """Verifies MatchedUniverse loads all 11 venues with typed (coin, mult, c_size) mappings."""
+        from main import KoreanSunriseService
+        from venues.manager import StreamManager
+        doc = {
+            "coins": ["BTC", "PEPE", "SOL"],
+            "upbit_krw_to_coin": {"KRW-BTC": "BTC", "KRW-PEPE": "PEPE", "KRW-SOL": "SOL"},
+            "binance_sym_map": {"BTCUSDT": ["BTC", 1.0, 1.0], "1000PEPEUSDT": ["PEPE", 1000.0, 1.0]},
+            "gateio_sym_map": {"BTC_USDT": ["BTC", 1.0, 0.0001]},
+            "okx_sym_map": {"BTC-USDT-SWAP": ["BTC", 1.0, 0.01]},
+            "hyperliquid_sym_map": {"kBONKUSDT": ["BONK", 1000.0, 1.0]},
+        }
+        univ = KoreanSunriseService._parse_universe_doc(doc)
+        self.assertEqual(univ.coins, ["BTC", "PEPE", "SOL"])
+        self.assertIn("gateio", univ.venue_sym_maps)
+        self.assertIn("okx", univ.venue_sym_maps)
+        self.assertIn("hyperliquid", univ.venue_sym_maps)
+
+        # Check get_sym_map preserves contract size
+        self.assertEqual(univ.get_sym_map("gateio")["BTC_USDT"], ("BTC", 1.0, 0.0001))
+        self.assertEqual(univ.get_sym_map("okx")["BTC-USDT-SWAP"], ("BTC", 1.0, 0.01))
+        self.assertEqual(univ.get_sym_map("hyperliquid")["kBONKUSDT"], ("BONK", 1000.0, 1.0))
+
+        # Check StreamManager initializes feeds using typed universe
+        sm = StreamManager(universe=univ, callback=lambda x: None, active_venues=["upbit", "gateio", "okx"])
+        self.assertIn("upbit", sm.streams)
+        self.assertIn("gateio", sm.streams)
+        self.assertIn("okx", sm.streams)
+        self.assertNotIn("binance", sm.streams)
+
+    def test_upbit_trade_stream_parsing(self):
+        """Verifies UpbitSpotStream parses trades and order books correctly."""
+        from venues.upbit import UpbitSpotStream
+        krw_to_coin = {"KRW-BTC": "BTC"}
+        received_books = []
+        received_trades = []
+
+        stream = UpbitSpotStream(
+            krw_to_coin=krw_to_coin,
+            callback=received_books.append,
+            trade_callback=lambda c, usd, buy, ts: received_trades.append((c, usd, buy, ts)),
+        )
+        stream.usdt_krw_rate = 1400.0
+        stream.rate_ready = True
+
+        # 1. Trade message from Upbit: Taker BUY (ask_bid == "BID")
+        trade_msg = json.dumps({
+            "type": "trade",
+            "code": "KRW-BTC",
+            "trade_price": 140000000.0,  # 140,000,000 KRW / 1400 = $100,000
+            "trade_volume": 0.05,        # 0.05 BTC = $5,000
+            "ask_bid": "BID",            # Taker Buy
+            "trade_timestamp": 1700000000000,
+        })
+        stream._handle_msg(trade_msg)
+
+        self.assertEqual(len(received_trades), 1)
+        coin, usd, is_buy, ts = received_trades[0]
+        self.assertEqual(coin, "BTC")
+        self.assertAlmostEqual(usd, 5000.0, places=2)
+        self.assertTrue(is_buy)
+
+        # 2. Trade message: Taker SELL (ask_bid == "ASK")
+        sell_msg = json.dumps({
+            "type": "trade",
+            "code": "KRW-BTC",
+            "trade_price": 140000000.0,
+            "trade_volume": 0.02,        # $2,000
+            "ask_bid": "ASK",            # Taker Sell
+            "trade_timestamp": 1700000001000,
+        })
+        stream._handle_msg(sell_msg)
+        self.assertEqual(len(received_trades), 2)
+        self.assertFalse(received_trades[1][2])  # is_taker_buy == False
+
+        # 3. Orderbook message
+        ob_msg = json.dumps({
+            "type": "orderbook",
+            "code": "KRW-BTC",
+            "timestamp": 1700000002000,
+            "orderbook_units": [
+                {"bid_price": 139900000.0, "bid_size": 1.0, "ask_price": 140100000.0, "ask_size": 1.0}
+            ]
+        })
+        stream._handle_msg(ob_msg)
+        self.assertEqual(len(received_books), 1)
+        self.assertEqual(received_books[0].symbol, "BTC")
+
+    def test_upbit_cancel_vs_sweep_guard(self):
+        """
+        Verifies that KoreanEngine discriminates between MM quote cancellations
+        and genuine market sweeps using the Upbit trade stream.
+        """
+        import time
+        from korean_engine import KoreanEngine, PairState
+        emitted = []
+        engine = KoreanEngine(
+            emit_callback=emitted.append,
+            require_trade_confirmation=True,
+            drain_threshold=0.30,
+        )
+
+        st = engine._get_or_create_pair_state("BTC", "binance")
+        st.warmup_samples = 1
+        st.dev_window.append(0.0)
+        st.n_obs = 10
+        st.baseline_bps = 0.0
+
+        # Follower orderbook (calm, ready to be sniped)
+        t0 = time.time()
+        f_snap = OrderBookDepth5(
+            exchange="binance", symbol="BTC", raw_symbol="BTCUSDT",
+            ts=t0, exchange_ts=int(t0 * 1000),
+            bids=[(99000.0, 1.0)], asks=[(99100.0, 1.0), (99200.0, 1.0), (99300.0, 1.0)]
+        )
+        engine._books[("binance", "BTC")] = f_snap
+        engine._recv_ts[("binance", "BTC")] = t0
+
+        # Upbit baseline book with a heavy $10,000 ask plate at 105,000
+        upbit_t0 = OrderBookDepth5(
+            exchange="upbit", symbol="BTC", raw_symbol="KRW-BTC",
+            ts=t0 - 0.1, exchange_ts=int((t0 - 0.1) * 1000),
+            bids=[(104900.0, 1.0)],
+            asks=[(105000.0, 0.0952), (105500.0, 0.5)]  # ~10,000 USD at best ask
+        )
+        engine._books[("upbit", "BTC")] = upbit_t0
+        engine._recv_ts[("upbit", "BTC")] = t0 - 0.1
+        engine._update_upbit_norm("BTC", upbit_t0, t0 - 0.1)
+
+        # SCENARIO A: Market-maker CANCELS the 105,000 ask plate!
+        # Best ask lifts to 105,500 with zero taker trades on Upbit.
+        t_cancel = time.time()
+        upbit_cancel = OrderBookDepth5(
+            exchange="upbit", symbol="BTC", raw_symbol="KRW-BTC",
+            ts=t_cancel, exchange_ts=int(t_cancel * 1000),
+            bids=[(104900.0, 1.0)],
+            asks=[(105500.0, 0.5)]
+        )
+        # Process orderbook update with no preceding trades
+        engine.on_book_update(upbit_cancel)
+
+        # Result: Blocked! cancels_blocked increments, no false signal opened!
+        self.assertEqual(engine.counters["cancels_blocked"], 1)
+        self.assertIsNone(st.open_signal)
+        self.assertEqual(engine.counters["signals_triggered"], 0)
+
+        # SCENARIO B: REAL SWEEP! Aggressive buyer sweeps the 105,000 ask plate!
+        # Reset Upbit book back to baseline and reset baseline_bps to 0.0
+        st.baseline_bps = 0.0
+        t_sweep = time.time()
+        engine._books[("binance", "BTC")] = f_snap
+        engine._recv_ts[("binance", "BTC")] = t_sweep
+        engine._books[("upbit", "BTC")] = upbit_t0
+        engine._recv_ts[("upbit", "BTC")] = t_sweep - 0.05
+
+        # First, real-time taker buy trades hit the tape:
+        engine.on_upbit_trade("BTC", trade_usd=10000.0, is_taker_buy=True, ts=t_sweep)
+        self.assertEqual(engine.counters["trades_upbit"], 1)
+
+        # Now the orderbook update arrives reflecting the swept plate
+        upbit_swept = OrderBookDepth5(
+            exchange="upbit", symbol="BTC", raw_symbol="KRW-BTC",
+            ts=t_sweep, exchange_ts=int(t_sweep * 1000),
+            bids=[(104900.0, 1.0)],
+            asks=[(105500.0, 0.5)]
+        )
+        engine.on_book_update(upbit_swept)
+
+        # Result: Confirmed! Signal fires with verified taker buys!
+        self.assertEqual(engine.counters["cancels_blocked"], 1)  # unchanged
+        self.assertEqual(engine.counters["signals_triggered"], 1)
+        self.assertIsNotNone(st.open_signal)
+        self.assertEqual(st.open_signal.leader_recent_buys_usd, 10000.0)
+
+    def test_concurrent_upbit_trade_stream_thread_safety(self):
+        """Stress-tests concurrent on_upbit_trade and get_recent_upbit_buys across multiple threads."""
+        import threading
+        import time
+
+        engine = KoreanEngine(
+            emit_callback=lambda sig: None,
+            thresholds_file=os.path.join(self.test_dir, "matrix_thresholds.json")
+        )
+
+        coin = "ETH"
+        num_writers = 8
+        trades_per_writer = 250
+        num_readers = 8
+        reads_per_reader = 250
+        errors = []
+
+        now = time.time()
+
+        def writer_worker(w_id: int):
+            try:
+                for i in range(trades_per_writer):
+                    t = now + (i * 0.001)
+                    engine.on_upbit_trade(coin, trade_usd=50.0 + (i % 10), is_taker_buy=True, ts=t)
+            except Exception as e:
+                errors.append(f"Writer-{w_id} failed: {e}")
+
+        def reader_worker(r_id: int):
+            try:
+                for i in range(reads_per_reader):
+                    cutoff = now + (i * 0.001) - 1.0
+                    buys_usd, has_trades = engine.get_recent_upbit_buys(coin, cutoff)
+                    self.assertIsInstance(buys_usd, float)
+                    self.assertIsInstance(has_trades, bool)
+            except Exception as e:
+                errors.append(f"Reader-{r_id} failed: {e}")
+
+        threads = []
+        for w in range(num_writers):
+            threads.append(threading.Thread(target=writer_worker, args=(w,)))
+        for r in range(num_readers):
+            threads.append(threading.Thread(target=reader_worker, args=(r,)))
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5.0)
+
+        self.assertEqual(errors, [], f"Encountered thread race errors: {errors}")
+        expected_total_trades = num_writers * trades_per_writer
+        self.assertEqual(engine.counters["trades_upbit"], expected_total_trades)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -6894,6 +7559,8 @@ from venues.kucoin import KucoinStream
 from venues.mexc import MEXCStream
 from venues.okx import OKXStream
 from venues.pionex import PionexStream
+from venues.asterdex import AsterdexStream, AsterdexRestClient
+from venues.hyperliquid import HyperliquidStream, HyperliquidRestClient
 
 
 class TestVenuesContractSize(unittest.TestCase):
@@ -7402,6 +8069,579 @@ class TestVenuesContractSize(unittest.TestCase):
         self.assertEqual(len(snaps), 1)
         self.assertEqual(snaps[0].exchange_ts, 1700000000456)
 
+    def test_asterdex_stream_and_multiplier(self):
+        """AsterdexStream: parses Binance-format depth5 and handles 1000x prefixes."""
+        snaps: List[OrderBookDepth5] = []
+        stream = AsterdexStream(["BTCUSDT", "1000PEPEUSDT"], snaps.append)
+
+        # 1. Standard BTCUSDT stream message
+        msg_btc = json.dumps({
+            "stream": "btcusdt@depth5@100ms",
+            "data": {
+                "e": "depthUpdate",
+                "E": 1700000000100,
+                "s": "BTCUSDT",
+                "b": [["85000.0", "1.5"], ["84999.0", "2.0"]],
+                "a": [["85001.0", "0.8"], ["85002.0", "1.2"]],
+            }
+        })
+        stream._parse_message(msg_btc)
+        self.assertEqual(len(snaps), 1)
+        snap = snaps[-1]
+        self.assertEqual(snap.exchange, "asterdex")
+        self.assertEqual(snap.symbol, "BTC")
+        self.assertEqual(snap.raw_symbol, "BTCUSDT")
+        self.assertEqual(snap.bids[0], (85000.0, 1.5))
+        self.assertEqual(snap.asks[0], (85001.0, 0.8))
+        self.assertEqual(snap.exchange_ts, 1700000000100)
+
+        # 2. 1000PEPEUSDT unwrapped message
+        msg_pepe = json.dumps({
+            "e": "depthUpdate",
+            "E": 1700000000200,
+            "s": "1000PEPEUSDT",
+            "b": [["0.015", "100.0"]],
+            "a": [["0.016", "200.0"]],
+        })
+        stream._parse_message(msg_pepe)
+        self.assertEqual(len(snaps), 2)
+        pepe_snap = snaps[-1]
+        self.assertEqual(pepe_snap.exchange, "asterdex")
+        self.assertEqual(pepe_snap.symbol, "PEPE")
+        self.assertEqual(pepe_snap.raw_symbol, "1000PEPEUSDT")
+        # 0.015 / 1000 = 0.000015, 100.0 * 1000 = 100000.0
+        self.assertAlmostEqual(pepe_snap.bids[0][0], 0.000015)
+        self.assertAlmostEqual(pepe_snap.bids[0][1], 100000.0)
+        self.assertAlmostEqual(pepe_snap.asks[0][0], 0.000016)
+        self.assertAlmostEqual(pepe_snap.asks[0][1], 200000.0)
+
+    def test_asterdex_rest_discovery(self):
+        """AsterdexRestClient: parses Binance-format exchangeInfo."""
+        from unittest.mock import MagicMock
+        mock_session = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "symbols": [
+                {"symbol": "BTCUSDT", "baseAsset": "BTC", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING"},
+                {"symbol": "1000PEPEUSDT", "baseAsset": "1000PEPE", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING"},
+                {"symbol": "ETHUSDC", "baseAsset": "ETH", "quoteAsset": "USDC", "contractType": "PERPETUAL", "status": "TRADING"},
+            ]
+        }
+        mock_session.get.return_value = mock_resp
+
+        client = AsterdexRestClient(session=mock_session)
+        perps = client.fetch_linear_perpetuals()
+        self.assertEqual(perps.get("BTCUSDT"), ("BTC", 1.0, 1.0))
+        self.assertEqual(perps.get("1000PEPEUSDT"), ("PEPE", 1000.0, 1.0))
+        self.assertNotIn("ETHUSDC", perps)
+
+        sizes = client.fetch_contract_sizes()
+        self.assertEqual(sizes.get("BTCUSDT"), 1.0)
+
+    def test_asterdex_stream_with_contract_size(self):
+        """AsterdexStream: passes contract_size to _extract_levels."""
+        snaps: List[OrderBookDepth5] = []
+        sym_map = {
+            "BTCUSDT": ("BTC", 1.0, 0.1),
+            "1000PEPEUSDT": ("PEPE", 1000.0, 2.0),
+        }
+        stream = AsterdexStream(sym_map, snaps.append)
+
+        # 1. BTC with contract_size = 0.1
+        msg = json.dumps({
+            "e": "depthUpdate",
+            "E": 1700000000000,
+            "s": "BTCUSDT",
+            "b": [["80000.0", "50.0"]],  # 50 contracts * 0.1 = 5.0 BTC
+            "a": [["80001.0", "100.0"]], # 100 contracts * 0.1 = 10.0 BTC
+        })
+        stream._parse_message(msg)
+        self.assertEqual(len(snaps), 1)
+        snap = snaps[-1]
+        self.assertEqual(snap.symbol, "BTC")
+        self.assertEqual(snap.bids[0], (80000.0, 5.0))
+        self.assertEqual(snap.asks[0], (80001.0, 10.0))
+
+        # 2. 1000PEPE with mult = 1000 and contract_size = 2.0
+        msg_pepe = json.dumps({
+            "e": "depthUpdate",
+            "E": 1700000000100,
+            "s": "1000PEPEUSDT",
+            "b": [["0.012", "10.0"]],  # price 0.000012, qty = 10.0 * 2.0 * 1000 = 20,000 PEPE
+            "a": [["0.013", "20.0"]],  # price 0.000013, qty = 20.0 * 2.0 * 1000 = 40,000 PEPE
+        })
+        stream._parse_message(msg_pepe)
+        self.assertEqual(len(snaps), 2)
+        pepe_snap = snaps[-1]
+        self.assertEqual(pepe_snap.symbol, "PEPE")
+        self.assertAlmostEqual(pepe_snap.bids[0][0], 0.000012)
+        self.assertAlmostEqual(pepe_snap.bids[0][1], 20000.0)
+        self.assertAlmostEqual(pepe_snap.asks[0][0], 0.000013)
+        self.assertAlmostEqual(pepe_snap.asks[0][1], 40000.0)
+
+    def test_hyperliquid_stream_and_k_multiplier(self):
+        """HyperliquidStream: parses l2Book levels and handles k-prefixed 1000x coins."""
+        snaps: List[OrderBookDepth5] = []
+        stream = HyperliquidStream(["SOL", "kBONK"], snaps.append)
+
+        # 1. Standard coin SOL
+        msg_sol = json.dumps({
+            "channel": "l2Book",
+            "data": {
+                "coin": "SOL",
+                "time": 1700000000300,
+                "levels": [
+                    [{"px": "150.0", "sz": "10.0", "n": 1}, {"px": "149.9", "sz": "5.0", "n": 2}],
+                    [{"px": "150.1", "sz": "12.0", "n": 1}, {"px": "150.2", "sz": "8.0", "n": 3}],
+                ]
+            }
+        })
+        stream._parse_message(msg_sol)
+        self.assertEqual(len(snaps), 1)
+        snap = snaps[-1]
+        self.assertEqual(snap.exchange, "hyperliquid")
+        self.assertEqual(snap.symbol, "SOL")
+        self.assertEqual(snap.raw_symbol, "SOLUSDT")
+        self.assertEqual(snap.bids[0], (150.0, 10.0))
+        self.assertEqual(snap.asks[0], (150.1, 12.0))
+        self.assertEqual(snap.exchange_ts, 1700000000300)
+
+        # 2. k-prefixed coin kBONK (multiplier = 1000.0)
+        msg_bonk = json.dumps({
+            "channel": "l2Book",
+            "data": {
+                "coin": "kBONK",
+                "time": 1700000000400,
+                "levels": [
+                    [{"px": "0.025", "sz": "500.0", "n": 1}],
+                    [{"px": "0.026", "sz": "600.0", "n": 2}],
+                ]
+            }
+        })
+        stream._parse_message(msg_bonk)
+        self.assertEqual(len(snaps), 2)
+        bonk_snap = snaps[-1]
+        self.assertEqual(bonk_snap.exchange, "hyperliquid")
+        self.assertEqual(bonk_snap.symbol, "BONK")
+        self.assertEqual(bonk_snap.raw_symbol, "1000BONKUSDT")
+        # 0.025 / 1000 = 0.000025, 500.0 * 1000 = 500000.0
+        self.assertAlmostEqual(bonk_snap.bids[0][0], 0.000025)
+        self.assertAlmostEqual(bonk_snap.bids[0][1], 500000.0)
+        self.assertAlmostEqual(bonk_snap.asks[0][0], 0.000026)
+        self.assertAlmostEqual(bonk_snap.asks[0][1], 600000.0)
+
+    def test_hyperliquid_stream_with_contract_size_and_multiscale(self):
+        """HyperliquidStream: supports custom contract_size and multi-scale prefixes (m, b)."""
+        snaps: List[OrderBookDepth5] = []
+        sym_map = {
+            "SOLUSDT": ("SOL", 1.0, 0.5),
+            "1000000PEPEUSDT": ("PEPE", 1_000_000.0, 1.0),
+            "1000000000LUNCUSDT": ("LUNC", 1_000_000_000.0, 1.0),
+        }
+        stream = HyperliquidStream(sym_map, snaps.append)
+
+        # 1. SOL with contract_size = 0.5
+        msg_sol = json.dumps({
+            "channel": "l2Book",
+            "data": {
+                "coin": "SOL",
+                "time": 1700000000500,
+                "levels": [
+                    [{"px": "160.0", "sz": "20.0"}],
+                    [{"px": "160.2", "sz": "40.0"}],
+                ]
+            }
+        })
+        stream._parse_message(msg_sol)
+        self.assertEqual(len(snaps), 1)
+        snap = snaps[-1]
+        self.assertEqual(snap.symbol, "SOL")
+        self.assertEqual(snap.bids[0], (160.0, 10.0))  # 20 * 0.5 = 10.0
+        self.assertEqual(snap.asks[0], (160.2, 20.0))  # 40 * 0.5 = 20.0
+
+        # 2. mPEPE (1M scale)
+        msg_mpepe = json.dumps({
+            "channel": "l2Book",
+            "data": {
+                "coin": "mPEPE",
+                "time": 1700000000600,
+                "levels": [
+                    [{"px": "10.0", "sz": "5.0"}],  # price per 1M = $10 -> single price $0.00001
+                    [{"px": "10.1", "sz": "8.0"}],
+                ]
+            }
+        })
+        stream._parse_message(msg_mpepe)
+        self.assertEqual(len(snaps), 2)
+        m_snap = snaps[-1]
+        self.assertEqual(m_snap.symbol, "PEPE")
+        self.assertAlmostEqual(m_snap.bids[0][0], 0.00001)
+        self.assertAlmostEqual(m_snap.bids[0][1], 5_000_000.0)
+
+    def test_hyperliquid_rest_discovery(self):
+        """HyperliquidRestClient: parses metaAndAssetCtxs with k-multipliers."""
+        from unittest.mock import MagicMock
+        mock_session = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [
+            {
+                "universe": [
+                    {"name": "BTC", "szDecimals": 4},
+                    {"name": "kSHIB", "szDecimals": 0},
+                ]
+            },
+            [
+                {"midPx": "80000.0", "dayNtlVlm": "50000000.0"},
+                {"midPx": "0.025", "dayNtlVlm": "1200000.0"},
+            ]
+        ]
+        mock_session.post.return_value = mock_resp
+
+        client = HyperliquidRestClient(session=mock_session)
+        perps = client.fetch_linear_perpetuals()
+        self.assertEqual(perps.get("BTCUSDT"), ("BTC", 1.0, 1.0))
+        self.assertEqual(perps.get("1000SHIBUSDT"), ("SHIB", 1000.0, 1.0))
+
+        sizes = client.fetch_contract_sizes()
+        self.assertEqual(sizes.get("BTCUSDT"), 1.0)
+        self.assertEqual(sizes.get("1000SHIBUSDT"), 1.0)
+
+        ticks = client.fetch_tickers_24h()
+        self.assertEqual(ticks["BTCUSDT"]["vol_24h"], 50000000.0)
+        self.assertEqual(ticks["BTCUSDT"]["price"], 80000.0)
+        self.assertEqual(ticks["1000SHIBUSDT"]["vol_24h"], 1200000.0)
+        self.assertEqual(ticks["1000SHIBUSDT"]["price"], 0.025)
+
+    def test_symbol_multiplier_normalization(self):
+        """venues/base.py: parse_symbol_and_mult handles multi-scale and preserves genuine tokens."""
+        from venues.base import parse_symbol_and_mult
+        cases = [
+            ("1000PEPE-USDT", ("PEPE", 1000.0)),
+            ("1MPEPE_USDT", ("PEPE", 1_000_000.0)),
+            ("1BPEPEUSDT", ("PEPE", 1_000_000_000.0)),
+            ("1000000PEPEUSDT", ("PEPE", 1_000_000.0)),
+            ("1000000000LUNCUSDT", ("LUNC", 1_000_000_000.0)),
+            ("kPEPE", ("PEPE", 1000.0)),
+            ("kSHIB", ("SHIB", 1000.0)),
+            ("mPEPE", ("PEPE", 1_000_000.0)),
+            ("bLUNC", ("LUNC", 1_000_000_000.0)),
+            ("KASUSDT", ("KAS", 1.0)),
+            ("MKRUSDT", ("MKR", 1.0)),
+            ("BTC-USDT-SWAP", ("BTC", 1.0)),
+            ("BONKUSDT", ("BONK", 1.0)),
+            ("1000BONKUSDT", ("BONK", 1000.0)),
+            ("1KPEPE", ("PEPE", 1000.0)),
+        ]
+        for raw, expected in cases:
+            res = parse_symbol_and_mult(raw)
+            self.assertEqual(res, expected, f"Failed for {raw}: got {res}, expected {expected}")
+
+    def test_bybit_thread_safe_copy_on_write(self):
+        """BybitPerpStream: Copy-on-Write updates ensure thread-safe book snapshots without corrupt dict states."""
+        from venues.bybit import BybitPerpStream
+        snaps: List[OrderBookDepth5] = []
+        sym_map = {"BTCUSDT": ("BTC", 1.0, 1.0)}
+        stream = BybitPerpStream(sym_map, snaps.append)
+
+        # 1. Snapshot message
+        snap_msg = json.dumps({
+            "topic": "orderbook.50.BTCUSDT",
+            "type": "snapshot",
+            "ts": 1700000000000,
+            "data": {
+                "s": "BTCUSDT",
+                "b": [["80000.0", "1.0"], ["79990.0", "2.0"]],
+                "a": [["80010.0", "1.5"], ["80020.0", "2.5"]],
+            }
+        })
+        stream._parse_message(snap_msg)
+        book = stream.get_book_snapshot("BTCUSDT")
+        self.assertIsNotNone(book)
+        self.assertEqual(book["bids"][80000.0], 1.0)
+        self.assertEqual(book["asks"][80010.0], 1.5)
+
+        # 2. Delta update (removes 80000.0 bid, adds 80005.0)
+        delta_msg = json.dumps({
+            "topic": "orderbook.50.BTCUSDT",
+            "type": "delta",
+            "ts": 1700000000100,
+            "data": {
+                "s": "BTCUSDT",
+                "b": [["80000.0", "0.0"], ["80005.0", "3.0"]],
+                "a": [["80010.0", "4.0"]],
+            }
+        })
+        stream._parse_message(delta_msg)
+        book2 = stream.get_book_snapshot("BTCUSDT")
+        self.assertNotIn(80000.0, book2["bids"])
+        self.assertEqual(book2["bids"][80005.0], 3.0)
+        self.assertEqual(book2["asks"][80010.0], 4.0)
+        # Previous snapshot reference remains unmodified (immutability)
+        self.assertEqual(book["bids"][80000.0], 1.0)
+
+    def test_bybit_sequence_gap_detection(self):
+        """BybitPerpStream: sequence gaps in pu/u or out-of-order deltas invalidate the book."""
+        from venues.bybit import BybitPerpStream
+        snaps: List[OrderBookDepth5] = []
+        sym_map = {"BTCUSDT": ("BTC", 1.0, 1.0)}
+        stream = BybitPerpStream(sym_map, snaps.append)
+
+        # 1. Snapshot message with u = 100
+        snap_msg = json.dumps({
+            "topic": "orderbook.50.BTCUSDT",
+            "type": "snapshot",
+            "ts": 1700000000000,
+            "data": {
+                "s": "BTCUSDT",
+                "u": 100,
+                "seq": 1000,
+                "b": [["80000.0", "1.0"]],
+                "a": [["80010.0", "1.0"]],
+            }
+        })
+        stream._parse_message(snap_msg)
+        self.assertIsNotNone(stream.get_book_snapshot("BTCUSDT"))
+        self.assertEqual(stream.seq_gaps, 0)
+
+        # 2. Sequential delta (pu = 100, u = 101) -> Valid
+        delta_valid = json.dumps({
+            "topic": "orderbook.50.BTCUSDT",
+            "type": "delta",
+            "ts": 1700000000100,
+            "data": {
+                "s": "BTCUSDT",
+                "pu": 100,
+                "u": 101,
+                "b": [["80005.0", "2.0"]],
+                "a": [],
+            }
+        })
+        stream._parse_message(delta_valid)
+        self.assertIsNotNone(stream.get_book_snapshot("BTCUSDT"))
+        self.assertEqual(stream.seq_gaps, 0)
+
+        # 3. Gap delta (pu = 105, expected 101) -> Sequence Gap! Book evicted!
+        delta_gap = json.dumps({
+            "topic": "orderbook.50.BTCUSDT",
+            "type": "delta",
+            "ts": 1700000000200,
+            "data": {
+                "s": "BTCUSDT",
+                "pu": 105,
+                "u": 106,
+                "b": [["80006.0", "2.0"]],
+                "a": [],
+            }
+        })
+        stream._parse_message(delta_gap)
+        self.assertEqual(stream.seq_gaps, 1)
+        # Corrupt book evicted from memory
+        self.assertIsNone(stream.get_book_snapshot("BTCUSDT"))
+
+        # 4. Subsequent delta without a snapshot is dropped
+        stream._parse_message(delta_valid)
+        self.assertEqual(stream.seq_gaps, 2)
+        self.assertIsNone(stream.get_book_snapshot("BTCUSDT"))
+
+    def test_bybit_memory_capping_under_spam(self):
+        """BybitPerpStream: MAX_BOOK_DEPTH strictly limits book size to 25 levels during spam."""
+        from venues.bybit import BybitPerpStream
+        snaps: List[OrderBookDepth5] = []
+        sym_map = {"BTCUSDT": ("BTC", 1.0, 1.0)}
+        stream = BybitPerpStream(sym_map, snaps.append)
+
+        # Generate snapshot with 50 distinct levels
+        bids_spam = [[str(80000 - i * 10), "1.0"] for i in range(50)]
+        asks_spam = [[str(80010 + i * 10), "1.0"] for i in range(50)]
+        snap_msg = json.dumps({
+            "topic": "orderbook.50.BTCUSDT",
+            "type": "snapshot",
+            "ts": 1700000000000,
+            "data": {
+                "s": "BTCUSDT",
+                "u": 1,
+                "b": bids_spam,
+                "a": asks_spam,
+            }
+        })
+        stream._parse_message(snap_msg)
+        book = stream.get_book_snapshot("BTCUSDT")
+        self.assertIsNotNone(book)
+        # Memory capped to 25 levels max, not allowed to grow to 50 or 100+
+        self.assertLessEqual(len(book["bids"]), 25)
+        self.assertLessEqual(len(book["asks"]), 25)
+
+    def test_gateio_sequence_gap_detection(self):
+        """GateioStream: sequence gap in id invalidates local book cache."""
+        snaps: List[OrderBookDepth5] = []
+        stream = GateioStream(["BTC_USDT"], snaps.append)
+
+        # 1. Snapshot with id = 10
+        snap_msg = json.dumps({
+            "channel": "futures.order_book_update",
+            "event": "all",
+            "result": {
+                "contract": "BTC_USDT",
+                "id": 10,
+                "b": [{"p": "80000.0", "s": "1.0"}],
+                "a": [{"p": "80001.0", "s": "1.0"}],
+            }
+        })
+        stream._parse_message(snap_msg)
+        self.assertIsNotNone(stream.get_book_snapshot("BTC_USDT"))
+        self.assertEqual(stream.seq_gaps, 0)
+
+        # 2. Sequential update (id = 11) -> Valid
+        up_valid = json.dumps({
+            "channel": "futures.order_book_update",
+            "event": "update",
+            "result": {
+                "contract": "BTC_USDT",
+                "id": 11,
+                "b": [{"p": "80000.5", "s": "2.0"}],
+                "a": [],
+            }
+        })
+        stream._parse_message(up_valid)
+        self.assertIsNotNone(stream.get_book_snapshot("BTC_USDT"))
+        self.assertEqual(stream.seq_gaps, 0)
+
+        # 3. Gap update (id = 15, expected 12) -> Sequence gap! Book evicted!
+        up_gap = json.dumps({
+            "channel": "futures.order_book_update",
+            "event": "update",
+            "result": {
+                "contract": "BTC_USDT",
+                "id": 15,
+                "b": [{"p": "80000.8", "s": "2.0"}],
+                "a": [],
+            }
+        })
+        stream._parse_message(up_gap)
+        self.assertEqual(stream.seq_gaps, 1)
+        self.assertIsNone(stream.get_book_snapshot("BTC_USDT"))
+
+    def test_gateio_memory_capping_under_spam(self):
+        """GateioStream: MAX_BOOK_DEPTH bounds dictionary to 25 levels max."""
+        snaps: List[OrderBookDepth5] = []
+        stream = GateioStream(["BTC_USDT"], snaps.append)
+
+        bids_spam = [{"p": str(80000 - i * 5), "s": "1.0"} for i in range(40)]
+        asks_spam = [{"p": str(80005 + i * 5), "s": "1.0"} for i in range(40)]
+        msg = json.dumps({
+            "channel": "futures.order_book_update",
+            "event": "all",
+            "result": {
+                "contract": "BTC_USDT",
+                "id": 1,
+                "b": bids_spam,
+                "a": asks_spam,
+            }
+        })
+        stream._parse_message(msg)
+        book = stream.get_book_snapshot("BTC_USDT")
+        self.assertIsNotNone(book)
+        self.assertLessEqual(len(book["bids"]), 25)
+        self.assertLessEqual(len(book["asks"]), 25)
+
+    def test_binance_and_asterdex_sequence_gap_detection(self):
+        """BinanceFuturesStream and AsterdexStream: verify pu == last_u continuity."""
+        from venues.binance import BinanceFuturesStream
+        snaps_binance: List[OrderBookDepth5] = []
+        stream_b = BinanceFuturesStream({"BTCUSDT": ("BTC", 1.0, 1.0)}, snaps_binance.append)
+
+        # 1. Initial tick u = 100
+        msg1 = json.dumps({
+            "s": "BTCUSDT",
+            "u": 100,
+            "b": [["80000.0", "1.0"]],
+            "a": [["80001.0", "1.0"]],
+        })
+        stream_b._parse_message(msg1)
+        self.assertEqual(len(snaps_binance), 1)
+
+        # 2. Sequential tick (pu = 100, u = 105)
+        msg2 = json.dumps({
+            "s": "BTCUSDT",
+            "pu": 100,
+            "u": 105,
+            "b": [["80000.0", "1.0"]],
+            "a": [["80001.0", "1.0"]],
+        })
+        stream_b._parse_message(msg2)
+        self.assertEqual(len(snaps_binance), 2)
+        self.assertEqual(stream_b.seq_gaps, 0)
+
+        # 3. Gap tick (pu = 110, expected 105) -> Gap detected, tick dropped!
+        msg3 = json.dumps({
+            "s": "BTCUSDT",
+            "pu": 110,
+            "u": 115,
+            "b": [["80000.0", "1.0"]],
+            "a": [["80001.0", "1.0"]],
+        })
+        stream_b._parse_message(msg3)
+        self.assertEqual(len(snaps_binance), 2)  # Not increased
+        self.assertEqual(stream_b.seq_gaps, 1)
+
+        # 4. Aster DEX gap verification
+        snaps_aster: List[OrderBookDepth5] = []
+        stream_a = AsterdexStream({"BTCUSDT": ("BTC", 1.0, 1.0)}, snaps_aster.append)
+
+        msg_a1 = json.dumps({
+            "e": "depthUpdate",
+            "s": "BTCUSDT",
+            "u": 500,
+            "b": [["80000.0", "1.0"]],
+            "a": [["80001.0", "1.0"]],
+        })
+        stream_a._parse_message(msg_a1)
+        self.assertEqual(len(snaps_aster), 1)
+
+        # Gap tick in Aster DEX
+        msg_a2 = json.dumps({
+            "e": "depthUpdate",
+            "s": "BTCUSDT",
+            "pu": 520,
+            "u": 525,
+            "b": [["80000.0", "1.0"]],
+            "a": [["80001.0", "1.0"]],
+        })
+        stream_a._parse_message(msg_a2)
+        self.assertEqual(len(snaps_aster), 1)  # Dropped
+        self.assertEqual(stream_a.seq_gaps, 1)
+
+    def test_okx_seq_id_dedup(self):
+        """OKXStream: drops duplicate or backward seqId messages."""
+        snaps: List[OrderBookDepth5] = []
+        stream = OKXStream({"BTC-USDT-SWAP": ("BTC", 1.0, 1.0)}, snaps.append)
+
+        msg1 = json.dumps({
+            "arg": {"channel": "books5", "instId": "BTC-USDT-SWAP"},
+            "data": [{
+                "seqId": 1000,
+                "bids": [["80000.0", "1.0", "0", "1"]],
+                "asks": [["80001.0", "1.0", "0", "1"]],
+            }]
+        })
+        stream._parse_message(msg1)
+        self.assertEqual(len(snaps), 1)
+
+        # Duplicate / backward seqId 999
+        msg2 = json.dumps({
+            "arg": {"channel": "books5", "instId": "BTC-USDT-SWAP"},
+            "data": [{
+                "seqId": 999,
+                "bids": [["80000.0", "1.0", "0", "1"]],
+                "asks": [["80001.0", "1.0", "0", "1"]],
+            }]
+        })
+        stream._parse_message(msg2)
+        self.assertEqual(len(snaps), 1)
+        self.assertEqual(stream.seq_duplicates, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -7504,19 +8744,23 @@ def main() -> None:
     print("\n[1] BREAKDOWN BY FOLLOWER EXCHANGE & TRIGGER TYPE:")
     print(
         f"{'Venue   | Trigger':<24} | {'Count':>5} | {'Conv%':>5} | {'Win%':>5} | "
-        f"{'MeanPnL':>8} | {'MedPnL':>7} | {'MeanMFE':>8} | {'PeakT(s)':>8}"
+        f"{'MeanPnL':>8} | {'MedPnL':>7} | {'MedTop3':>8} | {'MedCap15':>8}"
     )
-    print("-" * 88)
+    print("-" * 92)
     for k, rows in sorted(groups.items()):
         n = len(rows)
         pnls = [float(r.get("net_pnl_bps", 0.0)) for r in rows]
-        mfes = [float(r.get("mfe_exec_pnl_bps", r.get("net_pnl_bps", 0.0))) for r in rows]
-        t_peaks = [float(r.get("time_to_peak_sec", 0.0)) for r in rows]
+        top3s = [float(r.get("follower_top3_ask_usd", 0.0)) for r in rows if float(r.get("follower_top3_ask_usd", 0.0)) > 0]
+        caps = [
+            float(r.get("stealth_capacity_usd") or (0.15 * float(r.get("follower_top3_ask_usd", 0.0))))
+            for r in rows
+            if float(r.get("follower_top3_ask_usd", 0.0)) > 0
+        ]
         conv_pct = sum(1 for r in rows if r.get("close_reason") == "converged") / n * 100.0
         win_pct = sum(1 for p in pnls if p > 0.0) / n * 100.0
         print(
             f"{k:<24} | {n:>5d} | {conv_pct:>4.1f}% | {win_pct:>4.1f}% | "
-            f"{_mean(pnls):>+7.2f} | {_med(pnls):>+6.2f} | {_mean(mfes):>+7.2f} | {_med(t_peaks):>7.2f}s"
+            f"{_mean(pnls):>+7.2f} | {_med(pnls):>+6.2f} | ${_med(top3s):>7.0f} | ${_med(caps):>7.0f}"
         )
 
     # 2. Sub-second Markout Curve across horizons
@@ -7568,6 +8812,12 @@ def main() -> None:
         pnls = [float(r.get("net_pnl_bps", 0.0)) for r in rows]
         mfes = [float(r.get("mfe_exec_pnl_bps", 0.0)) for r in rows]
         spreads = [float(r.get("follower_spread_bps", 0.0)) for r in rows]
+        top3s = [float(r.get("follower_top3_ask_usd", 0.0)) for r in rows if float(r.get("follower_top3_ask_usd", 0.0)) > 0]
+        caps = [
+            float(r.get("stealth_capacity_usd") or (0.15 * float(r.get("follower_top3_ask_usd", 0.0))))
+            for r in rows
+            if float(r.get("follower_top3_ask_usd", 0.0)) > 0
+        ]
         win_pct = sum(1 for p in pnls if p > 0.0) / n * 100.0
         mfe_pos_pct = sum(1 for m in mfes if m > 2.0) / n * 100.0
         coin_stats.append({
@@ -7577,6 +8827,8 @@ def main() -> None:
             "mfe_pos_pct": mfe_pos_pct,
             "mean_pnl": _mean(pnls),
             "sum_pnl": sum(pnls),
+            "med_top3": _med(top3s),
+            "med_cap": _med(caps),
             "mean_mfe": _mean(mfes),
             "mean_spread": _mean(spreads),
         })
@@ -7585,14 +8837,15 @@ def main() -> None:
 
     print("\n[4] COIN PERFORMANCE RANKING (Sorted by Mean Realized Net PnL):")
     print(
-        f"{'Coin':<10} | {'Trades':>6} | {'Win%':>6} | {'MFE>2bps%':>9} | "
-        f"{'MeanPnL':>8} | {'TotalPnL':>9} | {'MeanMFE':>8} | {'F_Spread':>8}"
+        f"{'Coin':<10} | {'Trades':>6} | {'Win%':>6} | "
+        f"{'MeanPnL':>8} | {'MedTop3':>8} | {'MedCap15':>8} | {'MeanMFE':>8} | {'F_Spread':>8}"
     )
-    print("-" * 88)
+    print("-" * 92)
     for st in coin_stats:
         print(
-            f"{st['coin']:<10} | {st['n']:>6d} | {st['win_pct']:>5.1f}% | {st['mfe_pos_pct']:>8.1f}% | "
-            f"{st['mean_pnl']:>+7.2f} | {st['sum_pnl']:>+8.1f} | {st['mean_mfe']:>+7.2f} | {st['mean_spread']:>7.2f}"
+            f"{st['coin']:<10} | {st['n']:>6d} | {st['win_pct']:>5.1f}% | "
+            f"{st['mean_pnl']:>+7.2f} | ${st['med_top3']:>7.0f} | ${st['med_cap']:>7.0f} | "
+            f"{st['mean_mfe']:>+7.2f} | {st['mean_spread']:>7.2f}"
         )
 
     # Suggest automatic blacklist for coins with >= 3 signals and negative MFE/PnL
@@ -7649,6 +8902,8 @@ ALL_VENUES = [
     "bingx",
     "htx",
     "pionex",
+    "asterdex",
+    "hyperliquid",
 ]
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -7948,7 +9203,7 @@ def calibrate(
                 for c in udoc.get("coins", []):
                     # Check which venues this coin trades on
                     venues = []
-                    for v in ["binance", "bybit", "okx", "gateio", "mexc", "kucoin", "bingx", "htx", "pionex"]:
+                    for v in ["binance", "bybit", "okx", "gateio", "mexc", "kucoin", "bingx", "htx", "pionex", "asterdex", "hyperliquid"]:
                         sym_map = udoc.get(f"{v}_sym_map", {})
                         if any(val[0] == c for val in sym_map.values()):
                             venues.append(v)
@@ -8150,6 +9405,7 @@ import glob
 import gzip
 import json
 import os
+import statistics
 import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -8168,7 +9424,7 @@ UNIVERSE_FILE = os.path.join(PROJECT_ROOT, "universe_live.json")
 THRESHOLDS_FILE = os.path.join(PROJECT_ROOT, "matrix_thresholds.json")
 
 SWEEP_THRESHOLDS = (10, 15, 20, 25, 30, 35, 40, 50, 60)
-FUNDED_VENUES = {"binance", "bybit", "okx", "gateio", "mexc", "kucoin", "bingx"}
+FUNDED_VENUES = {"binance", "bybit", "okx", "gateio", "mexc", "kucoin", "bingx", "htx", "pionex", "asterdex", "hyperliquid"}
 
 
 def _collect_files(days_back: float = 1.0) -> List[str]:
@@ -8240,8 +9496,15 @@ def generate_daily_report(
     }
 
     sweep = {t: {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0} for t in SWEEP_THRESHOLDS}
-    pair_stats = collections.defaultdict(lambda: {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0})
-    coin_stats = collections.defaultdict(lambda: {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0, "mfes": [], "t_peaks": []})
+    pair_stats = collections.defaultdict(lambda: {
+        "count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0,
+        "top3_depths": [], "stealth_caps": []
+    })
+    coin_stats = collections.defaultdict(lambda: {
+        "count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0,
+        "mfes": [], "t_peaks": [], "top3_depths": [], "stealth_caps": []
+    })
+    venue_capacities = collections.defaultdict(lambda: {"count": 0, "top3_depths": [], "stealth_caps": []})
 
     for fpath in files:
         try:
@@ -8303,6 +9566,10 @@ def generate_daily_report(
                     if drain_ratio < 0.40 and cross_ratio < 0.50:
                         continue
 
+                    stealth_cap = float(d.get("stealth_capacity_usd", 0.0))
+                    if stealth_cap <= 0.0 and f_top3_ask > 0.0:
+                        stealth_cap = round(0.15 * f_top3_ask, 2)
+
                     pk = f"{coin}:upbit-{f_ex}"
                     req_edge = calibrated_thresholds.get(pk, 20.0)
                     if gross_edge_bps >= req_edge:
@@ -8331,6 +9598,9 @@ def generate_daily_report(
                     ps["fee"] += fee_usd
                     ps["net"] += net
                     ps["wins"] += is_win
+                    if f_top3_ask > 0:
+                        ps["top3_depths"].append(f_top3_ask)
+                        ps["stealth_caps"].append(stealth_cap)
 
                     # Coin stats
                     cs = coin_stats[coin]
@@ -8339,12 +9609,22 @@ def generate_daily_report(
                     cs["fee"] += fee_usd
                     cs["net"] += net
                     cs["wins"] += is_win
+                    if f_top3_ask > 0:
+                        cs["top3_depths"].append(f_top3_ask)
+                        cs["stealth_caps"].append(stealth_cap)
                     mfe = d.get("mfe_exec_pnl_bps")
                     if mfe is not None:
                         cs["mfes"].append(float(mfe))
                     t_pk = d.get("time_to_peak_sec")
                     if t_pk is not None:
                         cs["t_peaks"].append(float(t_pk))
+
+                    # Venue capacity stats
+                    if f_top3_ask > 0:
+                        vc = venue_capacities[f_ex]
+                        vc["count"] += 1
+                        vc["top3_depths"].append(f_top3_ask)
+                        vc["stealth_caps"].append(stealth_cap)
 
         except Exception as e:
             if not as_json:
@@ -8371,12 +9651,16 @@ def generate_daily_report(
     sorted_pairs = []
     for pk, ps in sorted(pair_stats.items(), key=lambda x: x[1]["net"], reverse=True):
         cnt = ps["count"]
+        med_top3 = statistics.median(ps["top3_depths"]) if ps["top3_depths"] else 0.0
+        med_cap = statistics.median(ps["stealth_caps"]) if ps["stealth_caps"] else 0.0
         sorted_pairs.append({
             "pair": pk,
             "trades": cnt,
             "winrate_pct": round((ps["wins"] / cnt) * 100.0, 1) if cnt else 0.0,
             "net_pnl_usd": round(ps["net"], 2),
             "gross_usd": round(ps["gross"], 2),
+            "med_top3_depth_usd": round(med_top3, 1),
+            "med_stealth_cap_usd": round(med_cap, 1),
         })
 
     # Format top coins
@@ -8385,6 +9669,8 @@ def generate_daily_report(
         cnt = cs["count"]
         avg_mfe = sum(cs["mfes"]) / len(cs["mfes"]) if cs["mfes"] else 0.0
         med_tpk = sorted(cs["t_peaks"])[len(cs["t_peaks"]) // 2] if cs["t_peaks"] else 0.0
+        med_top3 = statistics.median(cs["top3_depths"]) if cs["top3_depths"] else 0.0
+        med_cap = statistics.median(cs["stealth_caps"]) if cs["stealth_caps"] else 0.0
         sorted_coins.append({
             "coin": c,
             "trades": cnt,
@@ -8392,6 +9678,31 @@ def generate_daily_report(
             "net_pnl_usd": round(cs["net"], 2),
             "avg_mfe_bps": round(avg_mfe, 1),
             "median_t_peak_sec": round(med_tpk, 2),
+            "med_top3_depth_usd": round(med_top3, 1),
+            "med_stealth_cap_usd": round(med_cap, 1),
+        })
+
+    # Format venue physical capacities
+    venue_summary = []
+    for vex, vdata in sorted(venue_capacities.items(), key=lambda x: len(x[1]["stealth_caps"]), reverse=True):
+        if not vdata["stealth_caps"]:
+            continue
+        caps = sorted(vdata["stealth_caps"])
+        depths = sorted(vdata["top3_depths"])
+        n_c = len(caps)
+        med_cap = statistics.median(caps)
+        med_depth = statistics.median(depths)
+        p25_cap = caps[n_c // 4]
+        p75_cap = caps[(3 * n_c) // 4]
+        venue_summary.append({
+            "venue": vex,
+            "signals": vdata["count"],
+            "med_top3_depth_usd": round(med_depth, 1),
+            "med_stealth_cap_usd": round(med_cap, 1),
+            "p25_stealth_cap_usd": round(p25_cap, 1),
+            "p75_stealth_cap_usd": round(p75_cap, 1),
+            "min_stealth_cap_usd": round(caps[0], 1),
+            "max_stealth_cap_usd": round(caps[-1], 1),
         })
 
     doc = {
@@ -8411,6 +9722,7 @@ def generate_daily_report(
         "close_reasons": dict(close_reasons),
         "trigger_types": dict(trigger_types),
         "pnl_scenarios": pnl_summary,
+        "venue_capacities": venue_summary,
         "sweep_thresholds": {
             t: {
                 "trades": sweep[t]["count"],
@@ -8446,6 +9758,7 @@ def generate_daily_report(
 def _render_markdown_report(doc: Dict[str, Any]) -> str:
     m = doc["metadata"]
     p = doc["pnl_scenarios"]
+    vc = doc.get("venue_capacities", [])
     lines = [
         f"# Korean Sunrise: Суточный Квантовый Отчёт ({m['report_date']})",
         f"*Сгенерирован:* `{m['generated_at']}` | *Окно:* `{m['days_analyzed']} d` | *Размер слота:* `${m['order_size_usd']}` | *Комиссия:* `{m['roundtrip_fee_bps']} bps`",
@@ -8475,9 +9788,26 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
             f"${row['gross_usd']:.2f} | ${row['fee_usd']:.2f} | **${row['net_pnl_usd']:.2f}** | {row['profit_factor']} |"
         )
 
+    # Section 3: Physical order book capacity
     lines.extend([
         "",
-        "## 3. Оптимизация порогов спреда (Threshold Sweep)",
+        "## 3. Физическая ёмкость стакана по биржам (Real Order Book Capacity)",
+        "| Биржа | Сигналов | Мед. Top-3 стакан ($) | Мед. 15% Ёмкость ($) | P25 Ёмкость ($) | P75 Ёмкость ($) | Мин. ($) | Макс. ($) |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+    ])
+    if vc:
+        for v in vc:
+            lines.append(
+                f"| `{v['venue']}` | {v['signals']:,} | ${v['med_top3_depth_usd']:,.1f} | "
+                f"**${v['med_stealth_cap_usd']:,.1f}** | ${v['p25_stealth_cap_usd']:,.1f} | "
+                f"${v['p75_stealth_cap_usd']:,.1f} | ${v['min_stealth_cap_usd']:,.1f} | ${v['max_stealth_cap_usd']:,.1f} |"
+            )
+    else:
+        lines.append("| *Нет накопленных данных по стаканам* | - | - | - | - | - | - | - |")
+
+    lines.extend([
+        "",
+        "## 4. Оптимизация порогов спреда (Threshold Sweep)",
         "| Порог (bps) | Сигналов | Win Rate | Net PnL USD |",
         "| :---: | :---: | :---: | :---: |",
     ])
@@ -8486,27 +9816,35 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "## 4. Топ прибыльных связок (Upbit Leader <-> Perp Follower)",
-        "| Связка (Coin:Upbit-Follower) | Сделок | Win Rate | Gross USD | Net PnL USD |",
-        "| :--- | :---: | :---: | :---: | :---: |",
+        "## 5. Топ прибыльных связок (Upbit Leader <-> Perp Follower)",
+        "| Связка (Coin:Upbit-Follower) | Сделок | Win Rate | Gross USD | Net PnL USD | Мед. Top-3 ($) | Мед. 15% Ёмкость ($) |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
     ])
     if doc["top_pairs"]:
         for pr in doc["top_pairs"][:15]:
-            lines.append(f"| `{pr['pair']}` | {pr['trades']} | {pr['winrate_pct']}% | ${pr['gross_usd']:.2f} | **${pr['net_pnl_usd']:.2f}** |")
+            lines.append(
+                f"| `{pr['pair']}` | {pr['trades']} | {pr['winrate_pct']}% | "
+                f"${pr['gross_usd']:.2f} | **${pr['net_pnl_usd']:.2f}** | "
+                f"${pr.get('med_top3_depth_usd', 0.0):,.1f} | **${pr.get('med_stealth_cap_usd', 0.0):,.1f}** |"
+            )
     else:
-        lines.append("| *Нет накопленных сделок за выбранный период* | - | - | - | - |")
+        lines.append("| *Нет накопленных сделок за выбранный период* | - | - | - | - | - | - |")
 
     lines.extend([
         "",
-        "## 5. Топ монет по эффективности опережения",
-        "| Монета | Сделок | Win Rate | Net PnL USD | Ср. MFE (bps) | Медиана $T_{peak}$ |",
-        "| :--- | :---: | :---: | :---: | :---: | :---: |",
+        "## 6. Топ монет по эффективности опережения",
+        "| Монета | Сделок | Win Rate | Net PnL USD | Мед. Top-3 ($) | Мед. 15% Ёмкость ($) | Ср. MFE (bps) | Медиана $T_{peak}$ |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ])
     if doc["top_coins"]:
         for c in doc["top_coins"][:15]:
-            lines.append(f"| **{c['coin']}** | {c['trades']} | {c['winrate_pct']}% | **${c['net_pnl_usd']:.2f}** | +{c['avg_mfe_bps']} bps | {c['median_t_peak_sec']} s |")
+            lines.append(
+                f"| **{c['coin']}** | {c['trades']} | {c['winrate_pct']}% | **${c['net_pnl_usd']:.2f}** | "
+                f"${c.get('med_top3_depth_usd', 0.0):,.1f} | **${c.get('med_stealth_cap_usd', 0.0):,.1f}** | "
+                f"+{c['avg_mfe_bps']} bps | {c['median_t_peak_sec']} s |"
+            )
     else:
-        lines.append("| *Нет накопленных данных по монетам* | - | - | - | - | - |")
+        lines.append("| *Нет накопленных данных по монетам* | - | - | - | - | - | - | - |")
 
     return "\n".join(lines)
 
@@ -9039,11 +10377,15 @@ def main() -> None:
     parser.add_argument("--min-corr", type=float, default=0.65, help="Min 1m log-returns correlation (default: 0.65)")
     parser.add_argument("--min-both-trade", type=float, default=0.15, help="Min fraction of active trading minutes (default: 0.15)")
     parser.add_argument("--min-dev-bps", type=float, default=8.0, help="Min P90 basis deviation in bps (default: 8.0 bps)")
+    parser.add_argument("--venues", nargs="+", default=None, help="Specific follower venues (e.g. --venues binance)")
+    parser.add_argument("--coins", nargs="+", default=None, help="Specific coins to screen (e.g. --coins ETHFI AXS SPX)")
     parser.add_argument("--kline-limit", type=int, default=200, help="Number of 1m candles to evaluate (default: 200 = ~3.3h)")
     parser.add_argument("--workers", type=int, default=8, help="Parallel worker threads (default: 8)")
     args = parser.parse_args()
 
     screener = UniverseScreener(
+        venues=args.venues,
+        coins=args.coins,
         min_vol_usd=args.min_vol,
         max_price_diff_pct=args.max_price_diff,
         min_corr=args.min_corr,
@@ -9269,7 +10611,9 @@ if __name__ == "__main__":
       "kucoin": 100.0,
       "bingx": 100.0,
       "htx": 100.0,
-      "pionex": 100.0
+      "pionex": 100.0,
+      "asterdex": 100.0,
+      "hyperliquid": 100.0
     },
     "reserve_margin_frac": 0.2
   },
@@ -9282,7 +10626,9 @@ if __name__ == "__main__":
     "kucoin",
     "bingx",
     "htx",
-    "pionex"
+    "pionex",
+    "asterdex",
+    "hyperliquid"
   ],
   "max_active_slots": 5,
   "min_order_usd": 10.0,
@@ -14115,6 +15461,8 @@ from venues.kucoin import KucoinRestClient, KucoinStream
 from venues.bingx import BingXRestClient, BingXStream
 from venues.htx import HTXRestClient, HTXStream
 from venues.pionex import PionexRestClient, PionexStream
+from venues.asterdex import AsterdexRestClient, AsterdexStream
+from venues.hyperliquid import HyperliquidRestClient, HyperliquidStream
 from venues.manager import StreamManager
 
 __all__ = [
@@ -14122,28 +15470,257 @@ __all__ = [
     "BaseCEXStream",
     "create_http_session",
     "normalize_symbol",
-    "UpbitRestClient",
     "UpbitSpotStream",
-    "BinanceRestClient",
+    "UpbitRestClient",
     "BinanceFuturesStream",
-    "BybitRestClient",
+    "BinanceRestClient",
     "BybitPerpStream",
-    "OKXRestClient",
+    "BybitRestClient",
     "OKXStream",
-    "GateioRestClient",
+    "OKXRestClient",
     "GateioStream",
-    "MEXCRestClient",
+    "GateioRestClient",
     "MEXCStream",
-    "KucoinRestClient",
+    "MEXCRestClient",
     "KucoinStream",
-    "BingXRestClient",
+    "KucoinRestClient",
     "BingXStream",
-    "HTXRestClient",
+    "BingXRestClient",
     "HTXStream",
-    "PionexRestClient",
+    "HTXRestClient",
     "PionexStream",
+    "PionexRestClient",
+    "AsterdexStream",
+    "AsterdexRestClient",
+    "HyperliquidStream",
+    "HyperliquidRestClient",
     "StreamManager",
 ]
+```
+
+## venues/asterdex.py
+
+```python
+"""
+venues/asterdex.py — Aster DEX REST Client and WebSocket depth5@100ms Stream.
+Aster DEX is a high-liquidity perpetual DEX (built on ApolloX/APX Binance Cloud protocol).
+REST and WebSocket APIs are 100% Binance-Futures-compatible.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+import requests
+
+from models import OrderBookDepth5
+from venues.base import (
+    BaseCEXStream,
+    create_http_session,
+    normalize_symbol,
+    parse_symbol_and_mult,
+    log,
+)
+
+
+class AsterdexRestClient:
+    """REST Client for Aster DEX linear perpetuals discovery, 24h tickers, and 1m klines."""
+
+    BASE_URL = "https://fapi.asterdex.com"
+
+    def __init__(self, session: Optional[requests.Session] = None):
+        self.session = session or create_http_session()
+
+    def fetch_linear_perpetuals(self) -> Dict[str, Tuple[str, float, float]]:
+        """
+        Fetches all active USDT Linear Perpetuals from Aster DEX.
+        Returns: raw_symbol (e.g. '1000PEPEUSDT') -> (canonical_coin 'PEPE', multiplier 1000.0, contract_size 1.0).
+        """
+        url = f"{self.BASE_URL}/fapi/v1/exchangeInfo"
+        out: Dict[str, Tuple[str, float, float]] = {}
+        try:
+            r = self.session.get(url, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                for s in data.get("symbols", []):
+                    if (
+                        s.get("contractType") == "PERPETUAL"
+                        and s.get("status") == "TRADING"
+                        and s.get("quoteAsset") == "USDT"
+                    ):
+                        raw_sym = s.get("symbol", "").upper()
+                        base_asset = s.get("baseAsset", "").upper()
+                        coin, mult = parse_symbol_and_mult(base_asset)
+                        c_size = float(s.get("contractSize") or s.get("contract_size") or 1.0)
+                        out[raw_sym] = (coin, mult, c_size)
+        except Exception as e:
+            log.warning(f"[asterdex_rest] Failed to fetch exchangeInfo: {e}")
+        return out
+
+    def fetch_contract_sizes(self) -> Dict[str, float]:
+        """
+        Fetches contract_size for active symbols.
+        Returns raw_symbol -> contract_size float.
+        """
+        url = f"{self.BASE_URL}/fapi/v1/exchangeInfo"
+        out: Dict[str, float] = {}
+        try:
+            r = self.session.get(url, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                for s in data.get("symbols", []):
+                    raw_sym = s.get("symbol", "").upper()
+                    c_size = float(s.get("contractSize") or s.get("contract_size") or 1.0)
+                    out[raw_sym] = c_size
+        except Exception as e:
+            log.warning(f"[asterdex_rest] Failed to fetch contract sizes: {e}")
+        return out
+
+    def fetch_tickers_24h(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Fetches 24-hour ticker statistics for Aster DEX perps.
+        Returns: raw_symbol -> {'venue_sym': sym, 'price': float, 'vol_24h': float}.
+        """
+        url = f"{self.BASE_URL}/fapi/v1/ticker/24hr"
+        out: Dict[str, Dict[str, Any]] = {}
+        try:
+            r = self.session.get(url, timeout=10)
+            if r.status_code == 200:
+                for item in r.json():
+                    sym = item.get("symbol", "").upper()
+                    if not sym.endswith("USDT"):
+                        continue
+                    vol = float(item.get("quoteVolume", 0.0) or 0.0)
+                    price = float(item.get("lastPrice", 0.0) or 0.0)
+                    if price > 0:
+                        out[sym] = {"venue_sym": sym, "price": price, "vol_24h": vol}
+        except Exception as e:
+            log.warning(f"[asterdex_rest] Failed to fetch 24h tickers: {e}")
+        return out
+
+    def fetch_klines_1m(
+        self,
+        symbol: str,
+        limit: int = 200,
+        mult: float = 1.0,
+    ) -> Dict[int, Tuple[float, float]]:
+        """
+        Fetches up to limit 1m klines from Aster DEX.
+        Returns: minute_ts_sec -> (normalized_close_usd, quote_volume_usd).
+        """
+        url = f"{self.BASE_URL}/fapi/v1/klines?symbol={symbol}&interval=1m&limit={min(limit, 1000)}"
+        out: Dict[int, Tuple[float, float]] = {}
+        inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
+        try:
+            r = self.session.get(url, timeout=6)
+            if r.status_code == 200:
+                for row in r.json():
+                    t_sec = (int(row[0]) // 60000) * 60
+                    close = float(row[4]) * inv_mult
+                    quote_vol = float(row[7])
+                    if t_sec > 0 and close > 0:
+                        out[t_sec] = (close, quote_vol)
+        except Exception:
+            pass
+        return out
+
+
+class AsterdexStream(BaseCEXStream):
+    """
+    Subscribes to depth5@100ms on Aster DEX USDT Linear Perps via WebSocket.
+    Uses Binance-compatible SUBSCRIBE method and depthUpdate stream format.
+    """
+
+    WS_URL = "wss://fstream.asterdex.com/ws"
+    CHUNK_SIZE = 50
+
+    def __init__(
+        self,
+        symbols: List[str] | Dict[str, Any],
+        callback: Callable[[OrderBookDepth5], None],
+        stream_name: Optional[str] = None,
+        contract_sizes: Optional[Dict[str, float]] = None,
+    ):
+        super().__init__("asterdex", symbols, callback, stream_name=stream_name, contract_sizes=contract_sizes)
+        self._raw_symbols: List[str] = sorted(self._sym_map.keys())
+
+    async def _send_subscriptions(self, ws: Any) -> None:
+        if not self._raw_symbols:
+            return
+
+        streams = [f"{s.lower()}@depth5@100ms" for s in self._raw_symbols]
+        for i in range(0, len(streams), self.CHUNK_SIZE):
+            chunk = streams[i : i + self.CHUNK_SIZE]
+            sub_msg = {
+                "method": "SUBSCRIBE",
+                "params": chunk,
+                "id": (i // self.CHUNK_SIZE) + 1,
+            }
+            await ws.send(json.dumps(sub_msg))
+            await asyncio.sleep(0.05)
+
+    def _handle_sub_reply(self, data: Any) -> None:
+        pass
+
+    def _parse_message(self, raw_msg: str) -> None:
+        try:
+            payload = json.loads(raw_msg)
+            if payload.get("id") is not None and "result" in payload:
+                return
+
+            data = payload.get("data", payload)
+            if data.get("e") != "depthUpdate":
+                return
+
+            raw_sym = str(data.get("s", "")).upper()
+            if not raw_sym:
+                return
+
+            # Sequence gap / packet drop detection
+            curr_u = int(data.get("u") or 0)
+            prev_u = int(data.get("pu") or 0)
+            if curr_u > 0:
+                last_u = self._last_u.get(raw_sym)
+                if last_u is not None and prev_u > 0:
+                    if prev_u != last_u:
+                        self.seq_gaps += 1
+                        log.warning(
+                            f"[asterdex] Sequence gap for {raw_sym}: expected pu={last_u}, got {prev_u} (u={curr_u}). Dropping gap tick."
+                        )
+                        self._last_u[raw_sym] = curr_u
+                        return
+                    if curr_u <= last_u:
+                        self.seq_duplicates += 1
+                        return
+                self._last_u[raw_sym] = curr_u
+
+            coin, mult = self._resolve_coin_and_mult(raw_sym)
+            c_size = self._get_contract_size(raw_sym)
+            exchange_ts = int(data.get("E", 0))
+
+            raw_bids = data.get("b", [])
+            raw_asks = data.get("a", [])
+
+            bids = self._extract_levels(raw_bids, limit=5, mult=mult, contract_size=c_size)
+            asks = self._extract_levels(raw_asks, limit=5, mult=mult, contract_size=c_size)
+
+            if not bids or not asks:
+                return
+
+            snap = OrderBookDepth5(
+                exchange="asterdex",
+                symbol=coin,
+                raw_symbol=raw_sym,
+                ts=time.time(),
+                exchange_ts=exchange_ts,
+                bids=bids,
+                asks=asks,
+            )
+            self.callback(snap)
+        except Exception:
+            pass
 ```
 
 ## venues/base.py
@@ -14183,14 +15760,56 @@ _CONTRACT_SUFFIXES = ("PERP", "SWAP")
 
 import re
 
+_KNOWN_BASE_TOKENS = {
+    # Genuine tokens starting with K, M, B that must not be stripped as metric multiplier prefixes
+    "KAS", "KAVA", "KLAY", "KDA", "KSM", "KEY", "KNC", "KP3R", "KMD", "KUB",
+    "MKR", "MANA", "MATIC", "MEME", "MINA", "MOVE", "ME", "MOVR", "MDT", "MAGIC", "MASK", "MBL", "MTL", "MBOX", "MYRO", "MOG", "MELANIA",
+    "BTC", "BCH", "BNB", "BOME", "BONK", "BLUR", "BAT", "BICO", "BAND", "BADGER", "BEL", "BETA", "BAKE", "BEAM", "BSV", "BTT", "BIGTIME",
+}
+
+_SCALE_PREFIX_MAP: List[Tuple[re.Pattern, float]] = [
+    (re.compile(r"^1000000000([A-Z0-9]+)$"), 1_000_000_000.0),
+    (re.compile(r"^1B([A-Z0-9]+)$"), 1_000_000_000.0),
+    (re.compile(r"^1000000([A-Z0-9]+)$"), 1_000_000.0),
+    (re.compile(r"^1M([A-Z0-9]+)$"), 1_000_000.0),
+    (re.compile(r"^100000([A-Z0-9]+)$"), 100_000.0),
+    (re.compile(r"^10000([A-Z0-9]+)$"), 10_000.0),
+    (re.compile(r"^1000([A-Z0-9]+)$"), 1_000.0),
+    (re.compile(r"^1K([A-Z0-9]+)$"), 1_000.0),
+    (re.compile(r"^100([A-Z0-9]+)$"), 100.0),
+]
+
 _MULT_PREFIX_RE = re.compile(r"^(1000000|100000|10000|1000|100)([A-Z0-9]+)$")
 
 
 def parse_symbol_and_mult(raw: str) -> Tuple[str, float]:
-    """Returns (canonical_base_coin, multiplier) e.g. '1000PEPE-USDT' -> ('PEPE', 1000.0)."""
+    """
+    Returns (canonical_base_coin, multiplier)
+    e.g. '1000PEPE-USDT' -> ('PEPE', 1000.0)
+         '1MPEPE_USDT'   -> ('PEPE', 1000000.0)
+         'kPEPE'         -> ('PEPE', 1000.0)
+         'kSHIB'         -> ('SHIB', 1000.0)
+         'mPEPE'         -> ('PEPE', 1000000.0)
+         'bLUNC'         -> ('LUNC', 1000000000.0)
+         'KASUSDT'       -> ('KAS', 1.0)
+    """
     s_raw = str(raw).strip()
-    if len(s_raw) > 1 and s_raw[0] == "k" and s_raw[1].isupper():
-        s_raw = "1000" + s_raw[1:]
+    if not s_raw:
+        return "", 1.0
+
+    # Hyperliquid / DEX single-letter prefix convention ('k' for 1000, 'm' for 1M, 'b' for 1B)
+    prefix_mult = 1.0
+    if len(s_raw) > 2 and s_raw[0] in ("k", "m", "b") and s_raw[1].isupper():
+        if s_raw.upper() not in _KNOWN_BASE_TOKENS:
+            p_char = s_raw[0]
+            if p_char == "k":
+                prefix_mult = 1000.0
+            elif p_char == "m":
+                prefix_mult = 1_000_000.0
+            elif p_char == "b":
+                prefix_mult = 1_000_000_000.0
+            s_raw = s_raw[1:]
+
     s = s_raw.upper()
     if ":" in s:
         s = s.split(":", 1)[0]
@@ -14208,9 +15827,18 @@ def parse_symbol_and_mult(raw: str) -> Tuple[str, float]:
             s = s[:-len(suf)]
     if s == "XBT":
         s = "BTC"
-    m = _MULT_PREFIX_RE.match(s)
-    if m:
-        return m.group(2), float(m.group(1))
+
+    if prefix_mult != 1.0:
+        return s, prefix_mult
+
+    # Check numeric and metric prefix multipliers (1000, 1M, 1B, 1000000, etc.)
+    for pattern, mult in _SCALE_PREFIX_MAP:
+        m = pattern.match(s)
+        if m:
+            candidate_coin = m.group(1)
+            if candidate_coin:
+                return candidate_coin, mult
+
     return s, 1.0
 
 
@@ -14280,6 +15908,10 @@ class BaseVenueStream:
         self.symbols_seen: Set[str] = set()
         self.books_dropped = 0
         self.levels_dropped = 0
+        self.seq_gaps = 0
+        self.seq_duplicates = 0
+        self._last_u: Dict[str, int] = {}
+        self._last_seq: Dict[str, int] = {}
         self._first_ts = 0.0
 
     def _note_connect(self) -> None:
@@ -14362,6 +15994,8 @@ class BaseVenueStream:
             ),
             "books_dropped": self.books_dropped,
             "levels_dropped": self.levels_dropped,
+            "seq_gaps": self.seq_gaps,
+            "seq_duplicates": self.seq_duplicates,
         }
 
 
@@ -14693,9 +16327,9 @@ class BinanceFuturesStream(BaseVenueStream):
         sym_map: Dict[str, Tuple[str, float]],
         callback: Callable[[OrderBookDepth5], None],
     ):
-        coins = sorted({coin for coin, _ in sym_map.values()})
+        coins = sorted({v[0] for v in sym_map.values()})
         super().__init__("binance", coins, callback)
-        self._sym_map: Dict[str, Tuple[str, float]] = dict(sym_map)
+        self._sym_map: Dict[str, Tuple[Any, ...]] = dict(sym_map)
         self._raw_symbols: List[str] = sorted(self._sym_map.keys())
         self.subscribed = list(coins)
         self._connected_chunks: Set[int] = set()
@@ -14791,17 +16425,38 @@ class BinanceFuturesStream(BaseVenueStream):
             mapped = self._sym_map.get(raw_sym)
             if not mapped:
                 return
-            coin, mult = mapped
+            coin = mapped[0]
+            mult = float(mapped[1])
+            c_size = float(mapped[2]) if len(mapped) >= 3 else 1.0
 
             raw_bids = data.get("b", [])[:5]
             raw_asks = data.get("a", [])[:5]
             if not raw_bids or not raw_asks:
                 return
 
-            if mult != 1.0:
-                inv_mult = 1.0 / mult
-                bids = [(float(p) * inv_mult, float(q) * mult) for p, q in raw_bids]
-                asks = [(float(p) * inv_mult, float(q) * mult) for p, q in raw_asks]
+            # Sequence gap / packet drop detection
+            curr_u = int(data.get("u") or 0)
+            prev_u = int(data.get("pu") or 0)
+            if curr_u > 0:
+                last_u = self._last_u.get(raw_sym)
+                if last_u is not None and prev_u > 0:
+                    if prev_u != last_u:
+                        self.seq_gaps += 1
+                        log.warning(
+                            f"[binance] Sequence gap for {raw_sym}: expected pu={last_u}, got {prev_u} (u={curr_u}). Dropping gap tick."
+                        )
+                        self._last_u[raw_sym] = curr_u
+                        return
+                    if curr_u <= last_u:
+                        self.seq_duplicates += 1
+                        return
+                self._last_u[raw_sym] = curr_u
+
+            inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
+            scale_qty = mult * c_size
+            if inv_mult != 1.0 or scale_qty != 1.0:
+                bids = [(float(p) * inv_mult, float(q) * scale_qty) for p, q in raw_bids]
+                asks = [(float(p) * inv_mult, float(q) * scale_qty) for p, q in raw_asks]
             else:
                 bids = [(float(p), float(q)) for p, q in raw_bids]
                 asks = [(float(p), float(q)) for p, q in raw_asks]
@@ -14996,6 +16651,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
@@ -15006,6 +16662,7 @@ from venues.base import (
     BaseVenueStream,
     create_http_session,
     normalize_symbol,
+    parse_symbol_and_mult,
     _secs_until_daily_reconnect_for,
     log,
 )
@@ -15039,11 +16696,7 @@ class BybitRestClient:
                     if quote != "USDT":
                         continue
                     base_coin = item.get("baseCoin", "").upper()
-                    mult = 1.0
-                    m = _MULT_PREFIX_RE.match(base_coin)
-                    if m:
-                        mult = float(m.group(1))
-                        base_coin = m.group(2)
+                    base_coin, mult = parse_symbol_and_mult(base_coin)
                     out[raw_sym] = (base_coin, mult)
         except Exception as e:
             log.error(f"[bybit_rest] Failed to fetch linear instruments: {e}")
@@ -15111,12 +16764,24 @@ class BybitPerpStream(BaseVenueStream):
         sym_map: Dict[str, Tuple[str, float]],
         callback: Callable[[OrderBookDepth5], None],
     ):
-        coins = sorted({coin for coin, _ in sym_map.values()})
+        coins = sorted({v[0] for v in sym_map.values()})
         super().__init__("bybit", coins, callback)
-        self._sym_map: Dict[str, Tuple[str, float]] = dict(sym_map)
+        self._sym_map: Dict[str, Tuple[Any, ...]] = dict(sym_map)
         self._raw_symbols: List[str] = sorted(self._sym_map.keys())
         self.subscribed = list(coins)
         self._books: Dict[str, Dict[str, Dict[float, float]]] = {}
+        self._lock = threading.RLock()
+        self._last_u: Dict[str, int] = {}
+        self._last_seq: Dict[str, int] = {}
+        self._synced: Dict[str, bool] = {}
+
+    def get_book_snapshot(self, raw_sym: str) -> Optional[Dict[str, Dict[float, float]]]:
+        """Thread-safe snapshot copy of the current L2 book for raw_sym."""
+        with self._lock:
+            b = self._books.get(raw_sym)
+            if not b:
+                return None
+            return {"bids": dict(b["bids"]), "asks": dict(b["asks"])}
 
     async def _ping_loop(self, ws: Any) -> None:
         try:
@@ -15133,7 +16798,11 @@ class BybitPerpStream(BaseVenueStream):
 
         while self._running:
             try:
-                self._books.clear()
+                with self._lock:
+                    self._books.clear()
+                    self._last_u.clear()
+                    self._last_seq.clear()
+                    self._synced.clear()
                 log.info(f"[bybit] Connecting to {self.WS_URL} ({len(self._raw_symbols)} contracts)...")
                 async with websockets.connect(
                     self.WS_URL,
@@ -15202,49 +16871,92 @@ class BybitPerpStream(BaseVenueStream):
             mapped = self._sym_map.get(raw_sym)
             if not mapped:
                 return
-            coin, mult = mapped
+            coin = mapped[0]
+            mult = float(mapped[1])
+            c_size = float(mapped[2]) if len(mapped) >= 3 else 1.0
 
             mtype = data.get("type", "delta")
-            if raw_sym not in self._books or mtype == "snapshot":
-                self._books[raw_sym] = {"bids": {}, "asks": {}}
-            book = self._books[raw_sym]
-            bids_dict = book["bids"]
-            asks_dict = book["asks"]
+            u = int(d.get("u") or 0)
+            seq = int(d.get("seq") or 0)
 
-            for row in d.get("b", []):
-                p, q = float(row[0]), float(row[1])
-                if q <= 0.0 or p <= 0.0:
-                    bids_dict.pop(p, None)
+            with self._lock:
+                cur_book = self._books.get(raw_sym)
+                is_desynced = (self._synced.get(raw_sym) is False)
+                if mtype == "snapshot" or (cur_book is None and not is_desynced):
+                    self._synced[raw_sym] = True
+                    self._last_u[raw_sym] = u
+                    if seq > 0:
+                        self._last_seq[raw_sym] = seq
+                    new_bids: Dict[float, float] = {}
+                    new_asks: Dict[float, float] = {}
                 else:
-                    bids_dict[p] = q
+                    if is_desynced:
+                        # Waiting for a fresh snapshot after gap
+                        self.seq_gaps += 1
+                        return
 
-            for row in d.get("a", []):
-                p, q = float(row[0]), float(row[1])
-                if q <= 0.0 or p <= 0.0:
-                    asks_dict.pop(p, None)
-                else:
-                    asks_dict[p] = q
+                    last_u = self._last_u.get(raw_sym, 0)
+                    if u > 0 and last_u > 0:
+                        if u <= last_u:
+                            self.seq_duplicates += 1
+                            return
+                        pu = d.get("pu")
+                        if pu is not None and int(pu) != last_u:
+                            self.seq_gaps += 1
+                            log.warning(f"[bybit] Sequence gap on {raw_sym}: expected pu={last_u}, got {pu}. Desyncing book.")
+                            self._synced[raw_sym] = False
+                            self._books.pop(raw_sym, None)
+                            return
 
-            if not bids_dict or not asks_dict:
-                return
+                    self._last_u[raw_sym] = u
+                    if seq > 0:
+                        self._last_seq[raw_sym] = seq
 
-            sorted_bids_raw = sorted(bids_dict.items(), key=lambda x: x[0], reverse=True)
-            sorted_asks_raw = sorted(asks_dict.items(), key=lambda x: x[0])
+                    new_bids = dict(cur_book.get("bids", {}))
+                    new_asks = dict(cur_book.get("asks", {}))
 
-            if len(bids_dict) > 100:
-                book["bids"] = dict(sorted_bids_raw[:50])
-            if len(asks_dict) > 100:
-                book["asks"] = dict(sorted_asks_raw[:50])
+                for row in d.get("b", []):
+                    p, q = float(row[0]), float(row[1])
+                    if q <= 0.0 or p <= 0.0:
+                        new_bids.pop(p, None)
+                    else:
+                        new_bids[p] = q
 
-            top_bids = sorted_bids_raw[:5]
-            top_asks = sorted_asks_raw[:5]
+                for row in d.get("a", []):
+                    p, q = float(row[0]), float(row[1])
+                    if q <= 0.0 or p <= 0.0:
+                        new_asks.pop(p, None)
+                    else:
+                        new_asks[p] = q
+
+                if not new_bids or not new_asks:
+                    return
+
+                sorted_bids_raw = sorted(new_bids.items(), key=lambda x: x[0], reverse=True)
+                sorted_asks_raw = sorted(new_asks.items(), key=lambda x: x[0])
+
+                # Memory leak / GC protection: strictly cap depth to MAX_BOOK_DEPTH (25)
+                # whenever dictionary size exceeds 25, instead of letting it balloon to 100+
+                MAX_BOOK_DEPTH = 25
+                if len(new_bids) > MAX_BOOK_DEPTH:
+                    new_bids = dict(sorted_bids_raw[:MAX_BOOK_DEPTH])
+                if len(new_asks) > MAX_BOOK_DEPTH:
+                    new_asks = dict(sorted_asks_raw[:MAX_BOOK_DEPTH])
+
+                # Atomic Copy-on-Write assignment
+                self._books[raw_sym] = {"bids": new_bids, "asks": new_asks}
+
+                top_bids = sorted_bids_raw[:5]
+                top_asks = sorted_asks_raw[:5]
+
             if not top_bids or not top_asks:
                 return
 
-            if mult != 1.0:
-                inv_mult = 1.0 / mult
-                norm_bids = [(p * inv_mult, q * mult) for p, q in top_bids]
-                norm_asks = [(p * inv_mult, q * mult) for p, q in top_asks]
+            inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
+            scale_qty = mult * c_size
+            if inv_mult != 1.0 or scale_qty != 1.0:
+                norm_bids = [(p * inv_mult, q * scale_qty) for p, q in top_bids]
+                norm_asks = [(p * inv_mult, q * scale_qty) for p, q in top_asks]
             else:
                 norm_bids = [(p, q) for p, q in top_bids]
                 norm_asks = [(p, q) for p, q in top_asks]
@@ -15288,6 +17000,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
@@ -15395,6 +17108,17 @@ class GateioStream(BaseCEXStream):
     ):
         super().__init__("gateio", symbols, callback, stream_name=stream_name, contract_sizes=contract_sizes)
         self._books: Dict[str, Dict[str, Dict[float, float]]] = {}
+        self._lock = threading.RLock()
+        self._last_id: Dict[str, int] = {}
+        self._synced: Dict[str, bool] = {}
+
+    def get_book_snapshot(self, contract: str) -> Optional[Dict[str, Dict[float, float]]]:
+        """Thread-safe snapshot copy of the current L2 book for contract."""
+        with self._lock:
+            b = self._books.get(contract)
+            if not b:
+                return None
+            return {"bids": dict(b["bids"]), "asks": dict(b["asks"])}
 
     def _to_raw_symbol(self, s: str) -> str:
         s_u = s.upper()
@@ -15409,7 +17133,11 @@ class GateioStream(BaseCEXStream):
         await ws.send(json.dumps({"time": int(time.time()), "channel": "futures.ping"}))
 
     async def _send_subscriptions(self, ws: Any) -> None:
-        self._books.clear()
+        with self._lock:
+            self._books.clear()
+            self._last_id.clear()
+            self._synced.clear()
+
         if not self._contract_sizes:
             try:
                 sizes = await asyncio.to_thread(GateioRestClient().fetch_contract_sizes)
@@ -15445,40 +17173,74 @@ class GateioStream(BaseCEXStream):
             contract_size = self._get_contract_size(contract)
 
             event = data.get("event")
-            if contract not in self._books or event == "all":
-                self._books[contract] = {"bids": {}, "asks": {}}
+            curr_id = int(result.get("id") or result.get("last_id") or 0)
 
-            book = self._books[contract]
-            bids_dict = book["bids"]
-            asks_dict = book["asks"]
-
-            for row in result.get("b", []):
-                p, s = float(row.get("p", 0.0)), float(row.get("s", 0.0))
-                q = s * contract_size
-                if q <= 0.0 or p <= 0.0:
-                    bids_dict.pop(p, None)
+            with self._lock:
+                cur_book = self._books.get(contract)
+                is_desynced = (self._synced.get(contract) is False)
+                if event == "all" or (cur_book is None and not is_desynced):
+                    self._synced[contract] = True
+                    self._last_id[contract] = curr_id
+                    new_bids: Dict[float, float] = {}
+                    new_asks: Dict[float, float] = {}
                 else:
-                    bids_dict[p] = q
+                    if is_desynced:
+                        # Waiting for a fresh 'all' snapshot after gap
+                        self.seq_gaps += 1
+                        return
 
-            for row in result.get("a", []):
-                p, s = float(row.get("p", 0.0)), float(row.get("s", 0.0))
-                q = s * contract_size
-                if q <= 0.0 or p <= 0.0:
-                    asks_dict.pop(p, None)
-                else:
-                    asks_dict[p] = q
+                    last_id = self._last_id.get(contract, 0)
+                    if curr_id > 0 and last_id > 0:
+                        if curr_id <= last_id:
+                            self.seq_duplicates += 1
+                            return
+                        if curr_id > last_id + 1:
+                            self.seq_gaps += 1
+                            log.warning(
+                                f"[gateio] Sequence gap on {contract}: expected {last_id + 1}, got {curr_id}. Desyncing book."
+                            )
+                            self._synced[contract] = False
+                            self._books.pop(contract, None)
+                            return
 
-            if not bids_dict or not asks_dict:
-                return
+                    self._last_id[contract] = curr_id
+                    new_bids = dict(cur_book.get("bids", {}))
+                    new_asks = dict(cur_book.get("asks", {}))
 
-            sorted_bids_raw = sorted(bids_dict.items(), key=lambda x: x[0], reverse=True)
-            sorted_asks_raw = sorted(asks_dict.items(), key=lambda x: x[0])
+                for row in result.get("b", []):
+                    p, s = float(row.get("p", 0.0)), float(row.get("s", 0.0))
+                    q = s * contract_size
+                    if q <= 0.0 or p <= 0.0:
+                        new_bids.pop(p, None)
+                    else:
+                        new_bids[p] = q
 
-            # Prevent unbounded memory growth on volatile price moves
-            if len(bids_dict) > 100:
-                book["bids"] = dict(sorted_bids_raw[:50])
-            if len(asks_dict) > 100:
-                book["asks"] = dict(sorted_asks_raw[:50])
+                for row in result.get("a", []):
+                    p, s = float(row.get("p", 0.0)), float(row.get("s", 0.0))
+                    q = s * contract_size
+                    if q <= 0.0 or p <= 0.0:
+                        new_asks.pop(p, None)
+                    else:
+                        new_asks[p] = q
+
+                if not new_bids or not new_asks:
+                    return
+
+                sorted_bids_raw = sorted(new_bids.items(), key=lambda x: x[0], reverse=True)
+                sorted_asks_raw = sorted(new_asks.items(), key=lambda x: x[0])
+
+                # Memory leak / GC protection: strictly cap depth to MAX_BOOK_DEPTH (25)
+                MAX_BOOK_DEPTH = 25
+                if len(new_bids) > MAX_BOOK_DEPTH:
+                    new_bids = dict(sorted_bids_raw[:MAX_BOOK_DEPTH])
+                if len(new_asks) > MAX_BOOK_DEPTH:
+                    new_asks = dict(sorted_asks_raw[:MAX_BOOK_DEPTH])
+
+                # Atomic Copy-on-Write assignment
+                self._books[contract] = {"bids": new_bids, "asks": new_asks}
+
+                top_bids = sorted_bids_raw[:5]
+                top_asks = sorted_asks_raw[:5]
 
             if mult != 1.0:
                 inv_mult = 1.0 / mult
@@ -15671,6 +17433,353 @@ class HTXStream(BaseCEXStream):
                     bids=bids,
                     asks=asks,
                 ))
+        except Exception:
+            pass
+```
+
+## venues/hyperliquid.py
+
+```python
+"""
+venues/hyperliquid.py — Hyperliquid REST Client and WebSocket l2Book Stream.
+Connects directly to Hyperliquid L1/L2 matching engine.
+Supports single-unit normalization for 'k...' 1000x multiplier assets (e.g. kPEPE, kBONK).
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+import requests
+import websockets
+
+from models import OrderBookDepth5
+from venues.base import (
+    BaseVenueStream,
+    create_http_session,
+    normalize_symbol,
+    parse_symbol_and_mult,
+    _secs_until_daily_reconnect_for,
+    log,
+)
+
+
+class HyperliquidRestClient:
+    """REST Client for Hyperliquid perpetuals discovery, 24h tickers, and 1m klines."""
+
+    BASE_URL = "https://api.hyperliquid.xyz/info"
+
+    def __init__(self, session: Optional[requests.Session] = None):
+        self.session = session or create_http_session()
+
+    def fetch_linear_perpetuals(self) -> Dict[str, Tuple[str, float, float]]:
+        """
+        Fetches all active perpetual contracts from Hyperliquid.
+        Returns: raw_symbol (e.g. 'SOLUSDT', '1000PEPEUSDT') -> (canonical_coin 'SOL', multiplier 1.0, contract_size 1.0).
+        """
+        out: Dict[str, Tuple[str, float, float]] = {}
+        try:
+            r = self.session.post(
+                self.BASE_URL,
+                json={"type": "metaAndAssetCtxs"},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                universe = data[0].get("universe", []) if isinstance(data, list) and len(data) > 0 else []
+                for asset in universe:
+                    hl_name = asset.get("name", "")
+                    if not hl_name:
+                        continue
+                    coin, mult = parse_symbol_and_mult(hl_name)
+                    if mult != 1.0:
+                        raw_sym = f"{int(mult)}{coin}USDT"
+                    else:
+                        raw_sym = f"{coin}USDT"
+                    out[raw_sym] = (coin, mult, 1.0)
+        except Exception as e:
+            log.warning(f"[hyperliquid_rest] Failed to fetch meta: {e}")
+        return out
+
+    def fetch_contract_sizes(self) -> Dict[str, float]:
+        """Fetches contract sizes for Hyperliquid perpetual contracts (defaults to 1.0)."""
+        perps = self.fetch_linear_perpetuals()
+        return {raw_sym: c_size for raw_sym, (_, _, c_size) in perps.items()}
+
+    def fetch_tickers_24h(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Fetches 24-hour ticker statistics for Hyperliquid perps.
+        Returns: raw_symbol -> {'venue_sym': raw_sym, 'price': float, 'vol_24h': float}.
+        """
+        out: Dict[str, Dict[str, Any]] = {}
+        try:
+            r = self.session.post(
+                self.BASE_URL,
+                json={"type": "metaAndAssetCtxs"},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list) and len(data) >= 2:
+                    universe = data[0].get("universe", [])
+                    ctxs = data[1]
+                    for idx, asset in enumerate(universe):
+                        hl_name = asset.get("name", "")
+                        if not hl_name or idx >= len(ctxs):
+                            continue
+                        ctx = ctxs[idx]
+                        coin, mult = parse_symbol_and_mult(hl_name)
+                        if mult != 1.0:
+                            raw_sym = f"{int(mult)}{coin}USDT"
+                        else:
+                            raw_sym = f"{coin}USDT"
+
+                        price = float(ctx.get("midPx") or ctx.get("markPx") or 0.0)
+                        vol = float(ctx.get("dayNtlVlm") or 0.0)
+                        if price > 0:
+                            out[raw_sym] = {"venue_sym": raw_sym, "price": price, "vol_24h": vol}
+        except Exception as e:
+            log.warning(f"[hyperliquid_rest] Failed to fetch 24h tickers: {e}")
+        return out
+
+    def fetch_klines_1m(
+        self,
+        symbol: str,
+        limit: int = 200,
+        mult: float = 1.0,
+    ) -> Dict[int, Tuple[float, float]]:
+        """
+        Fetches up to limit 1m klines from Hyperliquid via candleSnapshot.
+        Returns: minute_ts_sec -> (normalized_close_usd, quote_volume_usd).
+        """
+        out: Dict[int, Tuple[float, float]] = {}
+        coin, s_mult = parse_symbol_and_mult(symbol)
+        effective_mult = mult if mult != 1.0 else s_mult
+        if effective_mult == 1000.0:
+            hl_coin = "k" + coin
+        elif effective_mult == 1_000_000.0:
+            hl_coin = "m" + coin
+        elif effective_mult == 1_000_000_000.0:
+            hl_coin = "b" + coin
+        else:
+            hl_coin = coin
+
+        now_ms = int(time.time() * 1000)
+        start_ms = now_ms - (min(limit, 500) * 60 * 1000)
+        payload = {
+            "type": "candleSnapshot",
+            "req": {
+                "coin": hl_coin,
+                "interval": "1m",
+                "startTime": start_ms,
+                "endTime": now_ms,
+            },
+        }
+        inv_mult = (1.0 / effective_mult) if effective_mult != 1.0 else 1.0
+        try:
+            r = self.session.post(self.BASE_URL, json=payload, timeout=6)
+            if r.status_code == 200:
+                candles = r.json()
+                if isinstance(candles, list):
+                    for c in candles:
+                        t_sec = int(c.get("t", 0)) // 1000
+                        close = float(c.get("c", 0.0)) * inv_mult
+                        vol = float(c.get("v", 0.0)) * close * effective_mult
+                        if t_sec > 0 and close > 0:
+                            out[t_sec] = (close, vol)
+        except Exception:
+            pass
+        return out
+
+
+class HyperliquidStream(BaseVenueStream):
+    """
+    Direct WebSocket connection to Hyperliquid l2Book order book feed.
+    Emits standardized OrderBookDepth5 events to the trading engine.
+    """
+
+    WS_URL = "wss://api.hyperliquid.xyz/ws"
+    PING_INTERVAL_SEC = 20.0
+
+    def __init__(
+        self,
+        symbols: List[str] | Dict[str, Any],
+        callback: Callable[[OrderBookDepth5], None],
+        contract_sizes: Optional[Dict[str, float]] = None,
+    ):
+        self._contract_sizes: Dict[str, float] = {
+            k.upper(): float(v) for k, v in (contract_sizes or {}).items()
+        }
+        if isinstance(symbols, dict):
+            self._sym_map: Dict[str, Tuple[str, float, float]] = {}
+            for k, v in symbols.items():
+                k_u = str(k).upper()
+                if isinstance(v, (list, tuple)):
+                    coin = str(v[0])
+                    mult = float(v[1]) if len(v) > 1 else 1.0
+                    c_size = float(v[2]) if len(v) >= 3 else self._contract_sizes.get(k_u, 1.0)
+                    self._sym_map[k_u] = (coin, mult, c_size)
+                    self._contract_sizes[k_u] = c_size
+                else:
+                    coin, mult = parse_symbol_and_mult(k_u)
+                    c_size = self._contract_sizes.get(k_u, 1.0)
+                    self._sym_map[k_u] = (coin, mult, c_size)
+            coins = sorted({c for c, _, _ in self._sym_map.values()})
+        else:
+            raw_list = [str(s).upper() for s in symbols]
+            self._sym_map = {}
+            for s in raw_list:
+                coin, mult = parse_symbol_and_mult(s)
+                c_size = self._contract_sizes.get(s, 1.0)
+                self._sym_map[s] = (coin, mult, c_size)
+            coins = sorted({c for c, _, _ in self._sym_map.values()})
+
+        super().__init__("hyperliquid", coins, callback)
+        self.subscribed = list(coins)
+
+    def _resolve_hl_coin(self, raw_sym: str, coin: str, mult: float) -> str:
+        if mult == 1000.0 or raw_sym.startswith("1000"):
+            return "k" + coin
+        if mult == 1_000_000.0 or raw_sym.startswith("1M") or raw_sym.startswith("1000000"):
+            return "m" + coin
+        if mult == 1_000_000_000.0 or raw_sym.startswith("1B") or raw_sym.startswith("1000000000"):
+            return "b" + coin
+        return coin
+
+    async def _run_loop(self) -> None:
+        while self._running:
+            try:
+                log.info(f"[hyperliquid] Connecting to {self.WS_URL} ({len(self.symbols)} coins)...")
+                async with websockets.connect(
+                    self.WS_URL,
+                    open_timeout=20,
+                    ping_interval=None,
+                    ping_timeout=None,
+                    max_queue=2000,
+                ) as ws:
+                    self._note_connect()
+                    log.info("[hyperliquid] Connected! Subscribing to l2Book...")
+
+                    # Subscribe to all configured coins
+                    seen_hl: Set[str] = set()
+                    for raw_sym, (coin, mult, c_size) in self._sym_map.items():
+                        hl_coin = self._resolve_hl_coin(raw_sym, coin, mult)
+                        if hl_coin in seen_hl:
+                            continue
+                        seen_hl.add(hl_coin)
+                        sub_msg = {
+                            "method": "subscribe",
+                            "subscription": {"type": "l2Book", "coin": hl_coin},
+                        }
+                        await ws.send(json.dumps(sub_msg))
+                        await asyncio.sleep(0.02)
+
+                    ping_task = asyncio.create_task(self._ping_loop(ws))
+                    reconnect_in = _secs_until_daily_reconnect_for(self.name)
+                    deadline = time.monotonic() + reconnect_in
+
+                    try:
+                        while self._running:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                log.info("[hyperliquid] Scheduled daily reconnect. Reconnecting...")
+                                break
+
+                            if not self.last_msg_ts:
+                                self.last_msg_ts = time.time()
+                            elif time.time() - self.last_msg_ts > 60.0:
+                                log.warning("[hyperliquid] No data for >60s, reconnecting...")
+                                break
+
+                            try:
+                                msg = await asyncio.wait_for(ws.recv(), timeout=min(20.0, remaining))
+                            except asyncio.TimeoutError:
+                                continue
+
+                            self.last_msg_ts = time.time()
+                            self._parse_message(msg)
+                    finally:
+                        ping_task.cancel()
+                        self.connected = False
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.connected = False
+                log.warning(f"[hyperliquid] WS disconnected: {e}. Reconnecting in 3s...")
+                await asyncio.sleep(3.0)
+
+    async def _ping_loop(self, ws: Any) -> None:
+        try:
+            while self._running:
+                await asyncio.sleep(self.PING_INTERVAL_SEC)
+                await ws.send(json.dumps({"method": "ping"}))
+        except Exception:
+            pass
+
+    def _parse_message(self, raw_msg: str) -> None:
+        try:
+            payload = json.loads(raw_msg)
+            ch = payload.get("channel")
+            if ch != "l2Book":
+                return
+
+            data = payload.get("data", {})
+            hl_coin = data.get("coin", "")
+            if not hl_coin:
+                return
+
+            coin, mult = parse_symbol_and_mult(hl_coin)
+            if mult != 1.0:
+                raw_sym = f"{int(mult)}{coin}USDT"
+            else:
+                raw_sym = f"{coin}USDT"
+
+            mapped = self._sym_map.get(raw_sym)
+            if not mapped:
+                for sym_key, info in self._sym_map.items():
+                    if info[0] == coin:
+                        mapped = info
+                        break
+
+            c_size = mapped[2] if mapped and len(mapped) >= 3 else self._contract_sizes.get(raw_sym, 1.0)
+
+            levels = data.get("levels", [[], []])
+            raw_bids = levels[0] if len(levels) > 0 else []
+            raw_asks = levels[1] if len(levels) > 1 else []
+
+            inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
+            scale_qty = mult * c_size
+
+            bids: List[Tuple[float, float]] = []
+            for item in raw_bids[:5]:
+                p = float(item.get("px", 0.0) or 0.0)
+                q = float(item.get("sz", 0.0) or 0.0)
+                if p > 0.0 and q > 0.0:
+                    bids.append((p * inv_mult, q * scale_qty))
+
+            asks: List[Tuple[float, float]] = []
+            for item in raw_asks[:5]:
+                p = float(item.get("px", 0.0) or 0.0)
+                q = float(item.get("sz", 0.0) or 0.0)
+                if p > 0.0 and q > 0.0:
+                    asks.append((p * inv_mult, q * scale_qty))
+
+            if not bids or not asks:
+                return
+
+            snap = OrderBookDepth5(
+                exchange="hyperliquid",
+                symbol=coin,
+                raw_symbol=raw_sym,
+                ts=time.time(),
+                exchange_ts=int(data.get("time", 0)),
+                bids=bids,
+                asks=asks,
+            )
+            self.callback(snap)
         except Exception:
             pass
 ```
@@ -15953,12 +18062,13 @@ from typing import Any, Callable, Dict, List, Optional
 
 from config import MatchedUniverse
 from models import OrderBookDepth5
-from venues.base import BaseVenueStream
+from venues.asterdex import AsterdexStream
 from venues.bingx import BingXStream
 from venues.binance import BinanceFuturesStream
 from venues.bybit import BybitPerpStream
 from venues.gateio import GateioStream
 from venues.htx import HTXStream
+from venues.hyperliquid import HyperliquidStream
 from venues.kucoin import KucoinStream
 from venues.mexc import MEXCStream
 from venues.okx import OKXStream
@@ -15975,28 +18085,38 @@ class StreamManager:
         self,
         universe: MatchedUniverse,
         callback: Callable[[OrderBookDepth5], None],
+        trade_callback: Optional[Callable[[str, float, bool, float], None]] = None,
         active_venues: Optional[List[str]] = None,
     ):
         self.universe = universe
         self.callback = callback
+        self.trade_callback = trade_callback
         self.streams: Dict[str, BaseVenueStream] = {}
 
         # 1. Leader stream: Upbit (Spot KRW)
         if universe.upbit_krw_to_coin:
-            self.streams["upbit"] = UpbitSpotStream(universe.upbit_krw_to_coin, callback)
+            self.streams["upbit"] = UpbitSpotStream(
+                universe.upbit_krw_to_coin,
+                callback=callback,
+                trade_callback=trade_callback,
+            )
 
         # 2. Dynamic Follower streams
         allowed_venues = [v.lower() for v in active_venues] if active_venues else None
 
         # Binance
-        if universe.binance_sym_map and (allowed_venues is None or "binance" in allowed_venues):
-            self.streams["binance"] = BinanceFuturesStream(universe.binance_sym_map, callback)
+        if allowed_venues is None or "binance" in allowed_venues:
+            b_map = universe.get_sym_map("binance") or universe.binance_sym_map
+            if b_map:
+                self.streams["binance"] = BinanceFuturesStream(b_map, callback)
 
         # Bybit
-        if universe.bybit_sym_map and (allowed_venues is None or "bybit" in allowed_venues):
-            self.streams["bybit"] = BybitPerpStream(universe.bybit_sym_map, callback)
+        if allowed_venues is None or "bybit" in allowed_venues:
+            by_map = universe.get_sym_map("bybit") or universe.bybit_sym_map
+            if by_map:
+                self.streams["bybit"] = BybitPerpStream(by_map, callback)
 
-        # Map of additional CEX stream classes that take (symbols, callback)
+        # Map of additional follower stream classes that take (symbols, callback)
         cex_classes = {
             "okx": OKXStream,
             "gateio": GateioStream,
@@ -16005,6 +18125,8 @@ class StreamManager:
             "bingx": BingXStream,
             "htx": HTXStream,
             "pionex": PionexStream,
+            "asterdex": AsterdexStream,
+            "hyperliquid": HyperliquidStream,
         }
 
         # Check universe for other venue sym maps
@@ -16013,10 +18135,13 @@ class StreamManager:
             if allowed_venues is not None and v_name not in allowed_venues:
                 continue
 
-            v_sym_map = raw_doc.get(f"{v_name}_sym_map", {})
+            v_sym_map = universe.get_sym_map(v_name)
+            if not v_sym_map:
+                v_sym_map = raw_doc.get(f"{v_name}_sym_map", {})
+
             if v_sym_map:
                 norm_map = {
-                    k: (v[0], float(v[1]), float(v[2])) if len(v) >= 3 else (v[0], float(v[1]))
+                    k: (v[0], float(v[1]), float(v[2])) if len(v) >= 3 else (v[0], float(v[1]), 1.0)
                     for k, v in v_sym_map.items()
                 }
                 try:
@@ -16069,6 +18194,8 @@ class StreamManager:
                 "symbols_seen": len(s.symbols_seen),
                 "subscribed": len(s.subscribed),
                 "books_dropped": s.books_dropped,
+                "seq_gaps": getattr(s, "seq_gaps", 0),
+                "seq_duplicates": getattr(s, "seq_duplicates", 0),
             }
             if isinstance(s, UpbitSpotStream):
                 info["usdt_krw_rate"] = round(s.usdt_krw_rate, 2) if s.rate_ready else 0.0
@@ -16397,6 +18524,16 @@ class OKXStream(BaseCEXStream):
             inst_id = arg.get("instId", "").upper()
             if not inst_id:
                 return
+
+            seq_id = int(book_data.get("seqId") or 0)
+            if seq_id > 0:
+                last_seq = self._last_seq.get(inst_id)
+                if last_seq is not None:
+                    if seq_id <= last_seq:
+                        self.seq_duplicates += 1
+                        return
+                self._last_seq[inst_id] = seq_id
+
             sym, mult = self._resolve_coin_and_mult(inst_id)
             contract_size = self._get_contract_size(inst_id)
             bids = self._extract_levels(book_data.get("bids") or book_data.get("b"), 5, mult=mult, contract_size=contract_size)
@@ -16760,11 +18897,13 @@ class UpbitSpotStream(BaseVenueStream):
         self,
         krw_to_coin: Dict[str, str],
         callback: Callable[[OrderBookDepth5], None],
+        trade_callback: Optional[Callable[[str, float, bool, float], None]] = None,
     ):
         coins = sorted(set(krw_to_coin.values()))
         super().__init__("upbit", coins, callback)
         self._krw_to_coin: Dict[str, str] = dict(krw_to_coin)
         self.subscribed: List[str] = list(coins)
+        self.trade_callback = trade_callback
 
         self.usdt_krw_rate: float = 0.0
         self.rate_ready: bool = False
@@ -16830,11 +18969,13 @@ class UpbitSpotStream(BaseVenueStream):
 
                 log.info(f"[upbit] Connecting to {self.WS_URL} ({len(self._krw_to_coin)} matched KRW coins)...")
 
-                sub_msg = [
+                sub_msg: List[Dict[str, Any]] = [
                     {"ticket": f"upbit-sunrise-{int(time.time())}"},
                     {"type": "orderbook", "codes": target_codes},
-                    {"format": "DEFAULT"},
                 ]
+                if self.trade_callback:
+                    sub_msg.append({"type": "trade", "codes": target_codes})
+                sub_msg.append({"format": "DEFAULT"})
 
                 async with websockets.connect(
                     self.WS_URL,
@@ -16845,7 +18986,8 @@ class UpbitSpotStream(BaseVenueStream):
                 ) as ws:
                     self._note_connect()
                     self.last_msg_ts = time.time()
-                    log.info(f"[upbit] Connected! Subscribed to {len(target_codes)} order books (incl. KRW-USDT).")
+                    trades_note = " + trades" if self.trade_callback else ""
+                    log.info(f"[upbit] Connected! Subscribed to {len(target_codes)} order books{trades_note} (incl. KRW-USDT).")
                     await ws.send(json.dumps(sub_msg))
                     backoff = self.BACKOFF_MIN
 
@@ -16885,11 +19027,26 @@ class UpbitSpotStream(BaseVenueStream):
 
     def _handle_msg(self, raw: str | bytes) -> None:
         try:
-            snap = self._parse_msg(raw)
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            data = json.loads(raw)
         except Exception:
             self._parse_errors += 1
             if self._parse_errors == 1 or self._parse_errors % self.PARSE_ERR_LOG_EVERY == 0:
                 log.warning(f"[upbit] parse error #{self._parse_errors}", exc_info=True)
+            return
+
+        msg_type = data.get("type")
+        if msg_type == "trade":
+            self._handle_trade(data)
+            return
+
+        try:
+            snap = self._parse_orderbook_data(data)
+        except Exception:
+            self._parse_errors += 1
+            if self._parse_errors == 1 or self._parse_errors % self.PARSE_ERR_LOG_EVERY == 0:
+                log.warning(f"[upbit] orderbook parse error #{self._parse_errors}", exc_info=True)
             return
 
         if snap is None:
@@ -16902,11 +19059,43 @@ class UpbitSpotStream(BaseVenueStream):
             if self._callback_errors == 1 or self._callback_errors % self.PARSE_ERR_LOG_EVERY == 0:
                 log.error(f"[upbit] callback error #{self._callback_errors}", exc_info=True)
 
+    def _handle_trade(self, data: Dict[str, Any]) -> None:
+        if not self.trade_callback or not self.rate_ready or self.usdt_krw_rate <= 0:
+            return
+        code = data.get("code")
+        if not code:
+            return
+        coin = self._krw_to_coin.get(code)
+        if not coin:
+            return
+
+        trade_price = float(data.get("trade_price", 0.0) or 0.0)
+        trade_volume = float(data.get("trade_volume", 0.0) or 0.0)
+        if trade_price <= 0.0 or trade_volume <= 0.0:
+            return
+
+        ask_bid = str(data.get("ask_bid", "")).upper()
+        # In Upbit protocol:
+        # "BID" indicates taker bought from ask (market buy)
+        # "ASK" indicates taker sold to bid (market sell)
+        is_taker_buy = (ask_bid == "BID")
+        trade_usd = (trade_price * trade_volume) / self.usdt_krw_rate
+        now_ts = time.time()
+
+        try:
+            self.trade_callback(coin, trade_usd, is_taker_buy, now_ts)
+        except Exception:
+            self._callback_errors += 1
+            if self._callback_errors == 1 or self._callback_errors % self.PARSE_ERR_LOG_EVERY == 0:
+                log.error(f"[upbit] trade callback error #{self._callback_errors}", exc_info=True)
+
     def _parse_msg(self, raw: str | bytes) -> OrderBookDepth5 | None:
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8")
         data = json.loads(raw)
+        return self._parse_orderbook_data(data)
 
+    def _parse_orderbook_data(self, data: Dict[str, Any]) -> OrderBookDepth5 | None:
         code = data.get("code")
         if not code:
             return None
@@ -16994,13 +19183,26 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
+import threading
+import time
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(HERE)
 REPORTS_DIR = os.path.join(PROJECT_ROOT, "reports", "daily")
 
+_REPORTS_CACHE: List[Dict[str, Any]] = []
+_REPORTS_CACHE_TIME: float = 0.0
+_REPORTS_CACHE_LOCK = threading.Lock()
 
-def list_available_reports() -> List[Dict[str, Any]]:
-    """Discovers all archived daily reports and extracts card metrics."""
+
+def list_available_reports(force: bool = False, ttl_sec: float = 10.0) -> List[Dict[str, Any]]:
+    """Discovers all archived daily reports and extracts card metrics, with in-memory caching."""
+    global _REPORTS_CACHE, _REPORTS_CACHE_TIME
+    now = time.time()
+    with _REPORTS_CACHE_LOCK:
+        if not force and _REPORTS_CACHE and (now - _REPORTS_CACHE_TIME < ttl_sec):
+            return list(_REPORTS_CACHE)
+
     os.makedirs(REPORTS_DIR, exist_ok=True)
     report_files = sorted(glob.glob(os.path.join(REPORTS_DIR, "report_*.md")), reverse=True)
 
@@ -17025,6 +19227,9 @@ def list_available_reports() -> List[Dict[str, Any]]:
         cards.append(card)
 
     cards.sort(key=lambda x: x["date_key"], reverse=True)
+    with _REPORTS_CACHE_LOCK:
+        _REPORTS_CACHE = cards
+        _REPORTS_CACHE_TIME = time.time()
     return cards
 
 
@@ -17104,15 +19309,19 @@ def get_report_content(report_id: str) -> Optional[str]:
 ```python
 """
 web/server.py - Built-in HTTP Server and API for Korean Sunrise Intelligence Hub.
-Provides live monitoring, reporting hub, threshold calibration, and 1-click dataset export.
+Provides live monitoring, reporting hub, threshold calibration, 1-click dataset export,
+and hardened security (zero-token URL leaks, SameSite HttpOnly cookies, and anti-CSRF protection).
 """
 from __future__ import annotations
 
 import datetime
+import hashlib
+import hmac
 import http.server
 import json
 import logging
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -17121,7 +19330,7 @@ import threading
 import time
 import urllib.parse
 import zipfile
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from web.reports_manager import list_available_reports, get_report_content
 from web.views import render_dashboard_html, render_login_html
@@ -17146,9 +19355,48 @@ class APIServer:
         self.host = host
         self.port = port
         self.token = token
+        self._csrf_secret: str = secrets.token_hex(16)
         self._server: Optional[http.server.ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._running = False
+
+        # In-memory mtime cache for matrix thresholds to avoid synchronous disk I/O on active dashboard
+        self._cached_thresholds: Dict[str, Any] = {}
+        self._thresholds_mtime: float = 0.0
+        self._thresholds_lock = threading.Lock()
+
+    def get_thresholds_doc(self) -> Dict[str, Any]:
+        """Returns cached matrix thresholds document, reloading from disk only when mtime changes."""
+        th_file = os.path.join(PROJECT_ROOT, "matrix_thresholds.json")
+        try:
+            if not os.path.isfile(th_file):
+                return {}
+            mtime = os.path.getmtime(th_file)
+            with self._thresholds_lock:
+                if mtime != self._thresholds_mtime or not self._cached_thresholds:
+                    with open(th_file, "r", encoding="utf-8") as tf:
+                        self._cached_thresholds = json.load(tf)
+                    self._thresholds_mtime = mtime
+                return self._cached_thresholds
+        except Exception as e:
+            log.warning(f"[api_server] Error reading thresholds: {e}")
+            with self._thresholds_lock:
+                return self._cached_thresholds or {}
+
+    def get_csrf_token(self, token: Optional[str] = None) -> str:
+        """Derives a cryptographically secure anti-CSRF token bound to the server session and token."""
+        tok = token or self.token
+        if not tok:
+            return ""
+        key = f"{tok}:{self._csrf_secret}".encode("utf-8")
+        return hmac.new(key, b"korean_sunrise_csrf_v1", hashlib.sha256).hexdigest()[:32]
+
+    def verify_csrf_token(self, candidate: str) -> bool:
+        """Validates candidate anti-CSRF token using timing-safe comparison."""
+        if not candidate or not self.token:
+            return False
+        expected = self.get_csrf_token()
+        return hmac.compare_digest(candidate, expected)
 
     def start(self) -> None:
         if self._running:
@@ -17160,38 +19408,73 @@ class APIServer:
             def log_message(self, format: str, *args: Any) -> None:
                 log.debug(f"[api] {self.address_string()} - {format % args}")
 
-            def _get_token(self, q: Dict[str, List[str]]) -> str:
-                if "token" in q and q["token"]:
-                    return q["token"][0]
+            def _get_auth_info(self) -> Tuple[str, str]:
+                """
+                Extracts authentication credentials and identifies the source ('header' or 'cookie').
+                Query parameter (?token=...) authentication is strictly rejected to prevent secret
+                leakage into web server access logs, reverse proxy logs, and browser history.
+                """
                 auth_hdr = self.headers.get("Authorization", "")
                 if auth_hdr.startswith("Bearer "):
-                    return auth_hdr.split(" ", 1)[1].strip()
+                    return auth_hdr.split(" ", 1)[1].strip(), "header"
                 if "X-Token" in self.headers:
-                    return self.headers["X-Token"].strip()
+                    return self.headers["X-Token"].strip(), "header"
                 cookies = self.headers.get("Cookie", "")
                 for part in cookies.split(";"):
                     if "=" in part:
                         k, v = part.strip().split("=", 1)
                         if k == "token":
-                            return v
-                return ""
+                            return v.strip(), "cookie"
+                return "", ""
 
-            def _is_authenticated(self, q: Dict[str, List[str]]) -> bool:
+            def _is_authenticated(self) -> bool:
                 if not server_ref.token:
                     return True
-                return self._get_token(q) == server_ref.token
+                tok, _ = self._get_auth_info()
+                return bool(tok) and hmac.compare_digest(tok, server_ref.token)
+
+            def _validate_csrf(self, body_bytes: bytes) -> bool:
+                """
+                Validates anti-CSRF tokens for state-changing requests originating from cookie sessions.
+                Checks X-CSRF-Token / X-CSRFToken header first, then inspects body payload.
+                """
+                header_csrf = self.headers.get("X-CSRF-Token") or self.headers.get("X-CSRFToken")
+                if header_csrf and server_ref.verify_csrf_token(header_csrf.strip()):
+                    return True
+
+                if body_bytes:
+                    content_type = self.headers.get("Content-Type", "")
+                    if "application/x-www-form-urlencoded" in content_type:
+                        try:
+                            form = urllib.parse.parse_qs(body_bytes.decode("utf-8", errors="replace"))
+                            cand = form.get("csrf_token", [""])[0]
+                            if cand and server_ref.verify_csrf_token(cand):
+                                return True
+                        except Exception:
+                            pass
+                    elif "application/json" in content_type:
+                        try:
+                            payload = json.loads(body_bytes.decode("utf-8", errors="replace"))
+                            if isinstance(payload, dict):
+                                cand = payload.get("csrf_token", "")
+                                if cand and server_ref.verify_csrf_token(str(cand)):
+                                    return True
+                        except Exception:
+                            pass
+
+                return False
 
             def do_GET(self) -> None:
                 parsed = urllib.parse.urlparse(self.path)
                 path = parsed.path.rstrip("/") or "/"
                 q = urllib.parse.parse_qs(parsed.query)
-                is_auth = self._is_authenticated(q)
+                is_auth = self._is_authenticated()
 
                 if path in ("/", "/dashboard", "/status"):
                     if not is_auth:
                         self._send_login()
                     else:
-                        self._handle_dashboard(q)
+                        self._handle_dashboard()
                 elif not is_auth:
                     self._send_unauthorized()
                 elif path == "/stats":
@@ -17216,31 +19499,128 @@ class APIServer:
             def do_POST(self) -> None:
                 parsed = urllib.parse.urlparse(self.path)
                 path = parsed.path.rstrip("/") or "/"
-                q = urllib.parse.parse_qs(parsed.query)
 
-                if not self._is_authenticated(q):
+                length = int(self.headers.get("Content-Length", 0))
+                body_bytes = self.rfile.read(length) if length > 0 else b""
+
+                # 1. Public Authentication Route
+                if path == "/login":
+                    self._handle_login(body_bytes)
+                    return
+
+                # 2. General Authentication Check
+                tok, auth_source = self._get_auth_info()
+                if not tok or not hmac.compare_digest(tok, server_ref.token):
                     self._send_unauthorized()
                     return
 
-                if path == "/api/report/generate":
+                # 3. Anti-CSRF Verification for Browser/Cookie Sessions
+                # Requests authenticated via custom headers (Bearer/X-Token) are exempt as
+                # browsers cannot forge custom cross-origin headers without CORS preflight.
+                if auth_source == "cookie":
+                    if not self._validate_csrf(body_bytes):
+                        self._send_forbidden("CSRF validation failed: missing or invalid anti-CSRF token")
+                        return
+
+                # 4. State-Changing Protected Routes
+                if path == "/logout":
+                    self._handle_logout()
+                elif path == "/api/report/generate":
                     self._handle_generate_report()
                 elif path == "/api/thresholds/calibrate":
                     self._handle_calibrate_thresholds()
                 elif path == "/api/daily-pipeline":
                     self._handle_trigger_pipeline()
                 elif path in ("/pool/pause", "/pool/resume"):
-                    self._handle_pool_toggle(path)
+                    self._handle_pool_toggle(path, body_bytes)
                 else:
                     self._send_404()
 
             # Handlers
-            def _send_login(self) -> None:
-                html_body = render_login_html()
-                self._send_html(html_body, code=200)
+            def _send_login(self, error: Optional[str] = None) -> None:
+                html_body = render_login_html(error=error)
+                self._send_html(html_body, code=200 if not error else 401)
 
-            def _handle_dashboard(self, q: Dict[str, List[str]]) -> None:
-                tok = self._get_token(q) or server_ref.token
-                cookie_hdr = f"token={tok}; Path=/; HttpOnly; SameSite=Strict"
+            def _handle_login(self, body_bytes: bytes) -> None:
+                content_type = self.headers.get("Content-Type", "")
+                submitted_token = ""
+                is_form = False
+
+                if "application/json" in content_type:
+                    try:
+                        payload = json.loads(body_bytes.decode("utf-8", errors="replace"))
+                        submitted_token = payload.get("token", "")
+                    except Exception:
+                        pass
+                elif "application/x-www-form-urlencoded" in content_type:
+                    is_form = True
+                    try:
+                        form = urllib.parse.parse_qs(body_bytes.decode("utf-8", errors="replace"))
+                        submitted_token = form.get("token", [""])[0]
+                    except Exception:
+                        pass
+                else:
+                    body_text = body_bytes.decode("utf-8", errors="replace").strip()
+                    if body_text.startswith("token="):
+                        is_form = True
+                        form = urllib.parse.parse_qs(body_text)
+                        submitted_token = form.get("token", [""])[0]
+                    else:
+                        submitted_token = body_text
+
+                if not server_ref.token or hmac.compare_digest(submitted_token, server_ref.token):
+                    csrf_tok = server_ref.get_csrf_token(server_ref.token)
+                    cookie_tok = f"token={server_ref.token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400"
+                    cookie_csrf = f"csrf_token={csrf_tok}; Path=/; SameSite=Strict; Max-Age=86400"
+
+                    if is_form or "text/html" in self.headers.get("Accept", ""):
+                        self.send_response(303)
+                        self.send_header("Location", "/dashboard")
+                        self.send_header("Set-Cookie", cookie_tok)
+                        self.send_header("Set-Cookie", cookie_csrf)
+                        self.end_headers()
+                    else:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Set-Cookie", cookie_tok)
+                        self.send_header("Set-Cookie", cookie_csrf)
+                        b = json.dumps({"ok": True, "csrf_token": csrf_tok}).encode("utf-8")
+                        self.send_header("Content-Length", str(len(b)))
+                        self.end_headers()
+                        self.wfile.write(b)
+                else:
+                    if is_form or "text/html" in self.headers.get("Accept", ""):
+                        self._send_login(error="Неверный ключ авторизации")
+                    else:
+                        self._send_json({"ok": False, "error": "Invalid authentication token"}, code=401)
+
+            def _handle_logout(self) -> None:
+                cookie_clear_tok = "token=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"
+                cookie_clear_csrf = "csrf_token=; Path=/; Max-Age=0; SameSite=Strict"
+
+                if "text/html" in self.headers.get("Accept", "") or "application/x-www-form-urlencoded" in self.headers.get("Content-Type", ""):
+                    self.send_response(303)
+                    self.send_header("Location", "/")
+                    self.send_header("Set-Cookie", cookie_clear_tok)
+                    self.send_header("Set-Cookie", cookie_clear_csrf)
+                    self.end_headers()
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Set-Cookie", cookie_clear_tok)
+                    self.send_header("Set-Cookie", cookie_clear_csrf)
+                    b = json.dumps({"ok": True, "message": "Logged out successfully"}).encode("utf-8")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+
+            def _handle_dashboard(self) -> None:
+                tok, _ = self._get_auth_info()
+                effective_tok = tok or server_ref.token
+                csrf_tok = server_ref.get_csrf_token(effective_tok)
+
+                cookie_tok_hdr = f"token={effective_tok}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400"
+                cookie_csrf_hdr = f"csrf_token={csrf_tok}; Path=/; SameSite=Strict; Max-Age=86400"
 
                 # Collect live status
                 status = {}
@@ -17258,14 +19638,7 @@ class APIServer:
                 if hasattr(server_ref.service, "profile_manager") and server_ref.service.profile_manager:
                     profile = server_ref.service.profile_manager.get_profile()
 
-                th_file = os.path.join(PROJECT_ROOT, "matrix_thresholds.json")
-                if os.path.exists(th_file):
-                    try:
-                        with open(th_file, "r", encoding="utf-8") as tf:
-                            thresholds = json.load(tf)
-                    except Exception:
-                        pass
-
+                thresholds = server_ref.get_thresholds_doc()
                 cards = list_available_reports()
                 html_body = render_dashboard_html(
                     service_status=status,
@@ -17273,11 +19646,12 @@ class APIServer:
                     profile_data=profile,
                     thresholds_doc=thresholds,
                     reports_cards=cards,
-                    auth_token=tok,
+                    csrf_token=csrf_tok,
                 )
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Set-Cookie", cookie_hdr)
+                self.send_header("Set-Cookie", cookie_tok_hdr)
+                self.send_header("Set-Cookie", cookie_csrf_hdr)
                 self.end_headers()
                 self.wfile.write(html_body.encode("utf-8"))
 
@@ -17307,16 +19681,7 @@ class APIServer:
                     self._send_json({})
 
             def _handle_thresholds(self) -> None:
-                th_file = os.path.join(PROJECT_ROOT, "matrix_thresholds.json")
-                if os.path.exists(th_file):
-                    try:
-                        with open(th_file, "r", encoding="utf-8") as tf:
-                            self._send_json(json.load(tf))
-                            return
-                    except Exception as e:
-                        self._send_json({"error": str(e)}, code=500)
-                        return
-                self._send_json({"thresholds": {}})
+                self._send_json(server_ref.get_thresholds_doc())
 
             def _handle_reports_list(self) -> None:
                 self._send_json(list_available_reports())
@@ -17352,12 +19717,13 @@ class APIServer:
                 subprocess.Popen(cmd)
                 self._send_json({"ok": True, "message": "Master 24h pipeline started in background"})
 
-            def _handle_pool_toggle(self, path: str) -> None:
-                length = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(length).decode("utf-8")
+            def _handle_pool_toggle(self, path: str, body_bytes: bytes) -> None:
                 try:
-                    payload = json.loads(body)
+                    payload = json.loads(body_bytes.decode("utf-8", errors="replace")) if body_bytes else {}
                     coin = payload.get("coin", "").upper()
+                    if not coin:
+                        self._send_json({"error": "Missing coin parameter"}, code=400)
+                        return
                     if hasattr(server_ref.service, "pool_state") and server_ref.service.pool_state:
                         if path == "/pool/pause":
                             server_ref.service.pool_state.pause_coin(coin)
@@ -17447,7 +19813,10 @@ class APIServer:
                 self.wfile.write(b)
 
             def _send_unauthorized(self) -> None:
-                self._send_json({"error": "Unauthorized. Provide valid ?token= or Bearer token"}, code=401)
+                self._send_json({"error": "Unauthorized. Provide Authorization header or session cookie"}, code=401)
+
+            def _send_forbidden(self, msg: str = "Forbidden") -> None:
+                self._send_json({"error": msg}, code=403)
 
             def _send_404(self) -> None:
                 self._send_json({"error": "Not Found"}, code=404)
@@ -17476,6 +19845,7 @@ class APIServer:
 ```python
 """
 web/views.py - Material Design 3 Dark Theme Dashboard and Reporting Hub for Korean Sunrise.
+Hardened with zero-token URL leaks, anti-CSRF protection, and session controls.
 """
 from __future__ import annotations
 
@@ -17485,15 +19855,22 @@ import urllib.parse
 from typing import Any, Dict, List, Optional
 
 
-def render_login_html() -> str:
-    return """<!DOCTYPE html>
+def render_login_html(error: Optional[str] = None) -> str:
+    error_banner = ""
+    if error:
+        error_banner = f"""<div style="background:rgba(239, 68, 68, 0.15);border:1px solid #ef4444;border-radius:10px;padding:12px;margin-bottom:20px;color:#fca5a5;font-size:13px;display:flex;align-items:center;gap:8px;">
+          <span>⚠️</span>
+          <span>{html.escape(error)}</span>
+        </div>"""
+
+    return f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Вход | Korean Sunrise Intelligence</title>
 <style>
-:root {
+:root {{
   --bg-color: #0b0e17;
   --surface-color: #151c2c;
   --surface-border: rgba(255, 255, 255, 0.08);
@@ -17501,9 +19878,9 @@ def render_login_html() -> str:
   --primary-glow: rgba(56, 189, 248, 0.25);
   --text-main: #f8fafc;
   --text-muted: #94a3b8;
-}
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body {
+}}
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
   background-color: var(--bg-color);
   color: var(--text-main);
@@ -17512,8 +19889,8 @@ body {
   justify-content: center;
   min-height: 100vh;
   padding: 16px;
-}
-.login-card {
+}}
+.login-card {{
   background: var(--surface-color);
   border: 1px solid var(--surface-border);
   border-radius: 20px;
@@ -17523,8 +19900,8 @@ body {
   box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
   position: relative;
   overflow: hidden;
-}
-.login-card::before {
+}}
+.login-card::before {{
   content: '';
   position: absolute;
   top: -50px;
@@ -17533,37 +19910,37 @@ body {
   height: 120px;
   background: radial-gradient(circle, var(--primary-glow) 0%, transparent 70%);
   border-radius: 50%;
-}
-.logo-title {
+}}
+.logo-title {{
   display: flex;
   align-items: center;
   gap: 12px;
   margin-bottom: 8px;
-}
-.logo-icon {
+}}
+.logo-icon {{
   font-size: 28px;
-}
-h1 {
+}}
+h1 {{
   font-size: 22px;
   font-weight: 700;
   letter-spacing: -0.5px;
-}
-.subtitle {
+}}
+.subtitle {{
   color: var(--text-muted);
   font-size: 14px;
   margin-bottom: 28px;
-}
-.form-group {
+}}
+.form-group {{
   margin-bottom: 20px;
-}
-label {
+}}
+label {{
   display: block;
   font-size: 13px;
   color: var(--text-muted);
   margin-bottom: 8px;
   font-weight: 500;
-}
-input[type="password"] {
+}}
+input[type="password"] {{
   width: 100%;
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid var(--surface-border);
@@ -17573,12 +19950,12 @@ input[type="password"] {
   font-size: 15px;
   outline: none;
   transition: border-color 0.2s, box-shadow 0.2s;
-}
-input[type="password"]:focus {
+}}
+input[type="password"]:focus {{
   border-color: var(--primary-color);
   box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.15);
-}
-button {
+}}
+button {{
   width: 100%;
   background: linear-gradient(135deg, #0284c7 0%, #2563eb 100%);
   border: none;
@@ -17589,9 +19966,9 @@ button {
   padding: 14px;
   cursor: pointer;
   transition: opacity 0.2s, transform 0.1s;
-}
-button:hover { opacity: 0.95; }
-button:active { transform: scale(0.99); }
+}}
+button:hover {{ opacity: 0.95; }}
+button:active {{ transform: scale(0.99); }}
 </style>
 </head>
 <body>
@@ -17601,7 +19978,8 @@ button:active { transform: scale(0.99); }
     <h1>Korean Sunrise</h1>
   </div>
   <p class="subtitle">Авторизация для доступа к квантовой телеметрии</p>
-  <form method="GET" action="/">
+  {error_banner}
+  <form method="POST" action="/login">
     <div class="form-group">
       <label for="token">Секретный ключ авторизации:</label>
       <input type="password" id="token" name="token" placeholder="Введите API токен" required autofocus>
@@ -17619,8 +19997,10 @@ def render_dashboard_html(
     profile_data: Dict[str, Any],
     thresholds_doc: Dict[str, Any],
     reports_cards: List[Dict[str, Any]],
-    auth_token: str,
+    csrf_token: str = "",
+    auth_token: str = "",
 ) -> str:
+    effective_csrf = csrf_token or auth_token
     summary = pool_snapshot.get("summary", {})
     counters = service_status.get("counters", {})
     streams = service_status.get("streams", {})
@@ -17669,6 +20049,7 @@ def render_dashboard_html(
                 """)
             venues_html = "".join(v_rows) if v_rows else "<div style='color:#64748b;font-size:12px;'>Нет связок</div>"
 
+            fn_escaped = urllib.parse.quote(rc.get("filename_md", ""))
             report_cards_html.append(f"""
             <div class="report-card">
               <div class="rc-header">
@@ -17689,7 +20070,7 @@ def render_dashboard_html(
               </div>
               <div class="rc-footer">
                 <button class="btn-read" onclick="viewReport('{rc.get('id', '')}')">📖 Читать квантовый отчёт</button>
-                <a href="/download?token={auth_token}&file={rc.get('filename_md', '')}" class="btn-dl">Скачать .md</a>
+                <a href="/download?file={fn_escaped}" class="btn-dl">Скачать .md</a>
               </div>
             </div>
             """)
@@ -17785,6 +20166,7 @@ body {{
 /* Navigation Tabs */
 .tabs {{
   display: flex;
+  align-items: center;
   gap: 8px;
 }}
 .tab-btn {{
@@ -17925,44 +20307,55 @@ body {{
   border: 1px solid var(--border);
   border-radius: 12px;
   overflow: hidden;
+  font-size: 13px;
 }}
 .data-table th, .data-table td {{
   padding: 12px 16px;
   border-bottom: 1px solid var(--border);
-  font-size: 13px;
 }}
-.data-table th {{ background: var(--bg-2); color: var(--text-muted); font-weight: 600; text-align: left; }}
-.badge {{ padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: 700; text-transform: uppercase; }}
+.data-table th {{
+  background: var(--bg-2);
+  color: var(--text-muted);
+  font-weight: 600;
+  text-align: left;
+}}
+.badge {{
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}}
 .badge-green {{ background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.3); }}
 .badge-blue {{ background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); }}
 .badge-yellow {{ background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.3); }}
 .badge-red {{ background: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3); }}
 
-/* Modal */
+/* Modal overlay */
 .modal-overlay {{
-  display: none;
   position: fixed;
   top: 0; left: 0; right: 0; bottom: 0;
-  background: rgba(0,0,0,0.8);
-  backdrop-filter: blur(4px);
-  z-index: 1000;
-  padding: 24px;
+  background: rgba(0,0,0,0.85);
+  display: none;
   align-items: center;
   justify-content: center;
+  z-index: 1000;
+  padding: 24px;
 }}
 .modal-overlay.active {{ display: flex; }}
 .modal-box {{
   background: var(--bg-1);
   border: 1px solid var(--border);
   border-radius: 16px;
-  width: 100%;
   max-width: 900px;
+  width: 100%;
   max-height: 85vh;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }}
 .modal-header {{
-  padding: 16px 20px;
+  padding: 16px 24px;
   border-bottom: 1px solid var(--border);
   display: flex;
   justify-content: space-between;
@@ -17991,6 +20384,10 @@ body {{
     <button class="tab-btn" onclick="switchTab('thresholds')">Матрица спредов ({len(th_items)})</button>
     <button class="tab-btn" onclick="switchTab('profile')">Депозит и слоты</button>
     <button class="tab-btn" onclick="switchTab('controls')">Управление</button>
+    <form method="POST" action="/logout" style="margin:0;display:inline;">
+      <input type="hidden" name="csrf_token" value="{effective_csrf}">
+      <button type="submit" class="tab-btn" style="color:var(--red);" title="Завершить сеанс">Выйти 🚪</button>
+    </form>
   </div>
 </div>
 
@@ -18095,8 +20492,8 @@ body {{
       </div>
       <div style="background:var(--bg-1);border:1px solid var(--border);border-radius:12px;padding:20px;">
         <h3>Экспорт всех данных (.ZIP)</h3>
-        <p style="color:var(--text-muted);font-size:13px;margin:8px 0 16px;">Выгрузка сигналов, отчётов и конфигураций в 1 клик без SSH.</p>
-        <a href="/download?token={auth_token}" class="btn-dl" style="display:block;text-align:center;">📦 Скачать архив</a>
+        <p style="color:var(--text-muted);font-size:13px;margin:8px 0 16px;">Выгрузка сигналов, отчётов и конфигураций в 1 клик без передачи токена в URL.</p>
+        <a href="/download" class="btn-dl" style="display:block;text-align:center;">📦 Скачать архив</a>
       </div>
     </div>
   </div>
@@ -18115,13 +20512,18 @@ body {{
 </div>
 
 <script>
-const TOKEN = "{auth_token}";
+const CSRF_TOKEN = "{effective_csrf}";
 
 function switchTab(name) {{
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-  document.getElementById('tab-' + name).classList.add('active');
-  event.target.classList.add('active');
+  const target = document.getElementById('tab-' + name);
+  if (target) {{
+    target.classList.add('active');
+  }}
+  if (window.event && window.event.target && window.event.target.classList.contains('tab-btn')) {{
+    window.event.target.classList.add('active');
+  }}
 }}
 
 async function viewReport(reportId) {{
@@ -18129,7 +20531,11 @@ async function viewReport(reportId) {{
   document.getElementById('modalContent').innerText = 'Загрузка...';
   document.getElementById('reportModal').classList.add('active');
   try {{
-    const res = await fetch('/api/report/content?token=' + TOKEN + '&id=' + reportId);
+    const res = await fetch('/api/report/content?id=' + encodeURIComponent(reportId));
+    if (!res.ok) {{
+      document.getElementById('modalContent').innerText = 'Ошибка (' + res.status + '): ' + res.statusText;
+      return;
+    }}
     const text = await res.text();
     document.getElementById('modalContent').innerText = text;
   }} catch (e) {{
@@ -18143,22 +20549,88 @@ function closeModal(e) {{
 
 async function triggerDailyReport() {{
   if (!confirm('Сгенерировать суточный квантовый отчёт прямо сейчас?')) return;
-  const res = await fetch('/api/report/generate?token=' + TOKEN, {{ method: 'POST' }});
-  alert('Отчёт успешно сформирован!');
-  location.reload();
+  try {{
+    const res = await fetch('/api/report/generate', {{
+      method: 'POST',
+      headers: {{
+        'X-CSRF-Token': CSRF_TOKEN,
+        'Content-Type': 'application/json'
+      }}
+    }});
+    if (!res.ok) {{
+      const err = await res.json().catch(() => ({{}}));
+      alert('Ошибка (' + res.status + '): ' + (err.error || res.statusText));
+      return;
+    }}
+    alert('Отчёт успешно сформирован!');
+    location.reload();
+  }} catch (e) {{
+    alert('Ошибка сети: ' + e);
+  }}
 }}
 
 async function triggerCalibration() {{
   if (!confirm('Запустить алгоритмическую калибровку спредов по всем парам?')) return;
-  const res = await fetch('/api/thresholds/calibrate?token=' + TOKEN, {{ method: 'POST' }});
-  alert('Калибровка завершена!');
-  location.reload();
+  try {{
+    const res = await fetch('/api/thresholds/calibrate', {{
+      method: 'POST',
+      headers: {{
+        'X-CSRF-Token': CSRF_TOKEN,
+        'Content-Type': 'application/json'
+      }}
+    }});
+    if (!res.ok) {{
+      const err = await res.json().catch(() => ({{}}));
+      alert('Ошибка (' + res.status + '): ' + (err.error || res.statusText));
+      return;
+    }}
+    alert('Калибровка завершена!');
+    location.reload();
+  }} catch (e) {{
+    alert('Ошибка сети: ' + e);
+  }}
 }}
 
 async function runPipeline() {{
   if (!confirm('Запустить 24-часовой автономный пайплайн?')) return;
-  const res = await fetch('/api/daily-pipeline?token=' + TOKEN, {{ method: 'POST' }});
-  alert('Пайплайн запущен в фоне!');
+  try {{
+    const res = await fetch('/api/daily-pipeline', {{
+      method: 'POST',
+      headers: {{
+        'X-CSRF-Token': CSRF_TOKEN,
+        'Content-Type': 'application/json'
+      }}
+    }});
+    if (!res.ok) {{
+      const err = await res.json().catch(() => ({{}}));
+      alert('Ошибка (' + res.status + '): ' + (err.error || res.statusText));
+      return;
+    }}
+    alert('Пайплайн запущен в фоне!');
+  }} catch (e) {{
+    alert('Ошибка сети: ' + e);
+  }}
+}}
+
+async function toggleCoinPool(action, coin) {{
+  try {{
+    const res = await fetch('/pool/' + action, {{
+      method: 'POST',
+      headers: {{
+        'X-CSRF-Token': CSRF_TOKEN,
+        'Content-Type': 'application/json'
+      }},
+      body: JSON.stringify({{ coin: coin }})
+    }});
+    if (!res.ok) {{
+      const err = await res.json().catch(() => ({{}}));
+      alert('Ошибка (' + res.status + '): ' + (err.error || res.statusText));
+      return;
+    }}
+    location.reload();
+  }} catch (e) {{
+    alert('Ошибка сети: ' + e);
+  }}
 }}
 </script>
 </body>
@@ -18178,9 +20650,13 @@ def _render_battle_tags(pool_snapshot: Dict[str, Any]) -> str:
         name = html.escape(str(c.get("coin", "")))
         en = c.get("enabled", True)
         col = "#10b981" if en else "#64748b"
+        act_text = "Пауза ⏸" if en else "Старт ▶"
+        act_fn = "pause" if en else "resume"
+        btn_col = "#f59e0b" if en else "#10b981"
         tags.append(f"""
-        <div style="background:var(--bg-2);border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:13px;display:flex;align-items:center;gap:6px;">
+        <div style="background:var(--bg-2);border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:13px;display:flex;align-items:center;gap:10px;">
           <span style="color:{col};font-weight:700;">⚔️ {name}</span>
+          <button onclick="toggleCoinPool('{act_fn}', '{name}')" style="background:none;border:1px solid {btn_col};color:{btn_col};border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer;">{act_text}</button>
         </div>
         """)
     return "".join(tags)

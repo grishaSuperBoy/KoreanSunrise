@@ -53,27 +53,59 @@ TAKER_FEE_BPS = 5.0             # Single-leg VIP0 taker fee (bps) on Binance/Byb
 ROUNDTRIP_FEE_BPS = 10.0        # Entry + Exit taker fee (bps) for net realized PnL
 MIN_WARMUP_SAMPLES = 30         # Minimum 1s MAD samples before firing signals
 MAX_SIGNAL_HOLD_SEC = 6.0       # Maximum holding horizon before timeout closure
+MAX_FOLLOWER_BOOK_AGE_SEC = 0.30 # Maximum 300ms staleness allowed for follower book snapshots
 
 # Regex to detect multiplier prefixes on Binance/Bybit perps: 1000PEPE, 1000000MOG, etc.
 _MULT_PREFIX_RE = re.compile(r"^(1000000|100000|10000|1000|100)([A-Z0-9]+)$")
 
+ALL_SUPPORTED_VENUES = [
+    "binance",
+    "bybit",
+    "okx",
+    "gateio",
+    "mexc",
+    "kucoin",
+    "bingx",
+    "htx",
+    "pionex",
+    "asterdex",
+    "hyperliquid",
+]
+
 
 @dataclass
 class MatchedUniverse:
-    """Holds the dynamically matched universe of coins across Upbit, Binance, and Bybit."""
+    """Holds the dynamically matched universe of coins across Upbit and all 11 follower perp venues."""
     # Canonical base coin list (Upbit base names, e.g. ["PEPE", "DOGE", "SAND", ...])
     coins: List[str] = field(default_factory=list)
 
     # Upbit mapping: KRW market code -> canonical coin (e.g. "KRW-PEPE" -> "PEPE")
     upbit_krw_to_coin: Dict[str, str] = field(default_factory=dict)
 
-    # Binance Futures mapping: raw exchange symbol -> (canonical coin, price_multiplier)
-    # e.g. "1000PEPEUSDT" -> ("PEPE", 1000.0), "SANDUSDT" -> ("SAND", 1.0)
-    binance_sym_map: Dict[str, Tuple[str, float]] = field(default_factory=dict)
+    # First-class typed dictionary for all follower venue symbol maps:
+    # venue -> {raw_symbol: (canonical_coin, mult, contract_size)}
+    venue_sym_maps: Dict[str, Dict[str, Tuple[str, float, float]]] = field(default_factory=dict)
 
-    # Bybit Linear mapping: raw exchange symbol -> (canonical coin, price_multiplier)
-    # e.g. "1000PEPEUSDT" -> ("PEPE", 1000.0), "SANDUSDT" -> ("SAND", 1.0)
+    # Legacy convenience attributes for Binance & Bybit backward-compatibility
+    binance_sym_map: Dict[str, Tuple[str, float]] = field(default_factory=dict)
     bybit_sym_map: Dict[str, Tuple[str, float]] = field(default_factory=dict)
+
+    def get_sym_map(self, venue: str) -> Dict[str, Tuple[str, float, float]]:
+        """Returns the symbol mapping for any supported venue with (coin, mult, c_size)."""
+        v = venue.lower()
+        if v in self.venue_sym_maps:
+            return self.venue_sym_maps[v]
+        if v == "binance":
+            return {
+                k: (val[0], float(val[1]), float(val[2]) if len(val) >= 3 else 1.0)
+                for k, val in self.binance_sym_map.items()
+            }
+        if v == "bybit":
+            return {
+                k: (val[0], float(val[1]), float(val[2]) if len(val) >= 3 else 1.0)
+                for k, val in self.bybit_sym_map.items()
+            }
+        return {}
 
 
 def _http_get_json(url: str, timeout: float = 12.0):
