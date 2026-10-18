@@ -122,6 +122,8 @@ class KoreanEngine:
         roundtrip_fee_bps: float = C.ROUNDTRIP_FEE_BPS,
         warmup_samples: int = C.MIN_WARMUP_SAMPLES,
         max_hold_sec: float = C.MAX_SIGNAL_HOLD_SEC,
+        pool_state: Any = None,
+        profile_manager: Any = None,
     ):
         self.emit = emit_callback
         self.drain_threshold = drain_threshold
@@ -133,6 +135,8 @@ class KoreanEngine:
         self.roundtrip_fee_bps = roundtrip_fee_bps
         self.warmup_samples = warmup_samples
         self.max_hold_sec = max_hold_sec
+        self.pool_state = pool_state
+        self.profile_manager = profile_manager
 
         # (exchange, coin) -> OrderBookDepth5
         self._books: Dict[Tuple[str, str], OrderBookDepth5] = {}
@@ -154,6 +158,8 @@ class KoreanEngine:
             "ticks_upbit": 0,
             "ticks_followers": 0,
             "signals_triggered": 0,
+            "signals_battle": 0,
+            "signals_incubator": 0,
             "signals_converged": 0,
             "signals_reversed": 0,
             "signals_timeout": 0,
@@ -359,13 +365,26 @@ class KoreanEngine:
             return
 
         top3_ask_depth_usd = f_snap.top_n_ask_depth_usd(3)
-        if top3_ask_depth_usd < 100.0:
+        if top3_ask_depth_usd < 50.0:
             return
 
-        suggested_size_usd = min(
-            self.max_position_budget_usd,
-            self.stealth_fraction * top3_ask_depth_usd,
-        )
+        # Determine pool basket and actionable status
+        is_battle = self.pool_state.is_battle_coin(coin) if self.pool_state else False
+        basket = "battle" if is_battle else "incubator"
+        is_actionable = is_battle
+
+        # Calculate dynamic stealth order size
+        if self.profile_manager:
+            sized = self.profile_manager.calculate_stealth_order_size(follower_ex, top3_ask_depth_usd)
+            suggested_size_usd = sized if sized is not None else min(
+                self.max_position_budget_usd,
+                self.stealth_fraction * top3_ask_depth_usd,
+            )
+        else:
+            suggested_size_usd = min(
+                self.max_position_budget_usd,
+                self.stealth_fraction * top3_ask_depth_usd,
+            )
 
         # Initial executable PnL at t=0 (if bought at f_ask and immediately sold at f_bid)
         init_exec_move_bps = (f_bid - f_ask) / f_ask * 1e4
@@ -406,6 +425,8 @@ class KoreanEngine:
             follower_latency_ms=f_snap.network_latency_ms,
             follower_book_age_ms=round(f_book_age_ms, 1),
             suggested_size_usd=round(suggested_size_usd, 2),
+            basket=basket,
+            is_actionable=is_actionable,
             mfe_exec_pnl_bps=init_net_pnl_bps,
             mae_exec_pnl_bps=init_net_pnl_bps,
             mfe_mid_move_bps=0.0,
@@ -416,8 +437,15 @@ class KoreanEngine:
         st.open_signal = sig
         self._active_signals[coin].append(sig)
         self.counters["signals_triggered"] += 1
+        if is_actionable:
+            self.counters["signals_battle"] += 1
+            tag = "[SIGNAL-BATTLE] ⚔️"
+        else:
+            self.counters["signals_incubator"] += 1
+            tag = "[SIGNAL-INCUBATOR] 🧪"
+
         log.info(
-            f"[SIGNAL] {sig.coin} ({sig.follower_contract}) | Upbit -> {sig.follower_exchange} | "
+            f"{tag} {sig.coin} ({sig.follower_contract}) | Upbit -> {sig.follower_exchange} | "
             f"Trig: {sig.trigger_type} (Swept: ${sig.leader_swept_usd:.0f}) | "
             f"Edge: +{sig.net_exec_edge_bps:.1f} bps | Z: {sig.dev_z:.1f}σ | Size: ${sig.suggested_size_usd:.0f}"
         )

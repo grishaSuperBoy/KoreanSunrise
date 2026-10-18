@@ -4,7 +4,9 @@ main.py - Main entry point for Korean Sunrise Lead-Lag & Momentum Sniping Servic
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import signal
 import time
 from typing import Optional
@@ -12,6 +14,8 @@ from typing import Optional
 from batch_writer import BatchWriter
 import config as C
 from korean_engine import KoreanEngine
+from pipeline.pool_state import PoolStateManager
+from pipeline.profile import TradingProfileManager
 from stream_manager import StreamManager
 
 LOG_FMT = "%(asctime)s | %(levelname)-7s | %(name)-14s | %(message)s"
@@ -22,6 +26,11 @@ log = logging.getLogger("main")
 class KoreanSunriseService:
     def __init__(self):
         self.writer = BatchWriter(data_root=C.DATA_ROOT)
+        self.pool_state = PoolStateManager()
+        self.pool_state.reload()
+        self.profile_manager = TradingProfileManager()
+        self.profile_manager.reload()
+
         self.engine = KoreanEngine(
             emit_callback=self.writer.add,
             drain_threshold=C.DRAIN_THRESHOLD,
@@ -33,6 +42,8 @@ class KoreanSunriseService:
             roundtrip_fee_bps=C.ROUNDTRIP_FEE_BPS,
             warmup_samples=C.MIN_WARMUP_SAMPLES,
             max_hold_sec=C.MAX_SIGNAL_HOLD_SEC,
+            pool_state=self.pool_state,
+            profile_manager=self.profile_manager,
         )
         self.universe: Optional[C.MatchedUniverse] = None
         self.stream_manager: Optional[StreamManager] = None
@@ -41,10 +52,51 @@ class KoreanSunriseService:
 
     async def run(self) -> None:
         self.running = True
-        log.info("=== Discovering overlapping Upbit KRW alts & Binance/Bybit Perps ===")
-        self.universe = await asyncio.to_thread(C.discover_universe)
+        univ_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "universe_live.json")
 
-        if not self.universe.coins:
+        if os.path.exists(univ_file):
+            try:
+                with open(univ_file, "r", encoding="utf-8") as f:
+                    doc = json.load(f)
+                coins = doc.get("coins", [])
+                upbit_krw_to_coin = doc.get("upbit_krw_to_coin", {})
+                binance_sym_map = {k: tuple(v) for k, v in doc.get("binance_sym_map", {}).items()}
+                bybit_sym_map = {k: tuple(v) for k, v in doc.get("bybit_sym_map", {}).items()}
+                self.universe = C.MatchedUniverse(
+                    coins=coins,
+                    upbit_krw_to_coin=upbit_krw_to_coin,
+                    binance_sym_map=binance_sym_map,
+                    bybit_sym_map=bybit_sym_map,
+                )
+                log.info(f"=== Loaded {len(coins)} incubator coins from universe_live.json ===")
+            except Exception as e:
+                log.warning(f"Could not parse universe_live.json: {e}")
+                self.universe = None
+
+        if self.universe is None or not self.universe.coins:
+            log.info("=== Discovering overlapping Upbit KRW alts & Binance/Bybit Perps ===")
+            self.universe = await asyncio.to_thread(C.discover_universe)
+            try:
+                doc = {
+                    "_meta": {
+                        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "updated_ts": round(time.time(), 3),
+                        "coins_count": len(self.universe.coins),
+                    },
+                    "coins": self.universe.coins,
+                    "upbit_krw_to_coin": self.universe.upbit_krw_to_coin,
+                    "binance_sym_map": self.universe.binance_sym_map,
+                    "bybit_sym_map": self.universe.bybit_sym_map,
+                }
+                with open(univ_file + ".tmp", "w", encoding="utf-8") as f:
+                    json.dump(doc, f, indent=2, ensure_ascii=False)
+                os.replace(univ_file + ".tmp", univ_file)
+            except Exception as e:
+                log.warning(f"Could not persist universe_live.json: {e}")
+
+        self.pool_state.reload()
+
+        if not self.universe or not self.universe.coins:
             raise RuntimeError("No overlapping coins discovered between Upbit and Perp exchanges.")
 
         log.info(f"=== Starting Korean Sunrise for {len(self.universe.coins)} matched target coins ===")
@@ -91,12 +143,14 @@ class KoreanSunriseService:
                 krw_rate = v["usdt_krw_rate"]
 
         conn_str = " | ".join(parts)
+        snap = self.pool_state.get_pool_snapshot()
+        summary = snap["summary"]
         log.info(
             f"[HEARTBEAT] KRW/USDT: {krw_rate:.1f} | "
-            f"Upbit Ticks: {c['ticks_upbit']} | Follower Ticks: {c['ticks_followers']} | "
-            f"Signals: {c['signals_triggered']} "
-            f"(Conv: {c['signals_converged']}, Rev: {c['signals_reversed']}, TO: {c['signals_timeout']}) | "
-            f"Written: {self.writer.total_written} | Streams: [{conn_str}]"
+            f"Pool: Inc {summary['incubator']} | Battle {summary['battle']} (Active: {summary['battle_active']}) | "
+            f"Ticks: Up {c['ticks_upbit']} / Foll {c['ticks_followers']} | "
+            f"Sigs: {c['signals_triggered']} (⚔️Battle: {c.get('signals_battle', 0)}, 🧪Inc: {c.get('signals_incubator', 0)}) | "
+            f"Streams: [{conn_str}]"
         )
 
     async def shutdown(self) -> None:

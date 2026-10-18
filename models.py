@@ -138,6 +138,10 @@ class SunriseSignal:
     # Sizing (Universal stealth rule: <= 15% top-3 ask depth)
     suggested_size_usd: float
 
+    # Pool routing: 'incubator' (telemetry only) vs 'battle' (live execution candidate)
+    basket: str = "incubator"
+    is_actionable: bool = False
+
     # Outcome & Excursion tracking (filled as signal matures)
     closed: bool = False
     close_ts: Optional[float] = None

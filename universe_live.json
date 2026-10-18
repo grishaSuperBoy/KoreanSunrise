@@ -1,0 +1,689 @@
+{
+  "_meta": {
+    "updated_at": "2026-10-18T13:13:47Z",
+    "updated_ts": 1792329227.322,
+    "usdt_krw_rate": 1349.0,
+    "coins_count": 31,
+    "binance_count": 26,
+    "bybit_count": 27,
+    "screening_elapsed_sec": 31.39
+  },
+  "coins": [
+    "AXL",
+    "TAO",
+    "ELSA",
+    "PUFFER",
+    "SPX",
+    "MOODENG",
+    "BIGTIME",
+    "AERO",
+    "BEAM",
+    "ZKP",
+    "ETHFI",
+    "CFX",
+    "ZRO",
+    "DOT",
+    "ZKC",
+    "CAP",
+    "PENDLE",
+    "ARX",
+    "LIT",
+    "ENSO",
+    "GTC",
+    "BAT",
+    "NEAR",
+    "WAL",
+    "AWE",
+    "PROM",
+    "JTO",
+    "RENDER",
+    "AAVE",
+    "APT",
+    "KERNEL"
+  ],
+  "upbit_krw_to_coin": {
+    "KRW-AXL": "AXL",
+    "KRW-TAO": "TAO",
+    "KRW-ELSA": "ELSA",
+    "KRW-PUFFER": "PUFFER",
+    "KRW-SPX": "SPX",
+    "KRW-MOODENG": "MOODENG",
+    "KRW-BIGTIME": "BIGTIME",
+    "KRW-AERO": "AERO",
+    "KRW-BEAM": "BEAM",
+    "KRW-ZKP": "ZKP",
+    "KRW-ETHFI": "ETHFI",
+    "KRW-CFX": "CFX",
+    "KRW-ZRO": "ZRO",
+    "KRW-DOT": "DOT",
+    "KRW-ZKC": "ZKC",
+    "KRW-CAP": "CAP",
+    "KRW-PENDLE": "PENDLE",
+    "KRW-ARX": "ARX",
+    "KRW-LIT": "LIT",
+    "KRW-ENSO": "ENSO",
+    "KRW-GTC": "GTC",
+    "KRW-BAT": "BAT",
+    "KRW-NEAR": "NEAR",
+    "KRW-WAL": "WAL",
+    "KRW-AWE": "AWE",
+    "KRW-PROM": "PROM",
+    "KRW-JTO": "JTO",
+    "KRW-RENDER": "RENDER",
+    "KRW-AAVE": "AAVE",
+    "KRW-APT": "APT",
+    "KRW-KERNEL": "KERNEL"
+  },
+  "binance_sym_map": {
+    "AXLUSDT": [
+      "AXL",
+      1.0
+    ],
+    "TAOUSDT": [
+      "TAO",
+      1.0
+    ],
+    "ELSAUSDT": [
+      "ELSA",
+      1.0
+    ],
+    "SPXUSDT": [
+      "SPX",
+      1.0
+    ],
+    "MOODENGUSDT": [
+      "MOODENG",
+      1.0
+    ],
+    "BIGTIMEUSDT": [
+      "BIGTIME",
+      1.0
+    ],
+    "AEROUSDT": [
+      "AERO",
+      1.0
+    ],
+    "ZKPUSDT": [
+      "ZKP",
+      1.0
+    ],
+    "ETHFIUSDT": [
+      "ETHFI",
+      1.0
+    ],
+    "CFXUSDT": [
+      "CFX",
+      1.0
+    ],
+    "ZROUSDT": [
+      "ZRO",
+      1.0
+    ],
+    "DOTUSDT": [
+      "DOT",
+      1.0
+    ],
+    "ZKCUSDT": [
+      "ZKC",
+      1.0
+    ],
+    "CAPUSDT": [
+      "CAP",
+      1.0
+    ],
+    "PENDLEUSDT": [
+      "PENDLE",
+      1.0
+    ],
+    "ARXUSDT": [
+      "ARX",
+      1.0
+    ],
+    "LITUSDT": [
+      "LIT",
+      1.0
+    ],
+    "ENSOUSDT": [
+      "ENSO",
+      1.0
+    ],
+    "GTCUSDT": [
+      "GTC",
+      1.0
+    ],
+    "BATUSDT": [
+      "BAT",
+      1.0
+    ],
+    "NEARUSDT": [
+      "NEAR",
+      1.0
+    ],
+    "WALUSDT": [
+      "WAL",
+      1.0
+    ],
+    "AWEUSDT": [
+      "AWE",
+      1.0
+    ],
+    "PROMUSDT": [
+      "PROM",
+      1.0
+    ],
+    "JTOUSDT": [
+      "JTO",
+      1.0
+    ],
+    "RENDERUSDT": [
+      "RENDER",
+      1.0
+    ]
+  },
+  "bybit_sym_map": {
+    "AXLUSDT": [
+      "AXL",
+      1.0
+    ],
+    "TAOUSDT": [
+      "TAO",
+      1.0
+    ],
+    "ELSAUSDT": [
+      "ELSA",
+      1.0
+    ],
+    "PUFFERUSDT": [
+      "PUFFER",
+      1.0
+    ],
+    "SPXUSDT": [
+      "SPX",
+      1.0
+    ],
+    "MOODENGUSDT": [
+      "MOODENG",
+      1.0
+    ],
+    "BIGTIMEUSDT": [
+      "BIGTIME",
+      1.0
+    ],
+    "AEROUSDT": [
+      "AERO",
+      1.0
+    ],
+    "BEAMUSDT": [
+      "BEAM",
+      1.0
+    ],
+    "ZKPUSDT": [
+      "ZKP",
+      1.0
+    ],
+    "ETHFIUSDT": [
+      "ETHFI",
+      1.0
+    ],
+    "CFXUSDT": [
+      "CFX",
+      1.0
+    ],
+    "ZROUSDT": [
+      "ZRO",
+      1.0
+    ],
+    "DOTUSDT": [
+      "DOT",
+      1.0
+    ],
+    "CAPUSDT": [
+      "CAP",
+      1.0
+    ],
+    "PENDLEUSDT": [
+      "PENDLE",
+      1.0
+    ],
+    "ARXUSDT": [
+      "ARX",
+      1.0
+    ],
+    "LITUSDT": [
+      "LIT",
+      1.0
+    ],
+    "ENSOUSDT": [
+      "ENSO",
+      1.0
+    ],
+    "BATUSDT": [
+      "BAT",
+      1.0
+    ],
+    "NEARUSDT": [
+      "NEAR",
+      1.0
+    ],
+    "WALUSDT": [
+      "WAL",
+      1.0
+    ],
+    "AWEUSDT": [
+      "AWE",
+      1.0
+    ],
+    "JTOUSDT": [
+      "JTO",
+      1.0
+    ],
+    "AAVEUSDT": [
+      "AAVE",
+      1.0
+    ],
+    "APTUSDT": [
+      "APT",
+      1.0
+    ],
+    "KERNELUSDT": [
+      "KERNEL",
+      1.0
+    ]
+  },
+  "pairs": {
+    "AXL": {
+      "coin": "AXL",
+      "upbit_symbol": "KRW-AXL",
+      "binance_symbol": "AXLUSDT",
+      "bybit_symbol": "AXLUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.866,
+      "p90_dev_bps": 28.6,
+      "both_trade": 1.0
+    },
+    "TAO": {
+      "coin": "TAO",
+      "upbit_symbol": "KRW-TAO",
+      "binance_symbol": "TAOUSDT",
+      "bybit_symbol": "TAOUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.852,
+      "p90_dev_bps": 11.5,
+      "both_trade": 1.0
+    },
+    "ELSA": {
+      "coin": "ELSA",
+      "upbit_symbol": "KRW-ELSA",
+      "binance_symbol": "ELSAUSDT",
+      "bybit_symbol": "ELSAUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.848,
+      "p90_dev_bps": 65.6,
+      "both_trade": 1.0
+    },
+    "PUFFER": {
+      "coin": "PUFFER",
+      "upbit_symbol": "KRW-PUFFER",
+      "binance_symbol": null,
+      "bybit_symbol": "PUFFERUSDT",
+      "venues": [
+        "bybit"
+      ],
+      "corr": 0.834,
+      "p90_dev_bps": 36.7,
+      "both_trade": 1.0
+    },
+    "SPX": {
+      "coin": "SPX",
+      "upbit_symbol": "KRW-SPX",
+      "binance_symbol": "SPXUSDT",
+      "bybit_symbol": "SPXUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.824,
+      "p90_dev_bps": 32.9,
+      "both_trade": 1.0
+    },
+    "MOODENG": {
+      "coin": "MOODENG",
+      "upbit_symbol": "KRW-MOODENG",
+      "binance_symbol": "MOODENGUSDT",
+      "bybit_symbol": "MOODENGUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.821,
+      "p90_dev_bps": 18.0,
+      "both_trade": 0.773
+    },
+    "BIGTIME": {
+      "coin": "BIGTIME",
+      "upbit_symbol": "KRW-BIGTIME",
+      "binance_symbol": "BIGTIMEUSDT",
+      "bybit_symbol": "BIGTIMEUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.807,
+      "p90_dev_bps": 10.6,
+      "both_trade": 0.658
+    },
+    "AERO": {
+      "coin": "AERO",
+      "upbit_symbol": "KRW-AERO",
+      "binance_symbol": "AEROUSDT",
+      "bybit_symbol": "AEROUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.805,
+      "p90_dev_bps": 30.0,
+      "both_trade": 1.0
+    },
+    "BEAM": {
+      "coin": "BEAM",
+      "upbit_symbol": "KRW-BEAM",
+      "binance_symbol": null,
+      "bybit_symbol": "BEAMUSDT",
+      "venues": [
+        "bybit"
+      ],
+      "corr": 0.796,
+      "p90_dev_bps": 27.9,
+      "both_trade": 0.981
+    },
+    "ZKP": {
+      "coin": "ZKP",
+      "upbit_symbol": "KRW-ZKP",
+      "binance_symbol": "ZKPUSDT",
+      "bybit_symbol": "ZKPUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.782,
+      "p90_dev_bps": 16.3,
+      "both_trade": 1.0
+    },
+    "ETHFI": {
+      "coin": "ETHFI",
+      "upbit_symbol": "KRW-ETHFI",
+      "binance_symbol": "ETHFIUSDT",
+      "bybit_symbol": "ETHFIUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.767,
+      "p90_dev_bps": 18.7,
+      "both_trade": 1.0
+    },
+    "CFX": {
+      "coin": "CFX",
+      "upbit_symbol": "KRW-CFX",
+      "binance_symbol": "CFXUSDT",
+      "bybit_symbol": "CFXUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.76,
+      "p90_dev_bps": 21.0,
+      "both_trade": 1.0
+    },
+    "ZRO": {
+      "coin": "ZRO",
+      "upbit_symbol": "KRW-ZRO",
+      "binance_symbol": "ZROUSDT",
+      "bybit_symbol": "ZROUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.757,
+      "p90_dev_bps": 15.0,
+      "both_trade": 1.0
+    },
+    "DOT": {
+      "coin": "DOT",
+      "upbit_symbol": "KRW-DOT",
+      "binance_symbol": "DOTUSDT",
+      "bybit_symbol": "DOTUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.754,
+      "p90_dev_bps": 15.9,
+      "both_trade": 1.0
+    },
+    "ZKC": {
+      "coin": "ZKC",
+      "upbit_symbol": "KRW-ZKC",
+      "binance_symbol": "ZKCUSDT",
+      "bybit_symbol": "ZKCUSDT",
+      "venues": [
+        "binance"
+      ],
+      "corr": 0.747,
+      "p90_dev_bps": 20.0,
+      "both_trade": 1.0
+    },
+    "CAP": {
+      "coin": "CAP",
+      "upbit_symbol": "KRW-CAP",
+      "binance_symbol": "CAPUSDT",
+      "bybit_symbol": "CAPUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.743,
+      "p90_dev_bps": 21.5,
+      "both_trade": 1.0
+    },
+    "PENDLE": {
+      "coin": "PENDLE",
+      "upbit_symbol": "KRW-PENDLE",
+      "binance_symbol": "PENDLEUSDT",
+      "bybit_symbol": "PENDLEUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.742,
+      "p90_dev_bps": 19.4,
+      "both_trade": 1.0
+    },
+    "ARX": {
+      "coin": "ARX",
+      "upbit_symbol": "KRW-ARX",
+      "binance_symbol": "ARXUSDT",
+      "bybit_symbol": "ARXUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.741,
+      "p90_dev_bps": 36.3,
+      "both_trade": 0.925
+    },
+    "LIT": {
+      "coin": "LIT",
+      "upbit_symbol": "KRW-LIT",
+      "binance_symbol": "LITUSDT",
+      "bybit_symbol": "LITUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.74,
+      "p90_dev_bps": 19.8,
+      "both_trade": 1.0
+    },
+    "ENSO": {
+      "coin": "ENSO",
+      "upbit_symbol": "KRW-ENSO",
+      "binance_symbol": "ENSOUSDT",
+      "bybit_symbol": "ENSOUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.736,
+      "p90_dev_bps": 21.2,
+      "both_trade": 1.0
+    },
+    "GTC": {
+      "coin": "GTC",
+      "upbit_symbol": "KRW-GTC",
+      "binance_symbol": "GTCUSDT",
+      "bybit_symbol": null,
+      "venues": [
+        "binance"
+      ],
+      "corr": 0.731,
+      "p90_dev_bps": 45.7,
+      "both_trade": 1.0
+    },
+    "BAT": {
+      "coin": "BAT",
+      "upbit_symbol": "KRW-BAT",
+      "binance_symbol": "BATUSDT",
+      "bybit_symbol": "BATUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.716,
+      "p90_dev_bps": 32.4,
+      "both_trade": 1.0
+    },
+    "NEAR": {
+      "coin": "NEAR",
+      "upbit_symbol": "KRW-NEAR",
+      "binance_symbol": "NEARUSDT",
+      "bybit_symbol": "NEARUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.706,
+      "p90_dev_bps": 13.9,
+      "both_trade": 1.0
+    },
+    "WAL": {
+      "coin": "WAL",
+      "upbit_symbol": "KRW-WAL",
+      "binance_symbol": "WALUSDT",
+      "bybit_symbol": "WALUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.705,
+      "p90_dev_bps": 23.0,
+      "both_trade": 1.0
+    },
+    "AWE": {
+      "coin": "AWE",
+      "upbit_symbol": "KRW-AWE",
+      "binance_symbol": "AWEUSDT",
+      "bybit_symbol": "AWEUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.702,
+      "p90_dev_bps": 30.7,
+      "both_trade": 0.711
+    },
+    "PROM": {
+      "coin": "PROM",
+      "upbit_symbol": "KRW-PROM",
+      "binance_symbol": "PROMUSDT",
+      "bybit_symbol": null,
+      "venues": [
+        "binance"
+      ],
+      "corr": 0.691,
+      "p90_dev_bps": 20.5,
+      "both_trade": 1.0
+    },
+    "JTO": {
+      "coin": "JTO",
+      "upbit_symbol": "KRW-JTO",
+      "binance_symbol": "JTOUSDT",
+      "bybit_symbol": "JTOUSDT",
+      "venues": [
+        "binance",
+        "bybit"
+      ],
+      "corr": 0.673,
+      "p90_dev_bps": 22.6,
+      "both_trade": 1.0
+    },
+    "RENDER": {
+      "coin": "RENDER",
+      "upbit_symbol": "KRW-RENDER",
+      "binance_symbol": "RENDERUSDT",
+      "bybit_symbol": "RENDERUSDT",
+      "venues": [
+        "binance"
+      ],
+      "corr": 0.663,
+      "p90_dev_bps": 19.2,
+      "both_trade": 1.0
+    },
+    "AAVE": {
+      "coin": "AAVE",
+      "upbit_symbol": "KRW-AAVE",
+      "binance_symbol": "AAVEUSDT",
+      "bybit_symbol": "AAVEUSDT",
+      "venues": [
+        "bybit"
+      ],
+      "corr": 0.658,
+      "p90_dev_bps": 11.8,
+      "both_trade": 0.988
+    },
+    "APT": {
+      "coin": "APT",
+      "upbit_symbol": "KRW-APT",
+      "binance_symbol": "APTUSDT",
+      "bybit_symbol": "APTUSDT",
+      "venues": [
+        "bybit"
+      ],
+      "corr": 0.656,
+      "p90_dev_bps": 18.5,
+      "both_trade": 1.0
+    },
+    "KERNEL": {
+      "coin": "KERNEL",
+      "upbit_symbol": "KRW-KERNEL",
+      "binance_symbol": "KERNELUSDT",
+      "bybit_symbol": "KERNELUSDT",
+      "venues": [
+        "bybit"
+      ],
+      "corr": 0.656,
+      "p90_dev_bps": 26.8,
+      "both_trade": 0.8
+    }
+  }
+}

@@ -8,10 +8,10 @@ from typing import Any, Callable, Dict
 
 from config import MatchedUniverse
 from models import OrderBookDepth5
-from stream_base import BaseVenueStream
-from stream_binance import BinanceFuturesStream
-from stream_bybit import BybitPerpStream
-from stream_upbit import UpbitSpotStream
+from venues.base import BaseVenueStream
+from venues.binance import BinanceFuturesStream
+from venues.bybit import BybitPerpStream
+from venues.upbit import UpbitSpotStream
 
 log = logging.getLogger("stream_manager")
 
