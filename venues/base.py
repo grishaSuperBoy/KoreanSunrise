@@ -1,16 +1,21 @@
 """
 venues/base.py — Core base classes and utilities for venue REST and WebSocket connections.
+Provides BaseVenueStream and BaseCEXStream with auto-reconnection, daily reconnect windows,
+gzip decompression, level extraction helpers, and HTTP session management.
 """
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hashlib
+import json
 import logging
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Callable, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
 from requests.adapters import HTTPAdapter
+import websockets
 
 from models import OrderBookDepth5
 
@@ -49,8 +54,8 @@ def normalize_symbol(raw: str) -> str:
 
 
 def create_http_session(
-    pool_connections: int = 25,
-    pool_maxsize: int = 25,
+    pool_connections: int = 35,
+    pool_maxsize: int = 35,
     max_retries: int = 2,
     timeout: float = 8.0,
 ) -> requests.Session:
@@ -64,7 +69,7 @@ def create_http_session(
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; KoreanSunrise/2.0; +https://github.com/grishaSuperBoy/KoreanSunrise)",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json",
     })
     return session
@@ -159,9 +164,20 @@ class BaseVenueStream:
             self.levels_dropped += 1
 
     async def start(self) -> None:
-        raise NotImplementedError
+        self._running = True
+        self._task = asyncio.create_task(self._run_loop())
 
     async def stop(self) -> None:
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        self.connected = False
+
+    async def _run_loop(self) -> None:
         raise NotImplementedError
 
     def get_status(self) -> dict:
@@ -177,3 +193,162 @@ class BaseVenueStream:
             "books_dropped": self.books_dropped,
             "levels_dropped": self.levels_dropped,
         }
+
+
+class BaseCEXStream(BaseVenueStream):
+    """
+    Generic base class for Centralized Exchange WebSocket feeds.
+    Provides auto-reconnection, heartbeat ping loops, binary gzip decompression,
+    starvation detection, and level extraction helpers.
+    """
+
+    WS_URL: str = ""
+    PING_INTERVAL_SEC: float = 15.0
+
+    def __init__(
+        self,
+        exchange: str,
+        symbols: List[str],
+        callback: Callable[[OrderBookDepth5], None],
+        stream_name: Optional[str] = None,
+    ):
+        super().__init__(exchange, symbols, callback)
+        self.venue = exchange.lower()
+        if stream_name:
+            self.name = stream_name.lower()
+        self.ws_url = self.WS_URL
+        self.subscribed = list(self.symbols)
+
+    @staticmethod
+    def _base_coin(s: str) -> str:
+        return normalize_symbol(s)
+
+    @staticmethod
+    def _extract_levels(raw_side: Any, limit: int = 5) -> List[Tuple[float, float]]:
+        out: List[Tuple[float, float]] = []
+        for row in raw_side or ():
+            if len(out) >= limit:
+                break
+            try:
+                if isinstance(row, (list, tuple)) and len(row) >= 2:
+                    p, q = float(row[0]), float(row[1])
+                elif isinstance(row, dict):
+                    p = float(row.get("p") or row.get("price") or row.get("px") or 0.0)
+                    q = float(
+                        row.get("q")
+                        or row.get("s")
+                        or row.get("m")
+                        or row.get("size")
+                        or row.get("qty")
+                        or row.get("amount")
+                        or row.get("v")
+                        or row.get("vol")
+                        or 0.0
+                    )
+                else:
+                    continue
+                if p > 0.0 and q > 0.0:
+                    out.append((p, q))
+            except (TypeError, ValueError, IndexError):
+                continue
+        return out
+
+    def _handle_sub_reply(self, data: Any) -> None:
+        """Hook to suppress subscription confirmation messages."""
+        pass
+
+    async def _send_subscriptions(self, ws: Any) -> None:
+        raise NotImplementedError
+
+    async def _send_client_ping(self, ws: Any) -> None:
+        pass
+
+    async def _handle_server_ping(self, ws: Any, raw_msg: str) -> bool:
+        return False
+
+    def _parse_message(self, raw_msg: str) -> None:
+        raise NotImplementedError
+
+    async def _ping_loop(self, ws: Any) -> None:
+        try:
+            while self._running:
+                await asyncio.sleep(self.PING_INTERVAL_SEC)
+                await self._send_client_ping(ws)
+        except Exception:
+            pass
+
+    async def _run_loop(self) -> None:
+        if not self.ws_url:
+            log.warning(f"[{self.name}] No WS endpoint configured.")
+            return
+
+        while self._running:
+            try:
+                log.info(f"[{self.name}] Connecting to {self.ws_url} ({len(self.symbols)} symbols)...")
+                async with websockets.connect(
+                    self.ws_url,
+                    open_timeout=20,
+                    ping_interval=None,
+                    ping_timeout=None,
+                    max_queue=2000,
+                ) as ws:
+                    self._note_connect()
+                    log.info(f"[{self.name}] Connected! Sending subscriptions...")
+                    await self._send_subscriptions(ws)
+                    ping_task = asyncio.create_task(self._ping_loop(ws))
+                    reconnect_in = _secs_until_daily_reconnect_for(self.name)
+                    deadline = time.monotonic() + reconnect_in
+
+                    try:
+                        while self._running:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                log.info(f"[{self.name}] Scheduled daily reconnect. Reconnecting...")
+                                break
+
+                            if not self.last_msg_ts:
+                                self.last_msg_ts = time.time()
+                            elif time.time() - self.last_msg_ts > 180.0:
+                                log.warning(f"[{self.name}] No data for >180s, reconnecting...")
+                                break
+
+                            try:
+                                msg = await asyncio.wait_for(ws.recv(), timeout=min(30.0, remaining))
+                            except asyncio.TimeoutError:
+                                continue
+
+                            # Automatic GZIP decompression for compressed streams (HTX, BingX)
+                            if isinstance(msg, bytes):
+                                try:
+                                    msg = gzip.decompress(msg).decode("utf-8")
+                                except Exception:
+                                    msg = msg.decode("utf-8", errors="ignore")
+
+                            if isinstance(msg, str):
+                                s_clean = msg.strip().strip('"').lower()
+                                if s_clean == "ping":
+                                    await ws.send("pong")
+                                    self.last_msg_ts = time.time()
+                                    continue
+                                if s_clean == "pong":
+                                    self.last_msg_ts = time.time()
+                                    continue
+                                if "ping" in s_clean or "pong" in s_clean or '"time"' in s_clean:
+                                    if await self._handle_server_ping(ws, msg):
+                                        self.last_msg_ts = time.time()
+                                        continue
+
+                            self.last_msg_ts = time.time()
+                            self._parse_message(msg)
+                    finally:
+                        ping_task.cancel()
+                        self.connected = False
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.connected = False
+                err_str = str(e)
+                delay = 30.0 if ("403" in err_str or "11001" in err_str or "getaddrinfo" in err_str) else 3.0
+                log.warning(f"[{self.name}] WS disconnected: {e}. Reconnecting in {delay}s...")
+                await asyncio.sleep(delay)

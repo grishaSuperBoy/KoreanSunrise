@@ -6,15 +6,29 @@
   "capital": {
     "per_venue_usd": {
       "binance": 100.0,
-      "bybit": 100.0
+      "bybit": 100.0,
+      "okx": 100.0,
+      "gateio": 100.0,
+      "mexc": 100.0,
+      "kucoin": 100.0,
+      "bingx": 100.0,
+      "htx": 100.0,
+      "pionex": 100.0
     },
     "reserve_margin_frac": 0.2
   },
   "active_venues": [
     "binance",
-    "bybit"
+    "bybit",
+    "okx",
+    "gateio",
+    "mexc",
+    "kucoin",
+    "bingx",
+    "htx",
+    "pionex"
   ],
-  "max_active_slots": 3,
+  "max_active_slots": 5,
   "min_order_usd": 10.0,
   "stealth_depth_frac": 0.15,
   "max_single_position_usd": 500.0

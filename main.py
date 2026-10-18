@@ -68,6 +68,7 @@ class KoreanSunriseService:
                     binance_sym_map=binance_sym_map,
                     bybit_sym_map=bybit_sym_map,
                 )
+                self.universe._raw_doc = doc
                 log.info(f"=== Loaded {len(coins)} incubator coins from universe_live.json ===")
             except Exception as e:
                 log.warning(f"Could not parse universe_live.json: {e}")

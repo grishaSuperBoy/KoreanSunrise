@@ -1,7 +1,9 @@
 """
-screening/screener.py — Two-Stage Universe Screener and Validator for Korean Sunrise.
-Stage 1: Fast 24h ticker, volume, and namesake price sanity filter.
+screening/screener.py — Multi-Venue Two-Stage Universe Screener and Validator for Korean Sunrise.
+Stage 1: Fast 24h ticker, volume, and namesake price sanity filter across all venues.
 Stage 2: Deep 1-minute kline correlation and Kimchi basis volatility screening.
+Supports all 9 major perpetual follower exchanges:
+  Binance, Bybit, OKX, Gate.io, MEXC, KuCoin, BingX, HTX, Pionex.
 """
 from __future__ import annotations
 
@@ -10,13 +12,20 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from config import EXCLUDED_COINS, TICKER_ALIASES
 from screening.metrics import evaluate_pair_klines
-from venues.base import create_http_session
+from venues.base import create_http_session, normalize_symbol
+from venues.bingx import BingXRestClient
 from venues.binance import BinanceRestClient
 from venues.bybit import BybitRestClient
+from venues.gateio import GateioRestClient
+from venues.htx import HTXRestClient
+from venues.kucoin import KucoinRestClient
+from venues.mexc import MEXCRestClient
+from venues.okx import OKXRestClient
+from venues.pionex import PionexRestClient
 from venues.upbit import UpbitRestClient
 
 log = logging.getLogger("screening")
@@ -32,14 +41,28 @@ DEFAULT_MIN_BOTH_TRADE = 0.15           # Min 15% of minutes traded on both side
 DEFAULT_MIN_DEV_BPS = 8.0               # Min 8.0 bps P90 spread volatility
 DEFAULT_KLINE_LIMIT = 200               # 200 1-minute candles (~3.3 hours)
 
+CLIENT_FACTORIES: Dict[str, Any] = {
+    "binance": BinanceRestClient,
+    "bybit": BybitRestClient,
+    "okx": OKXRestClient,
+    "gateio": GateioRestClient,
+    "mexc": MEXCRestClient,
+    "kucoin": KucoinRestClient,
+    "bingx": BingXRestClient,
+    "htx": HTXRestClient,
+    "pionex": PionexRestClient,
+}
+
 
 class UniverseScreener:
     """
-    Two-stage quantitative screener that filters Upbit KRW alts and Perp followers.
+    Two-stage quantitative screener that filters Upbit KRW spot leader alts
+    against multiple perpetual follower exchanges.
     """
 
     def __init__(
         self,
+        venues: Optional[List[str]] = None,
         min_vol_usd: float = DEFAULT_MIN_VOL_USD,
         max_price_diff_pct: float = DEFAULT_MAX_PRICE_DIFF_PCT,
         min_corr: float = DEFAULT_MIN_CORR,
@@ -47,8 +70,9 @@ class UniverseScreener:
         min_dev_bps: float = DEFAULT_MIN_DEV_BPS,
         kline_limit: int = DEFAULT_KLINE_LIMIT,
         output_file: str = DEFAULT_OUTPUT_FILE,
-        max_workers: int = 8,
+        max_workers: int = 10,
     ) -> None:
+        self.target_venues = [v.lower() for v in (venues or list(CLIENT_FACTORIES.keys())) if v.lower() in CLIENT_FACTORIES]
         self.min_vol_usd = min_vol_usd
         self.max_price_diff_pct = max_price_diff_pct
         self.min_corr = min_corr
@@ -60,64 +84,63 @@ class UniverseScreener:
 
         self.session = create_http_session()
         self.upbit = UpbitRestClient(self.session)
-        self.binance = BinanceRestClient(self.session)
-        self.bybit = BybitRestClient(self.session)
+        self.clients = {v: CLIENT_FACTORIES[v](self.session) for v in self.target_venues}
 
     def run(self) -> Dict[str, Any]:
         t0 = time.time()
-        log.info("=== Starting Two-Stage Korean Sunrise Universe Screener ===")
+        log.info(f"=== Starting Multi-Venue Screener ({len(self.target_venues)} follower venues) ===")
+        log.info(f"Active follower venues: {', '.join(self.target_venues)}")
 
         # ------------------------------------------------------------- Stage 1
-        log.info("[Stage 1/2] Fetching 24h market tickers & exchange metadata...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        log.info("[Stage 1/2] Fetching 24h market tickers & exchange metadata across venues...")
+        
+        # Parallel fetch for all venue instruments and 24h tickers
+        venue_perps: Dict[str, Dict[str, Tuple[str, float]]] = {}
+        venue_ticks: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+        def _fetch_venue_metadata(venue: str):
+            client = self.clients[venue]
+            perps = client.fetch_linear_perpetuals()
+            ticks = client.fetch_tickers_24h()
+            return venue, perps, ticks
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(4, len(self.target_venues) + 1)) as ex:
             f_rate = ex.submit(self.upbit.fetch_usdt_krw_rate)
             f_up_mkts = ex.submit(self.upbit.fetch_krw_markets)
-            f_bin_perps = ex.submit(self.binance.fetch_linear_perpetuals)
-            f_byb_perps = ex.submit(self.bybit.fetch_linear_perpetuals)
-            f_bin_ticks = ex.submit(self.binance.fetch_tickers_24h)
-            f_byb_ticks = ex.submit(self.bybit.fetch_tickers_24h)
+            v_futures = [ex.submit(_fetch_venue_metadata, v) for v in self.target_venues]
 
             usdt_krw_rate = f_rate.result()
             up_mkts = f_up_mkts.result()
-            bin_perps = f_bin_perps.result()
-            byb_perps = f_byb_perps.result()
-            bin_ticks = f_bin_ticks.result()
-            byb_ticks = f_byb_ticks.result()
+            for fut in concurrent.futures.as_completed(v_futures):
+                try:
+                    v, p, tk = fut.result()
+                    venue_perps[v] = p
+                    venue_ticks[v] = tk
+                    log.info(f"  • {v.upper():<8}: {len(p)} contracts | {len(tk)} 24h tickers")
+                except Exception as e:
+                    log.warning(f"  • Venue fetch failed: {e}")
 
         log.info(f"[Stage 1/2] USDT/KRW Rate: {usdt_krw_rate:.2f} | Upbit KRW Markets: {len(up_mkts)}")
 
-        # Fetch Upbit 24h tickers in fast batches
+        # Batch fetch Upbit 24h tickers
         up_ticks = self.upbit.fetch_tickers_24h(list(up_mkts.values()), usdt_krw_rate)
-        log.info(f"[Stage 1/2] Fetched 24h tickers for {len(up_ticks)} Upbit coins")
+        log.info(f"[Stage 1/2] Upbit 24h tickers fetched: {len(up_ticks)}")
 
-        # Invert perp mappings: base_coin -> (raw_sym, mult)
-        bin_base_map: Dict[str, Tuple[str, float]] = {}
-        for raw, (base, mult) in bin_perps.items():
-            bin_base_map[base] = (raw, mult)
+        # Build reverse base map for each venue: canonical_base -> (raw_sym, mult)
+        venue_base_maps: Dict[str, Dict[str, Tuple[str, float]]] = {}
+        for v, perps in venue_perps.items():
+            b_map: Dict[str, Tuple[str, float]] = {}
+            for raw, (base, mult) in perps.items():
+                b_map[base] = (raw, mult)
+            venue_base_maps[v] = b_map
 
-        byb_base_map: Dict[str, Tuple[str, float]] = {}
-        for raw, (base, mult) in byb_perps.items():
-            byb_base_map[base] = (raw, mult)
-
-        # Stage 1 Matching and Fast Volume + Price Discrepancy Filter
+        # Stage 1 Matching and Fast Volume + Namesake Price Sanity Filter
         candidate_coins: Dict[str, Dict[str, Any]] = {}
         rejected_namesakes = 0
         rejected_volume = 0
 
         for coin, mkt_code in up_mkts.items():
             if coin in EXCLUDED_COINS:
-                continue
-
-            # Check matching aliases if coin not directly in perp base map
-            matched_bin = bin_base_map.get(coin)
-            if not matched_bin and coin in TICKER_ALIASES:
-                matched_bin = bin_base_map.get(TICKER_ALIASES[coin])
-
-            matched_byb = byb_base_map.get(coin)
-            if not matched_byb and coin in TICKER_ALIASES:
-                matched_byb = byb_base_map.get(TICKER_ALIASES[coin])
-
-            if not matched_bin and not matched_byb:
                 continue
 
             up_tick = up_ticks.get(coin)
@@ -127,114 +150,104 @@ class UniverseScreener:
             up_vol = up_tick["vol_usd_24h"]
             up_px = up_tick["price_usd"]
 
-            # Filter 1: Upbit volume
             if up_vol < self.min_vol_usd:
                 rejected_volume += 1
                 continue
 
-            # Check venues that pass volume & price sanity
-            valid_venues: List[str] = []
-            bin_meta = None
-            byb_meta = None
+            matched_venues_meta: Dict[str, Tuple[str, float, float, float]] = {}
 
-            if matched_bin:
-                raw_b, mult_b = matched_bin
-                t_b = bin_ticks.get(raw_b)
-                if t_b and t_b["vol_24h"] >= self.min_vol_usd:
-                    px_b = t_b["price"] / mult_b
-                    diff_pct = abs(up_px - px_b) / max(up_px, px_b) * 100.0
-                    if diff_pct <= self.max_price_diff_pct:
-                        valid_venues.append("binance")
-                        bin_meta = (raw_b, mult_b, px_b, t_b["vol_24h"])
-                    else:
-                        rejected_namesakes += 1
-                        log.debug(f"[sanity] Rejected namesake {coin} on Binance (price diff {diff_pct:.1f}%)")
+            for v in self.target_venues:
+                b_map = venue_base_maps.get(v, {})
+                matched = b_map.get(coin)
+                if not matched and coin in TICKER_ALIASES:
+                    matched = b_map.get(TICKER_ALIASES[coin])
 
-            if matched_byb:
-                raw_by, mult_by = matched_byb
-                t_by = byb_ticks.get(raw_by)
-                if t_by and t_by["vol_24h"] >= self.min_vol_usd:
-                    px_by = t_by["price"] / mult_by
-                    diff_pct = abs(up_px - px_by) / max(up_px, px_by) * 100.0
-                    if diff_pct <= self.max_price_diff_pct:
-                        valid_venues.append("bybit")
-                        byb_meta = (raw_by, mult_by, px_by, t_by["vol_24h"])
-                    else:
-                        rejected_namesakes += 1
-                        log.debug(f"[sanity] Rejected namesake {coin} on Bybit (price diff {diff_pct:.1f}%)")
+                if not matched:
+                    continue
 
-            if valid_venues:
+                raw_sym, mult = matched
+                t_info = venue_ticks.get(v, {}).get(raw_sym)
+                if not t_info:
+                    continue
+
+                vol_v = t_info.get("vol_24h", 0.0)
+                px_v = (t_info.get("price", 0.0) or 0.0) / mult
+
+                if vol_v < self.min_vol_usd or px_v <= 0:
+                    continue
+
+                diff_pct = abs(up_px - px_v) / max(up_px, px_v) * 100.0
+                if diff_pct <= self.max_price_diff_pct:
+                    matched_venues_meta[v] = (raw_sym, mult, px_v, vol_v)
+                else:
+                    rejected_namesakes += 1
+                    log.debug(f"[sanity] Rejected namesake {coin} on {v} (diff {diff_pct:.1f}%)")
+
+            if matched_venues_meta:
                 candidate_coins[coin] = {
                     "coin": coin,
                     "market": mkt_code,
                     "up_px": up_px,
                     "up_vol": up_vol,
-                    "venues": valid_venues,
-                    "bin_meta": bin_meta,
-                    "byb_meta": byb_meta,
+                    "matched_venues": matched_venues_meta,
                 }
 
         log.info(
-            f"[Stage 1/2] Complete: {len(candidate_coins)} candidates survived "
+            f"[Stage 1/2] Complete: {len(candidate_coins)} candidate coins survived "
             f"(Rejected: {rejected_volume} low volume, {rejected_namesakes} namesakes/price diffs)"
         )
 
         # ------------------------------------------------------------- Stage 2
         log.info(f"[Stage 2/2] Fetching {self.kline_limit} 1m candles for deep correlation screening...")
 
-        def _evaluate_worker(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        def _evaluate_coin_worker(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             c = item["coin"]
             mkt = item["market"]
             kl_up = self.upbit.fetch_klines_1m(mkt, count=self.kline_limit)
             if len(kl_up) < 30:
                 return None
 
+            confirmed_venues: Dict[str, Dict[str, Any]] = {}
             best_res: Optional[Dict[str, Any]] = None
-            confirmed_venues: List[str] = []
 
-            if "binance" in item["venues"] and item["bin_meta"]:
-                raw_b, mult_b, _, _ = item["bin_meta"]
-                kl_b = self.binance.fetch_klines_1m(raw_b, limit=self.kline_limit, mult=mult_b)
-                res_b = evaluate_pair_klines(
-                    kl_up, kl_b, usdt_krw_rate,
+            for v, (raw_sym, mult, _, _) in item["matched_venues"].items():
+                client = self.clients.get(v)
+                if not client:
+                    continue
+                kl_v = client.fetch_klines_1m(raw_sym, limit=self.kline_limit, mult=mult)
+                if len(kl_v) < 30:
+                    continue
+
+                res = evaluate_pair_klines(
+                    kl_up, kl_v, usdt_krw_rate,
                     min_corr=self.min_corr,
                     min_both_trade=self.min_both_trade,
                     min_dev_bps=self.min_dev_bps,
                     max_price_diff_pct=self.max_price_diff_pct,
                 )
-                if res_b["passed"] > 0:
-                    confirmed_venues.append("binance")
-                    best_res = res_b
 
-            if "bybit" in item["venues"] and item["byb_meta"]:
-                raw_by, mult_by, _, _ = item["byb_meta"]
-                kl_by = self.bybit.fetch_klines_1m(raw_by, limit=self.kline_limit, mult=mult_by)
-                res_by = evaluate_pair_klines(
-                    kl_up, kl_by, usdt_krw_rate,
-                    min_corr=self.min_corr,
-                    min_both_trade=self.min_both_trade,
-                    min_dev_bps=self.min_dev_bps,
-                    max_price_diff_pct=self.max_price_diff_pct,
-                )
-                if res_by["passed"] > 0:
-                    confirmed_venues.append("bybit")
-                    if best_res is None or res_by["corr"] > best_res["corr"]:
-                        best_res = res_by
+                if res["passed"] > 0:
+                    confirmed_venues[v] = {
+                        "raw_sym": raw_sym,
+                        "mult": mult,
+                        "metrics": res,
+                    }
+                    if best_res is None or res["corr"] > best_res["corr"]:
+                        best_res = res
 
             if confirmed_venues and best_res:
                 return {
                     "coin": c,
                     "market": mkt,
-                    "venues": confirmed_venues,
-                    "metrics": best_res,
-                    "bin_meta": item["bin_meta"],
-                    "byb_meta": item["byb_meta"],
+                    "venues": sorted(confirmed_venues.keys()),
+                    "venue_details": confirmed_venues,
+                    "best_metrics": best_res,
                 }
             return None
 
         vetted_coins: List[Dict[str, Any]] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as ex:
-            futures = [ex.submit(_evaluate_worker, it) for it in candidate_coins.values()]
+            futures = [ex.submit(_evaluate_coin_worker, it) for it in candidate_coins.values()]
             for f in concurrent.futures.as_completed(futures):
                 try:
                     res = f.result()
@@ -243,16 +256,16 @@ class UniverseScreener:
                 except Exception as e:
                     log.debug(f"[screening] Worker error: {e}")
 
-        # Sort by correlation and volume
-        vetted_coins.sort(key=lambda x: x["metrics"]["corr"], reverse=True)
+        # Sort by best correlation
+        vetted_coins.sort(key=lambda x: x["best_metrics"]["corr"], reverse=True)
 
         elapsed = round(time.time() - t0, 2)
         log.info(
-            f"[Stage 2/2] Complete in {elapsed}s: {len(vetted_coins)} coins qualified for live universe."
+            f"[Stage 2/2] Complete in {elapsed}s: {len(vetted_coins)} coins qualified across all venues."
         )
 
-        for i, q in enumerate(vetted_coins[:20], 1):
-            m = q["metrics"]
+        for i, q in enumerate(vetted_coins[:25], 1):
+            m = q["best_metrics"]
             v_str = ",".join(q["venues"])
             log.info(
                 f"  #{i:2d} {q['coin']:<10} | Corr: {m['corr']:>5.3f} | "
@@ -274,49 +287,52 @@ class UniverseScreener:
     ) -> Dict[str, Any]:
         coins_list = [c["coin"] for c in vetted_coins]
         upbit_krw_to_coin: Dict[str, str] = {c["market"]: c["coin"] for c in vetted_coins}
-        binance_sym_map: Dict[str, Tuple[str, float]] = {}
-        bybit_sym_map: Dict[str, Tuple[str, float]] = {}
+
+        # Build sym_map per venue
+        sym_maps: Dict[str, Dict[str, Tuple[str, float]]] = {v: {} for v in self.target_venues}
         pairs_meta: Dict[str, Any] = {}
 
         for c in vetted_coins:
             coin = c["coin"]
-            bm = c.get("bin_meta")
-            bym = c.get("byb_meta")
-            bin_raw = bm[0] if bm else None
-            byb_raw = bym[0] if bym else None
+            v_details = c.get("venue_details", {})
+            v_list = c.get("venues", [])
 
-            if "binance" in c["venues"] and bm:
-                binance_sym_map[bm[0]] = (coin, bm[1])
-            if "bybit" in c["venues"] and bym:
-                bybit_sym_map[bym[0]] = (coin, bym[1])
+            for v in v_list:
+                dt = v_details.get(v)
+                if dt:
+                    raw_sym = dt["raw_sym"]
+                    mult = dt["mult"]
+                    sym_maps[v][raw_sym] = (coin, mult)
 
             pairs_meta[coin] = {
                 "coin": coin,
                 "upbit_symbol": c["market"],
-                "binance_symbol": bin_raw,
-                "bybit_symbol": byb_raw,
-                "venues": c["venues"],
-                "corr": c["metrics"]["corr"],
-                "p90_dev_bps": c["metrics"]["p90_dev_bps"],
-                "both_trade": c["metrics"]["both_trade"],
+                "venues": v_list,
+                "best_corr": c["best_metrics"]["corr"],
+                "best_p90_dev_bps": c["best_metrics"]["p90_dev_bps"],
+                "venue_symbols": {v: v_details[v]["raw_sym"] for v in v_list if v in v_details},
             }
 
-        return {
+        doc = {
             "_meta": {
                 "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "updated_ts": round(time.time(), 3),
                 "usdt_krw_rate": round(usdt_krw_rate, 2),
                 "coins_count": len(coins_list),
-                "binance_count": len(binance_sym_map),
-                "bybit_count": len(bybit_sym_map),
+                "active_venues": self.target_venues,
                 "screening_elapsed_sec": elapsed_sec,
             },
             "coins": coins_list,
             "upbit_krw_to_coin": upbit_krw_to_coin,
-            "binance_sym_map": binance_sym_map,
-            "bybit_sym_map": bybit_sym_map,
             "pairs": pairs_meta,
         }
+
+        # Store individual {venue}_sym_map entries for backward compatibility and direct lookup
+        for v in self.target_venues:
+            doc[f"{v}_sym_map"] = sym_maps[v]
+            doc["_meta"][f"{v}_count"] = len(sym_maps[v])
+
+        return doc
 
     def _save_atomic(self, doc: Dict[str, Any]) -> None:
         tmp = self.output_file + ".tmp"
@@ -324,7 +340,7 @@ class UniverseScreener:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(doc, f, indent=2, ensure_ascii=False)
             os.replace(tmp, self.output_file)
-            log.info(f"Saved verified live universe to {self.output_file}")
+            log.info(f"Saved verified multi-venue universe to {self.output_file}")
         except Exception as e:
             log.error(f"Failed to write live universe to {self.output_file}: {e}")
             if os.path.exists(tmp):

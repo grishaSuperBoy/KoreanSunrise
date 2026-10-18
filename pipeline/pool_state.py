@@ -324,21 +324,22 @@ class PoolStateManager:
             return
 
         coins = doc.get("coins", [])
-        binance_map = doc.get("binance_sym_map", {})
-        bybit_map = doc.get("bybit_sym_map", {})
+        coin_venues: Dict[str, Set[str]] = {c: set() for c in coins}
 
-        # Map coin -> active follower venues
-        coin_venues: Dict[str, Set[str]] = {}
-        for c in coins:
-            coin_venues.setdefault(c, set())
+        # Dynamic venue extraction from all *_sym_map entries or pairs
+        for k, v_map in doc.items():
+            if k.endswith("_sym_map") and isinstance(v_map, dict):
+                venue_name = k[:-8].lower()
+                for raw, item in v_map.items():
+                    c = item[0] if isinstance(item, (list, tuple)) else item
+                    coin_venues.setdefault(c, set()).add(venue_name)
 
-        for raw, item in binance_map.items():
-            c = item[0] if isinstance(item, (list, tuple)) else item
-            coin_venues.setdefault(c, set()).add("binance")
-
-        for raw, item in bybit_map.items():
-            c = item[0] if isinstance(item, (list, tuple)) else item
-            coin_venues.setdefault(c, set()).add("bybit")
+        pairs = doc.get("pairs", {})
+        if isinstance(pairs, dict):
+            for c, p_meta in pairs.items():
+                if isinstance(p_meta, dict):
+                    for v in p_meta.get("venues", []):
+                        coin_venues.setdefault(c, set()).add(v.lower())
 
         for coin, venues in coin_venues.items():
             if coin in self._coins:

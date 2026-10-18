@@ -29,11 +29,28 @@ DEFAULT_PROFILE: Dict[str, Any] = {
         "per_venue_usd": {
             "binance": 100.0,
             "bybit": 100.0,
+            "okx": 100.0,
+            "gateio": 100.0,
+            "mexc": 100.0,
+            "kucoin": 100.0,
+            "bingx": 100.0,
+            "htx": 100.0,
+            "pionex": 100.0,
         },
         "reserve_margin_frac": 0.20,  # 20% margin cushion against drawdowns
     },
-    "active_venues": ["binance", "bybit"],
-    "max_active_slots": 3,           # Max concurrent positions
+    "active_venues": [
+        "binance",
+        "bybit",
+        "okx",
+        "gateio",
+        "mexc",
+        "kucoin",
+        "bingx",
+        "htx",
+        "pionex",
+    ],
+    "max_active_slots": 5,           # Max concurrent positions
     "min_order_usd": 10.0,           # Exchange min notional
     "stealth_depth_frac": 0.15,      # Universal stealth sizing rule (15% top-3 ask depth)
     "max_single_position_usd": 500.0,# Hard ceiling per position
