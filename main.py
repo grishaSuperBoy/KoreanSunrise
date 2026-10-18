@@ -126,9 +126,11 @@ class KoreanSunriseService:
             raise RuntimeError("No overlapping coins discovered between Upbit and Perp exchanges.")
 
         log.info(f"=== Starting Korean Sunrise for {len(self.universe.coins)} matched target coins ===")
+        active_venues = self.profile_manager.get_profile().get("active_venues")
         self.stream_manager = StreamManager(
             universe=self.universe,
             callback=self.engine.on_book_update,
+            active_venues=active_venues,
         )
         await self.stream_manager.start_all()
 

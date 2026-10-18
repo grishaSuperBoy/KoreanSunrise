@@ -189,7 +189,7 @@ class KoreanEngine:
     def on_book_update(self, snap: OrderBookDepth5) -> None:
         now = time.time()
         ex = snap.exchange.lower()
-        coin = _base(snap.symbol)
+        coin = snap.symbol.upper()
         key = (ex, coin)
 
         prev_snap = self._books.get(key)
@@ -448,6 +448,7 @@ class KoreanEngine:
             pair_sigma_bps=round(sigma, 2),
             raw_dislocation_bps=round(dislocation_bps, 2),
             dev_z=round(dev_z, 2),
+            gross_exec_edge_bps=round(gross_exec_edge_bps, 2),
             net_exec_edge_bps=round(net_edge, 2),
             leader_latency_ms=upbit_snap.network_latency_ms,
             follower_latency_ms=f_snap.network_latency_ms,
@@ -569,7 +570,7 @@ class KoreanEngine:
         else:
             self.counters["signals_timeout"] += 1
 
-        self.emit(asdict(sig))
+        self.emit(sig.to_dict())
 
         pair_key = (sig.coin, sig.follower_exchange)
         st = self._pairs.get(pair_key)

@@ -30,8 +30,13 @@ _QUOTES = ("USDT", "USDC", "USD", "KRW")
 _CONTRACT_SUFFIXES = ("PERP", "SWAP")
 
 
-def normalize_symbol(raw: str) -> str:
-    """Canonical base coin symbol normalizer."""
+import re
+
+_MULT_PREFIX_RE = re.compile(r"^(1000000|100000|10000|1000|100)([A-Z0-9]+)$")
+
+
+def parse_symbol_and_mult(raw: str) -> Tuple[str, float]:
+    """Returns (canonical_base_coin, multiplier) e.g. '1000PEPE-USDT' -> ('PEPE', 1000.0)."""
     s_raw = str(raw).strip()
     if len(s_raw) > 1 and s_raw[0] == "k" and s_raw[1].isupper():
         s_raw = "1000" + s_raw[1:]
@@ -50,7 +55,18 @@ def normalize_symbol(raw: str) -> str:
     for suf in _CONTRACT_SUFFIXES:
         if s.endswith(suf) and len(s) > len(suf):
             s = s[:-len(suf)]
-    return s
+    if s == "XBT":
+        s = "BTC"
+    m = _MULT_PREFIX_RE.match(s)
+    if m:
+        return m.group(2), float(m.group(1))
+    return s, 1.0
+
+
+def normalize_symbol(raw: str) -> str:
+    """Canonical base coin symbol normalizer (strips 1000x prefix and quote)."""
+    coin, _ = parse_symbol_and_mult(raw)
+    return coin
 
 
 def create_http_session(
@@ -148,20 +164,23 @@ class BaseVenueStream:
                 self.books_dropped += 1
                 return
 
+            now = time.time()
+            self._note_symbol(snap.symbol)
+
             clean_snap = OrderBookDepth5(
                 exchange=snap.exchange,
                 symbol=snap.symbol,
                 raw_symbol=snap.raw_symbol,
-                ts=snap.ts or time.time(),
-                recv_ts=snap.recv_ts or time.time(),
-                network_latency_ms=snap.network_latency_ms,
+                ts=snap.ts or now,
+                exchange_ts=int(snap.exchange_ts or (now * 1000)),
                 bids=bids[:5],
                 asks=asks[:5],
             )
             self._raw_callback(clean_snap)
 
-        except (ValueError, TypeError, IndexError):
+        except (ValueError, TypeError, IndexError) as e:
             self.levels_dropped += 1
+            log.debug(f"[{self.name}] Sanitise drop: {e}")
 
     async def start(self) -> None:
         self._running = True
@@ -208,24 +227,39 @@ class BaseCEXStream(BaseVenueStream):
     def __init__(
         self,
         exchange: str,
-        symbols: List[str],
+        symbols: List[str] | Dict[str, Tuple[str, float]],
         callback: Callable[[OrderBookDepth5], None],
         stream_name: Optional[str] = None,
     ):
-        super().__init__(exchange, symbols, callback)
+        if isinstance(symbols, dict):
+            self._sym_map: Dict[str, Tuple[str, float]] = dict(symbols)
+            raw_list = list(symbols.keys())
+            coins = sorted({c for c, _ in symbols.values()})
+        else:
+            raw_list = [str(s).upper() for s in symbols]
+            self._sym_map = {s: parse_symbol_and_mult(s) for s in raw_list}
+            coins = sorted({c for c, _ in self._sym_map.values()})
+
+        super().__init__(exchange, raw_list, callback)
         self.venue = exchange.lower()
         if stream_name:
             self.name = stream_name.lower()
         self.ws_url = self.WS_URL
-        self.subscribed = list(self.symbols)
+        self.subscribed = coins  # Canonical coins for accurate heartbeat X/Y counter
+
+    def _resolve_coin_and_mult(self, raw_sym: str) -> Tuple[str, float]:
+        raw_u = raw_sym.upper()
+        if raw_u in self._sym_map:
+            return self._sym_map[raw_u]
+        return parse_symbol_and_mult(raw_u)
 
     @staticmethod
     def _base_coin(s: str) -> str:
         return normalize_symbol(s)
 
-    @staticmethod
-    def _extract_levels(raw_side: Any, limit: int = 5) -> List[Tuple[float, float]]:
+    def _extract_levels(self, raw_side: Any, limit: int = 5, mult: float = 1.0) -> List[Tuple[float, float]]:
         out: List[Tuple[float, float]] = []
+        inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
         for row in raw_side or ():
             if len(out) >= limit:
                 break
@@ -248,7 +282,7 @@ class BaseCEXStream(BaseVenueStream):
                 else:
                     continue
                 if p > 0.0 and q > 0.0:
-                    out.append((p, q))
+                    out.append((p * inv_mult, q * mult))
             except (TypeError, ValueError, IndexError):
                 continue
         return out

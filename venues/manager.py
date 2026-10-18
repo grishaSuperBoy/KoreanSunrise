@@ -71,20 +71,24 @@ class StreamManager:
                 continue
 
             v_sym_map = raw_doc.get(f"{v_name}_sym_map", {})
-            v_coins = [c for c, item in v_sym_map.items()] if v_sym_map else []
-            if not v_coins:
-                # Fallback to coins that have this venue listed in pairs
+            if v_sym_map:
+                norm_map = {k: (v[0], float(v[1])) for k, v in v_sym_map.items()}
+                try:
+                    self.streams[v_name] = cls(norm_map, callback)
+                    log.info(f"[stream_manager] Registered follower feed for {v_name.upper()} ({len(norm_map)} contracts)")
+                except Exception as e:
+                    log.warning(f"[stream_manager] Failed to initialize {v_name} feed: {e}")
+            else:
                 v_coins = [
                     coin for coin, p in raw_doc.get("pairs", {}).items()
                     if v_name in p.get("venues", [])
                 ]
-
-            if v_coins:
-                try:
-                    self.streams[v_name] = cls(v_coins, callback)
-                    log.info(f"[stream_manager] Registered follower feed for {v_name.upper()} ({len(v_coins)} coins)")
-                except Exception as e:
-                    log.warning(f"[stream_manager] Failed to initialize {v_name} feed: {e}")
+                if v_coins:
+                    try:
+                        self.streams[v_name] = cls(v_coins, callback)
+                        log.info(f"[stream_manager] Registered follower feed for {v_name.upper()} ({len(v_coins)} coins)")
+                    except Exception as e:
+                        log.warning(f"[stream_manager] Failed to initialize {v_name} feed: {e}")
 
     async def start_all(self) -> None:
         log.info(

@@ -86,7 +86,7 @@ class GateioStream(BaseCEXStream):
 
     def __init__(
         self,
-        symbols: List[str],
+        symbols,
         callback: Callable[[OrderBookDepth5], None],
         stream_name: Optional[str] = None,
     ):
@@ -99,7 +99,7 @@ class GateioStream(BaseCEXStream):
     async def _send_subscriptions(self, ws: Any) -> None:
         self._books.clear()
         for s in self.symbols:
-            pair = f"{self._base_coin(s)}_USDT"
+            pair = s if s.endswith("_USDT") else f"{self._base_coin(s)}_USDT"
             sub = {
                 "time": int(time.time()),
                 "channel": "futures.order_book_update",
@@ -118,35 +118,54 @@ class GateioStream(BaseCEXStream):
             if "order_book" not in channel:
                 return
             result = data.get("result", {})
-            contract = result.get("contract", "") or result.get("s", "")
+            contract = (result.get("contract", "") or result.get("s", "")).upper()
             if not contract:
                 return
-            sym = self._base_coin(contract)
+            sym, mult = self._resolve_coin_and_mult(contract)
 
             event = data.get("event")
             if contract not in self._books or event == "all":
                 self._books[contract] = {"bids": {}, "asks": {}}
 
             book = self._books[contract]
+            bids_dict = book["bids"]
+            asks_dict = book["asks"]
+
             for row in result.get("b", []):
                 p, q = float(row.get("p", 0.0)), float(row.get("s", 0.0))
                 if q <= 0.0 or p <= 0.0:
-                    book["bids"].pop(p, None)
+                    bids_dict.pop(p, None)
                 else:
-                    book["bids"][p] = q
+                    bids_dict[p] = q
 
             for row in result.get("a", []):
                 p, q = float(row.get("p", 0.0)), float(row.get("s", 0.0))
                 if q <= 0.0 or p <= 0.0:
-                    book["asks"].pop(p, None)
+                    asks_dict.pop(p, None)
                 else:
-                    book["asks"][p] = q
+                    asks_dict[p] = q
 
-            sorted_bids = sorted(book["bids"].items(), key=lambda x: x[0], reverse=True)[:5]
-            sorted_asks = sorted(book["asks"].items(), key=lambda x: x[0])[:5]
+            if not bids_dict or not asks_dict:
+                return
 
-            if sorted_bids and sorted_asks:
-                self._note_symbol(sym)
+            sorted_bids_raw = sorted(bids_dict.items(), key=lambda x: x[0], reverse=True)
+            sorted_asks_raw = sorted(asks_dict.items(), key=lambda x: x[0])
+
+            # Prevent unbounded memory growth on volatile price moves
+            if len(bids_dict) > 100:
+                book["bids"] = dict(sorted_bids_raw[:50])
+            if len(asks_dict) > 100:
+                book["asks"] = dict(sorted_asks_raw[:50])
+
+            if mult != 1.0:
+                inv_mult = 1.0 / mult
+                top_bids = [(p * inv_mult, q * mult) for p, q in sorted_bids_raw[:5]]
+                top_asks = [(p * inv_mult, q * mult) for p, q in sorted_asks_raw[:5]]
+            else:
+                top_bids = sorted_bids_raw[:5]
+                top_asks = sorted_asks_raw[:5]
+
+            if top_bids and top_asks:
                 ets = int(result.get("t", 0) or data.get("time", 0) * 1000)
                 self.callback(OrderBookDepth5(
                     exchange="gateio",
@@ -154,8 +173,8 @@ class GateioStream(BaseCEXStream):
                     raw_symbol=contract,
                     ts=time.time(),
                     exchange_ts=ets,
-                    bids=sorted_bids,
-                    asks=sorted_asks,
+                    bids=top_bids,
+                    asks=top_asks,
                 ))
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f"[gateio] parse error: {e}")
