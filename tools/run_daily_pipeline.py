@@ -1,140 +1,167 @@
 """
-tools/run_daily_pipeline.py — Master daily lifecycle orchestrator for Korean Sunrise.
+tools/run_daily_pipeline.py - Master Orchestrator for the 24-Hour Autonomous Lifecycle.
 
-Executes the autonomous 24-hour cycle:
-  [Phase 1] Universe Screening:
-            Queries Upbit, Binance Futures, and Bybit Linear.
-            Updates: universe_live.json (Incubator universe).
-  [Phase 2] Pool Evaluation & Promotion:
-            Scores recent signals using pure realized Net PnL and Profit Factor.
-            Updates: live_trading_pool.json (Battle pool).
-  [Phase 3] Lifecycle Summary & Actionable Pairs Report.
+Executes the 4 core daily operations sequentially:
+  [Phase 1] Universe Screening (1-min candles across 24h on Upbit & 9 follower CEXs):
+            Updates: universe_live.json (Incubator universe)
+  [Phase 2] Pool Evaluation (Yesterday's telemetry scoring & promotion):
+            Updates: live_trading_pool.json (Battle vs Incubator)
+  [Phase 3] Spread Calibration (10-60 bps sweep per pair):
+            Updates: matrix_thresholds.json (Dynamic execution thresholds)
+  [Phase 4] Full Daily Quantitative Report:
+            Updates: reports/daily/report_YYYY-MM-DD.md & .json
 
 Usage:
   python tools/run_daily_pipeline.py
   python tools/run_daily_pipeline.py --skip-screening
-  python tools/run_daily_pipeline.py --days 3
   python tools/run_daily_pipeline.py --dry-run
 """
 from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import logging
 import os
 import subprocess
 import sys
 import time
+from typing import Any, Dict, List, Optional
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(HERE)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+UNIVERSE_FILE = os.path.join(PROJECT_ROOT, "universe_live.json")
+BATTLE_FILE = os.path.join(PROJECT_ROOT, "live_trading_pool.json")
+THRESHOLDS_FILE = os.path.join(PROJECT_ROOT, "matrix_thresholds.json")
+LOG_FILE = os.path.join(PROJECT_ROOT, "logs", "daily_pipeline.log")
 
-from pipeline.evaluator import SunriseEvaluator
-from pipeline.pool_state import PoolStateManager
-from pipeline.profile import TradingProfileManager
+os.makedirs(os.path.join(PROJECT_ROOT, "logs"), exist_ok=True)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s")
-log = logging.getLogger("daily_pipeline")
+logger = logging.getLogger("daily_pipeline")
+logger.setLevel(logging.INFO)
+_fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s")
 
+_fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+_fh.setFormatter(_fmt)
+logger.addHandler(_fh)
 
-def phase_1_screening(dry_run: bool = False) -> bool:
-    log.info("=" * 80)
-    log.info("[PHASE 1/3] Live Universe Screening: Upbit Spot KRW <-> Binance/Bybit USDT Perps")
-    log.info("=" * 80)
-    cmd = [sys.executable, os.path.join(HERE, "screen_universe.py")]
-    if dry_run:
-        cmd.append("--dry-run")
-
-    try:
-        res = subprocess.run(cmd, cwd=PROJECT_ROOT, check=True)
-        return res.returncode == 0
-    except Exception as e:
-        log.error(f"[daily_pipeline] Screening failed: {e}")
-        return False
+_sh = logging.StreamHandler(sys.stdout)
+_sh.setFormatter(_fmt)
+logger.addHandler(_sh)
 
 
-def phase_2_evaluation(days_back: int = 7, min_events: int = 5, dry_run: bool = False) -> int:
-    log.info("=" * 80)
-    log.info(f"[PHASE 2/3] Quantitative Pool Evaluation (days_back={days_back}, min_events={min_events})")
-    log.info("=" * 80)
-    data_root = os.getenv("DATA_ROOT", os.path.join(PROJECT_ROOT, "data"))
-    psm = PoolStateManager()
-    psm.reload()
+def run_pipeline(
+    skip_screening: bool = False,
+    skip_evaluation: bool = False,
+    skip_calibration: bool = False,
+    skip_report: bool = False,
+    dry_run: bool = False,
+) -> bool:
+    t_start = time.time()
+    logger.info("================================================================================")
+    logger.info("  KOREAN SUNRISE: 24-HOUR MASTER AUTONOMOUS LIFECYCLE PIPELINE")
+    logger.info("================================================================================")
 
-    ev = SunriseEvaluator(
-        data_root=data_root,
-        days_back=days_back,
-        min_events=min_events,
-        pool_state=psm,
-    )
-    qualified = ev.run(dry_run=dry_run)
-    return len(qualified)
-
-
-def phase_3_summary() -> None:
-    log.info("=" * 80)
-    log.info("[PHASE 3/3] Daily Lifecycle Summary & Actionable Pairs")
-    log.info("=" * 80)
-    psm = PoolStateManager()
-    tpm = TradingProfileManager()
-    psm.reload()
-    tpm.reload()
-
-    snap = psm.get_pool_snapshot()
-    battle_coins = psm.get_battle_coins()
-    log.info(
-        f"Pipeline state: Incubator: {snap['summary']['incubator']} coins | "
-        f"Battle Pool: {snap['summary']['battle']} coins (Active: {snap['summary']['battle_active']})"
-    )
-
-    if battle_coins:
-        log.info("Active Battle coins ready for live execution:")
-        for c in battle_coins:
-            coin = c["coin"]
-            venues = c.get("venues", [])
-            depth = c.get("top3_depth_usd", 0.0)
-            sizes = []
-            for v in venues:
-                sz = tpm.calculate_stealth_order_size(v, depth)
-                if sz:
-                    sizes.append(f"{v}: ${sz:.1f}")
-            log.info(
-                f"  • {coin:<10} | Exp: {c.get('mean_net_pnl_bps', 0):>+6.2f} bps | "
-                f"PF: {c.get('profit_factor', 0):>4.2f} | Win: {c.get('win_rate_pct', 0):>4.1f}% | "
-                f"Sizes: [{' | '.join(sizes)}]"
-            )
+    # -------------------------------------------------------------------------
+    # PHASE 1: Universe Screening (1440 1m candles across 24h)
+    # -------------------------------------------------------------------------
+    if skip_screening:
+        logger.info("[PHASE 1/4] Universe Screening: SKIPPED (--skip-screening)")
     else:
-        log.info("No coins currently in Battle pool. Incubator is actively gathering signal telemetry.")
-    log.info("=" * 80)
+        logger.info("[PHASE 1/4] Universe Screening: Fetching 1440 1m candles across Upbit & 9 followers...")
+        cmd_scr = [
+            sys.executable,
+            os.path.join(PROJECT_ROOT, "tools", "screen_universe.py"),
+            "--kline-limit", "1440",
+            "--workers", "8",
+        ]
+        if not dry_run:
+            p = subprocess.run(cmd_scr, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if p.returncode != 0:
+                logger.error(f"[!] Phase 1 failed: {p.stderr}")
+            else:
+                logger.info("[OK] Phase 1 completed successfully.")
+
+    # -------------------------------------------------------------------------
+    # PHASE 2: Pool Evaluation & Promotion
+    # -------------------------------------------------------------------------
+    if skip_evaluation:
+        logger.info("[PHASE 2/4] Pool Evaluation: SKIPPED (--skip-evaluation)")
+    else:
+        logger.info("[PHASE 2/4] Pool Evaluation: Scoring recorded signals and promoting to Battle...")
+        from pipeline.evaluator import SunriseEvaluator
+        if not dry_run:
+            ev = SunriseEvaluator(data_root=os.path.join(PROJECT_ROOT, "data"))
+            promoted = ev.run()
+            logger.info(f"[OK] Phase 2 completed: {len(promoted)} coins promoted to Battle pool.")
+
+    # -------------------------------------------------------------------------
+    # PHASE 3: Spread Threshold Calibration
+    # -------------------------------------------------------------------------
+    if skip_calibration:
+        logger.info("[PHASE 3/4] Spread Calibration: SKIPPED (--skip-calibration)")
+    else:
+        logger.info("[PHASE 3/4] Spread Calibration: Sweeping thresholds [10..60 bps] per pair...")
+        cmd_cal = [
+            sys.executable,
+            os.path.join(PROJECT_ROOT, "tools", "calibrate_thresholds.py"),
+        ]
+        if not dry_run:
+            p = subprocess.run(cmd_cal, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if p.returncode != 0:
+                logger.error(f"[!] Phase 3 failed: {p.stderr}")
+            else:
+                logger.info("[OK] Phase 3 completed: matrix_thresholds.json updated.")
+
+    # -------------------------------------------------------------------------
+    # PHASE 4: Full Daily Report
+    # -------------------------------------------------------------------------
+    if skip_report:
+        logger.info("[PHASE 4/4] Daily Report: SKIPPED (--skip-report)")
+    else:
+        logger.info("[PHASE 4/4] Daily Report: Generating quantitative performance report...")
+        cmd_rep = [
+            sys.executable,
+            os.path.join(PROJECT_ROOT, "tools", "full_daily_report.py"),
+        ]
+        if not dry_run:
+            p = subprocess.run(cmd_rep, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if p.returncode != 0:
+                logger.error(f"[!] Phase 4 failed: {p.stderr}")
+            else:
+                logger.info("[OK] Phase 4 completed: report saved to reports/daily/.")
+
+    elapsed = time.time() - t_start
+    logger.info("================================================================================")
+    logger.info(f"  [ALL COMPLETE] Master pipeline finished in {elapsed:.2f}s.")
+    logger.info("================================================================================\n")
+    return True
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Korean Sunrise Autonomous Daily Pipeline")
-    parser.add_argument("--skip-screening", action="store_true", help="Skip REST screening of exchanges")
-    parser.add_argument("--days", type=int, default=7, help="Days of logs to scan for evaluation")
-    parser.add_argument("--min-events", type=int, default=5, help="Minimum events to qualify for Battle")
-    parser.add_argument("--dry-run", action="store_true", help="Dry run without updating state files")
+    parser = argparse.ArgumentParser(description="Master 24h Autonomous Daily Pipeline.")
+    parser.add_argument("--skip-screening", action="store_true", help="Skip universe screening")
+    parser.add_argument("--skip-evaluation", action="store_true", help="Skip pool evaluation")
+    parser.add_argument("--skip-calibration", action="store_true", help="Skip spread calibration")
+    parser.add_argument("--skip-report", action="store_true", help="Skip daily report")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate without writing")
     args = parser.parse_args()
 
-    t0 = time.time()
-    log.info("=== Starting Korean Sunrise Autonomous Daily Pipeline ===")
-
-    if not args.skip_screening:
-        ok = phase_1_screening(dry_run=args.dry_run)
-        if not ok:
-            log.warning("Screening phase encountered errors. Continuing with existing universe...")
-
-    qualified_count = phase_2_evaluation(days_back=args.days, min_events=args.min_events, dry_run=args.dry_run)
-
-    phase_3_summary()
-
-    elapsed = round(time.time() - t0, 1)
-    log.info(f"=== Daily Pipeline completed in {elapsed}s (Battle Qualified: {qualified_count}) ===")
+    run_pipeline(
+        skip_screening=args.skip_screening,
+        skip_evaluation=args.skip_evaluation,
+        skip_calibration=args.skip_calibration,
+        skip_report=args.skip_report,
+        dry_run=args.dry_run,
+    )
 
 
 if __name__ == "__main__":

@@ -5,8 +5,10 @@ and records full microstructural telemetry for post-trade analysis.
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 import time
 from collections import defaultdict, deque
 from dataclasses import asdict
@@ -164,6 +166,25 @@ class KoreanEngine:
             "signals_reversed": 0,
             "signals_timeout": 0,
         }
+
+        # Pair-specific calibrated execution thresholds
+        self.thresholds_file = os.path.join(C.PROJECT_ROOT, "matrix_thresholds.json")
+        self._thresholds: Dict[str, Any] = {}
+        self.reload_thresholds()
+
+    def reload_thresholds(self) -> None:
+        try:
+            if os.path.exists(self.thresholds_file):
+                with open(self.thresholds_file, "r", encoding="utf-8") as f:
+                    doc = json.load(f)
+                    self._thresholds = doc.get("thresholds", {})
+                log.info(f"[engine] Loaded {len(self._thresholds)} calibrated pair thresholds.")
+        except Exception as e:
+            log.warning(f"[engine] Failed to load {self.thresholds_file}: {e}")
+
+    def get_pair_threshold_config(self, coin: str, follower_ex: str) -> Dict[str, Any]:
+        pk = f"{coin.upper()}:upbit-{follower_ex.lower()}"
+        return self._thresholds.get(pk, {})
 
     def on_book_update(self, snap: OrderBookDepth5) -> None:
         now = time.time()
@@ -359,7 +380,13 @@ class KoreanEngine:
         gross_exec_edge_bps = f_ask_diff_bps - st.baseline_bps
         net_edge = gross_exec_edge_bps - self.taker_fee_bps
 
-        if net_edge < self.min_edge_bps:
+        # Check pair-specific calibrated threshold
+        pair_cfg = self.get_pair_threshold_config(coin, follower_ex)
+        if not pair_cfg.get("enabled", True):
+            return  # Pruned pair due to negative EV or high adverse flow
+
+        req_edge = float(pair_cfg.get("min_spread_bps", self.min_edge_bps))
+        if net_edge < req_edge:
             return
 
         if f_snap.spread_bps >= gross_exec_edge_bps * 0.8:

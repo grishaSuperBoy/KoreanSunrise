@@ -17,6 +17,13 @@ log = logging.getLogger("config")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 DATA_ROOT = os.getenv("DATA_ROOT", "data")
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# API Web Server & Dashboard
+API_SERVER_ENABLED = os.getenv("API_SERVER_ENABLED", "true").lower() in ("true", "1", "yes")
+API_SERVER_HOST = os.getenv("API_SERVER_HOST", "0.0.0.0")
+API_SERVER_PORT = int(os.getenv("API_SERVER_PORT", "8089"))
+API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "vitali_secret_key_2026")
 
 # Exclude heavy majors & stablecoins so we focus purely on alts / shitcoins.
 # (Can be overridden via env EXCLUDE_COINS="BTC,ETH,USDT,USDC")

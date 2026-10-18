@@ -17,6 +17,7 @@ from korean_engine import KoreanEngine
 from pipeline.pool_state import PoolStateManager
 from pipeline.profile import TradingProfileManager
 from stream_manager import StreamManager
+from web import APIServer
 
 LOG_FMT = "%(asctime)s | %(levelname)-7s | %(name)-14s | %(message)s"
 logging.basicConfig(level=getattr(logging, C.LOG_LEVEL.upper(), logging.INFO), format=LOG_FMT)
@@ -47,11 +48,21 @@ class KoreanSunriseService:
         )
         self.universe: Optional[C.MatchedUniverse] = None
         self.stream_manager: Optional[StreamManager] = None
+        self.api_server: Optional[APIServer] = None
+        if getattr(C, "API_SERVER_ENABLED", True):
+            self.api_server = APIServer(
+                service=self,
+                host=getattr(C, "API_SERVER_HOST", "0.0.0.0"),
+                port=getattr(C, "API_SERVER_PORT", 8089),
+                token=getattr(C, "API_AUTH_TOKEN", "vitali_secret_key_2026"),
+            )
         self.running = False
         self._shutdown_event = asyncio.Event()
 
     async def run(self) -> None:
         self.running = True
+        if self.api_server:
+            self.api_server.start()
         univ_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "universe_live.json")
 
         if os.path.exists(univ_file):
@@ -161,6 +172,8 @@ class KoreanSunriseService:
         log.info("Gracefully shutting down Korean Sunrise...")
         if self.stream_manager is not None:
             await self.stream_manager.stop_all()
+        if self.api_server is not None:
+            self.api_server.stop()
         self.writer.flush()
         log.info("Korean Sunrise stopped cleanly.")
 

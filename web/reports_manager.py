@@ -1,0 +1,112 @@
+"""
+web/reports_manager.py - Daily reports discovery, metadata extraction, and content serving for Korean Sunrise.
+"""
+from __future__ import annotations
+
+import datetime
+import glob
+import json
+import os
+import re
+from typing import Any, Dict, List, Optional
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(HERE)
+REPORTS_DIR = os.path.join(PROJECT_ROOT, "reports", "daily")
+
+
+def list_available_reports() -> List[Dict[str, Any]]:
+    """Discovers all archived daily reports and extracts card metrics."""
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    report_files = sorted(glob.glob(os.path.join(REPORTS_DIR, "report_*.md")), reverse=True)
+
+    cards = []
+    seen_dates = set()
+
+    for md_path in report_files:
+        bn = os.path.basename(md_path)
+        m = re.search(r"(\d{4}-?\d{2}-?\d{2})", bn)
+        date_raw = m.group(1) if m else "2026-10-18"
+        if len(date_raw) == 8 and "-" not in date_raw:
+            date_key = f"{date_raw[:4]}-{date_raw[4:6]}-{date_raw[6:]}"
+        else:
+            date_key = date_raw
+
+        if date_key in seen_dates:
+            continue
+        seen_dates.add(date_key)
+
+        json_path = os.path.join(REPORTS_DIR, f"report_{date_key}.json")
+        card = _build_card_from_files(date_key, md_path, json_path)
+        cards.append(card)
+
+    cards.sort(key=lambda x: x["date_key"], reverse=True)
+    return cards
+
+
+def _build_card_from_files(date_key: str, md_path: str, json_path: str) -> Dict[str, Any]:
+    """Extracts summary metrics from JSON if available, or provides sensible defaults."""
+    card = {
+        "id": date_key,
+        "date_key": date_key,
+        "title": f"Суточный квантовый отчёт: {date_key}",
+        "date_from": f"{date_key} 00:00:00 UTC",
+        "date_to": f"{date_key} 23:59:59 UTC",
+        "filename_md": os.path.basename(md_path),
+        "filepath_md": md_path,
+        "has_json": os.path.exists(json_path),
+        "net_pnl_usd": 0.0,
+        "winrate_pct": 0.0,
+        "total_trades": 0,
+        "total_rows": 0,
+        "total_mb": 0.0,
+        "venues_breakdown": [],
+        "strategies_breakdown": [
+            {"name": "1. Upbit Depth Drain", "winrate": 0.0, "net": 0.0},
+            {"name": "2. Spread Blowout Sniping", "winrate": 0.0, "net": 0.0},
+            {"name": "3. Calibrated Spread Filter", "winrate": 0.0, "net": 0.0},
+        ],
+    }
+
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as jf:
+                data = json.load(jf)
+            meta = data.get("metadata", {})
+            sc = data.get("pnl_scenarios", {})
+            p_all = sc.get("calibrated_threshold_only") or sc.get("all_signals") or {}
+
+            card["total_trades"] = p_all.get("trades", 0)
+            card["net_pnl_usd"] = p_all.get("net_pnl_usd", 0.0)
+            card["winrate_pct"] = p_all.get("winrate_pct", 0.0)
+            card["total_rows"] = meta.get("total_signals_recorded", 0)
+            card["total_mb"] = meta.get("total_size_mb", 0.0)
+
+            # Top pairs
+            top_pairs = data.get("top_pairs", [])
+            card["venues_breakdown"] = [
+                {
+                    "pair": pr["pair"].replace("upbit-", "Upbit <-> "),
+                    "trades": pr["trades"],
+                    "net": pr["net_pnl_usd"],
+                    "winrate": pr["winrate_pct"],
+                }
+                for pr in top_pairs[:8]
+            ]
+        except Exception:
+            pass
+
+    return card
+
+
+def get_report_content(report_id: str) -> Optional[str]:
+    """Reads Markdown content of a specific report by date key."""
+    fn = f"report_{report_id}.md"
+    fp = os.path.join(REPORTS_DIR, fn)
+    if os.path.exists(fp):
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            return None
+    return None

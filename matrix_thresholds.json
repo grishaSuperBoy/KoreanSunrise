@@ -1,0 +1,2172 @@
+{
+  "metadata": {
+    "generated_at": "2026-10-18T14:09:54.010303+00:00",
+    "days_analyzed": 7.0,
+    "order_size_usd": 10.0,
+    "roundtrip_fee_bps": 10.0,
+    "min_trades_guard": 5,
+    "min_winrate_guard": 0.7,
+    "global_fallback_bps": 20.0,
+    "total_files_scanned": 0,
+    "total_signals_evaluated": 0,
+    "total_pairs_configured": 269,
+    "classifications": {
+      "default_baseline": 269
+    },
+    "elapsed_sec": 0.01
+  },
+  "thresholds": {
+    "VVV:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "VVV:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "VVV:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "VVV:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "VVV:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "VVV:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "VVV:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "VVV:upbit-pionex": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "LIT:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "LIT:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "LIT:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "LIT:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "LIT:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "LIT:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "LIT:upbit-pionex": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ICP:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ICP:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ICP:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ICP:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ICP:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ICP:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ICP:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ICP:upbit-pionex": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ETHFI:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ETHFI:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ETHFI:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ETHFI:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ETHFI:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ETHFI:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ETHFI:upbit-pionex": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "RAY:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "RAY:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "RAY:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "RAY:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "RAY:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "RAY:upbit-pionex": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PROM:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PROM:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PROM:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PROM:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PROM:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "AXL:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "AXL:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "AXL:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "AXL:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "AXL:upbit-pionex": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "TRUMP:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "TRUMP:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "TRUMP:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "WLD:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "WLD:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "WLD:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "WLD:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "WLD:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "WLD:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "WLD:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "WLD:upbit-htx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "WLD:upbit-pionex": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ELSA:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ELSA:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ELSA:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ELSA:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ELSA:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ELSA:upbit-pionex": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SPX:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SPX:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SPX:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SPX:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SPX:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SPX:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SPX:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SPX:upbit-pionex": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SOMI:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SOMI:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SOMI:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SOMI:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "GRT:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "GRT:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "GRT:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "GRT:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "EUL:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZRO:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZRO:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZRO:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZRO:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZRO:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZRO:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZRO:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZRO:upbit-pionex": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZORA:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZORA:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZORA:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZORA:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZORA:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZORA:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "CAP:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "CAP:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "CAP:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "CAP:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "CAP:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "CAP:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "CAP:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PIEVERSE:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PIEVERSE:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PIEVERSE:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PIEVERSE:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PIEVERSE:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PIEVERSE:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PIEVERSE:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "WCT:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "WCT:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "WCT:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "WCT:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "WCT:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PROS:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PROS:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ENSO:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ENSO:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ENSO:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ENSO:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ENSO:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BREV:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BREV:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BREV:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BREV:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BREV:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ESP:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ESP:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "NEAR:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "NEAR:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "NEAR:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "NEAR:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "NEAR:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "NEAR:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "NEAR:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "NEAR:upbit-htx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "NEAR:upbit-pionex": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "VET:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "VET:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "VET:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "VET:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "VET:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "KMNO:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "KMNO:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "KMNO:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "KMNO:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "KMNO:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "GTC:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "GTC:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "B3:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "B3:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "CYBER:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "CYBER:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "CYBER:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "CYBER:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "HYPER:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "HYPER:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "HYPER:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SENT:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "AWE:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "AWE:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "AWE:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "AWE:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZKC:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZKC:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZKC:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZKC:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZKP:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZKP:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZKP:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZKP:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZKP:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ZKP:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "NEO:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "NEO:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "NEO:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "NEO:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "IO:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "IO:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "IO:upbit-pionex": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "INJ:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "INJ:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "INJ:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "INJ:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "INJ:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "INJ:upbit-pionex": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SKR:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SKR:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SKR:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SKR:upbit-pionex": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "CARV:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "CARV:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "CARV:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "CARV:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ERA:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ERA:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ERA:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ERA:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ERA:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SEI:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SEI:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SEI:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SEI:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SEI:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "SEI:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ARX:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "MMT:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "MNT:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "MNT:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PONS:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PONS:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PONS:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "API3:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "API3:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ENS:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ENS:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ENS:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ENS:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "IOTA:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "IOTA:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "O:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "O:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "O:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "O:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "O:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BCH:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BCH:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BCH:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BCH:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BCH:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BEAM:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BAT:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BAT:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BAT:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BAT:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BAT:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BAT:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BAT:upbit-pionex": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PUMP:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PUMP:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "PUMP:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "DOS:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "DOS:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "DOS:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "RENDER:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "RENDER:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "APT:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "APT:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "APT:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "APT:upbit-gateio": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "APT:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "APT:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "APT:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "APT:upbit-pionex": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "2Z:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "F:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BIO:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BIO:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BIO:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BIO:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "NMR:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "MANA:upbit-kucoin": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "VTHO:upbit-binance": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "VTHO:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "MOODENG:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ATOM:upbit-bybit": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ATOM:upbit-mexc": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "ATOM:upbit-bingx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    },
+    "BIGTIME:upbit-okx": {
+      "min_spread_bps": 20.0,
+      "expected_winrate": 0.85,
+      "expected_net_bps": 22.0,
+      "sample_trades": 0,
+      "status": "default_baseline",
+      "enabled": true
+    }
+  }
+}
