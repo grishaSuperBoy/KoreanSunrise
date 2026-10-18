@@ -1,66 +1,8 @@
-# KoreanSunrise — Full Codebase Snapshot
-
-## Table of Contents
-
-- [README.md](#readme-md)
-- [batch_writer.py](#batch_writer-py)
-- [config.py](#config-py)
-- [docs/explanations.md](#docs-explanations-md)
-- [korean_engine.py](#korean_engine-py)
-- [logs/.gitkeep](#logs--gitkeep)
-- [main.py](#main-py)
-- [matrix_thresholds.json](#matrix_thresholds-json)
-- [models.py](#models-py)
-- [pipeline/__init__.py](#pipeline-__init__-py)
-- [pipeline/evaluator.py](#pipeline-evaluator-py)
-- [pipeline/pool_state.py](#pipeline-pool_state-py)
-- [pipeline/profile.py](#pipeline-profile-py)
-- [reports/daily/report_2026-10-18.json](#reports-daily-report_2026-10-18-json)
-- [reports/daily/report_2026-10-18.md](#reports-daily-report_2026-10-18-md)
-- [requirements.txt](#requirements-txt)
-- [runtime_overrides.json](#runtime_overrides-json)
-- [screening/__init__.py](#screening-__init__-py)
-- [screening/metrics.py](#screening-metrics-py)
-- [screening/screener.py](#screening-screener-py)
-- [scripts/cron_daily.sh](#scripts-cron_daily-sh)
-- [scripts/daily-pipeline.service](#scripts-daily-pipeline-service)
-- [scripts/daily-pipeline.timer](#scripts-daily-pipeline-timer)
-- [scripts/korean-sunrise.service](#scripts-korean-sunrise-service)
-- [tests/test_pipeline_e2e.py](#tests-test_pipeline_e2e-py)
-- [tools/__init__.py](#tools-__init__-py)
-- [tools/analyze_signals.py](#tools-analyze_signals-py)
-- [tools/audit_venues.py](#tools-audit_venues-py)
-- [tools/calibrate_thresholds.py](#tools-calibrate_thresholds-py)
-- [tools/full_daily_report.py](#tools-full_daily_report-py)
-- [tools/manage_pool.py](#tools-manage_pool-py)
-- [tools/run_daily_pipeline.py](#tools-run_daily_pipeline-py)
-- [tools/screen_universe.py](#tools-screen_universe-py)
-- [tools/validate_data.py](#tools-validate_data-py)
-- [trading_profile.json](#trading_profile-json)
-- [universe_live.json](#universe_live-json)
-- [venues/__init__.py](#venues-__init__-py)
-- [venues/base.py](#venues-base-py)
-- [venues/binance.py](#venues-binance-py)
-- [venues/bingx.py](#venues-bingx-py)
-- [venues/bybit.py](#venues-bybit-py)
-- [venues/gateio.py](#venues-gateio-py)
-- [venues/htx.py](#venues-htx-py)
-- [venues/kucoin.py](#venues-kucoin-py)
-- [venues/manager.py](#venues-manager-py)
-- [venues/mexc.py](#venues-mexc-py)
-- [venues/okx.py](#venues-okx-py)
-- [venues/pionex.py](#venues-pionex-py)
-- [venues/upbit.py](#venues-upbit-py)
-- [web/__init__.py](#web-__init__-py)
-- [web/reports_manager.py](#web-reports_manager-py)
-- [web/server.py](#web-server-py)
-- [web/views.py](#web-views-py)
-
----
+# Full Codebase: KoreanSunrise
 
 ## README.md
 
-````markdown
+```md
 # Korean Sunrise 🌅
 
 **High-Frequency Spot Lead-Lag & Momentum Sniping System**
@@ -182,26 +124,25 @@ python tools/run_daily_pipeline.py
 # Анализ собранных сигналов и построение кривых маркаута
 python tools/analyze_signals.py
 ```
-
-````
+```
 
 ## batch_writer.py
 
 ```python
 """
-batch_writer.py - Atomic compressed disk writer for Korean Sunrise signals.
+batch_writer.py - Non-blocking compressed disk writer for Korean Sunrise signals.
+Buffers raw JSON lines in RAM and compresses via gzip in batches upon flush.
 """
 from __future__ import annotations
 
 import gzip
-import io
 import json
 import logging
 import os
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 log = logging.getLogger("writer")
 
@@ -211,46 +152,54 @@ def _utc_day() -> str:
 
 
 class BatchWriter:
-    """Buffers signals in RAM (gzipped) and writes sequentially to disk."""
+    """Buffers signals in RAM (as raw lines) and writes compressed sequentially to disk."""
 
     def __init__(self, data_root: str = "data", flush_interval_sec: float = 5.0):
         self.data_root = data_root
         self.flush_interval_sec = flush_interval_sec
-        self.buf = io.BytesIO()
-        self.gz = gzip.GzipFile(fileobj=self.buf, mode="wb", compresslevel=6)
-        self.rows_count = 0
+        self._lines: List[str] = []
         self.total_written = 0
         self._flush_seq = 0
         self._lock = threading.Lock()
         self._last_flush = time.time()
         os.makedirs(os.path.join(self.data_root, "signals"), exist_ok=True)
 
+    @property
+    def rows_count(self) -> int:
+        with self._lock:
+            return len(self._lines)
+
     def add(self, signal_dict: Dict[str, Any]) -> None:
+        """Non-blocking in-memory append of signal line."""
         try:
             line = json.dumps(signal_dict, default=str) + "\n"
-            encoded = line.encode("utf-8")
             with self._lock:
-                self.gz.write(encoded)
-                self.rows_count += 1
+                self._lines.append(line)
         except Exception as e:
             log.error(f"[writer] Failed to buffer signal: {e}")
 
     def maybe_flush(self, now: float = 0.0) -> None:
         now = now or time.time()
-        if now - self._last_flush >= self.flush_interval_sec and self.rows_count > 0:
+        with self._lock:
+            need_flush = (now - self._last_flush >= self.flush_interval_sec) and bool(self._lines)
+        if need_flush:
             self.flush()
 
     def flush(self) -> None:
+        """Compresses all buffered lines in a single batch and writes atomically to disk."""
         with self._lock:
-            if self.rows_count == 0:
+            if not self._lines:
                 return
-
-            batch_rows = self.rows_count
+            batch_lines = self._lines
+            self._lines = []
+            self._last_flush = time.time()
             self._flush_seq += 1
             seq = self._flush_seq
 
-            self.gz.close()
-            compressed_data = self.buf.getvalue()
+        batch_rows = len(batch_lines)
+        try:
+            raw_bytes = "".join(batch_lines).encode("utf-8")
+            compressed_data = gzip.compress(raw_bytes, compresslevel=6)
 
             day = _utc_day()
             target_dir = os.path.join(self.data_root, "signals", day)
@@ -261,22 +210,19 @@ class BatchWriter:
             tmp_path = os.path.join(target_dir, f"{filename}.tmp")
             final_path = os.path.join(target_dir, filename)
 
-            try:
-                with open(tmp_path, "wb") as f:
-                    f.write(compressed_data)
-                os.replace(tmp_path, final_path)
+            with open(tmp_path, "wb") as f:
+                f.write(compressed_data)
+            os.replace(tmp_path, final_path)
+            with self._lock:
                 self.total_written += batch_rows
-                log.info(
-                    f"[writer] Flushed {batch_rows} signals to {filename} "
-                    f"({len(compressed_data)} bytes)"
-                )
-            except Exception as e:
-                log.error(f"[writer] Flush error: {e}")
-            finally:
-                self.buf = io.BytesIO()
-                self.gz = gzip.GzipFile(fileobj=self.buf, mode="wb", compresslevel=6)
-                self.rows_count = 0
-                self._last_flush = time.time()
+            log.info(
+                f"[writer] Flushed {batch_rows} signals to {filename} "
+                f"({len(compressed_data)} bytes)"
+            )
+        except Exception as e:
+            with self._lock:
+                self._lines = batch_lines + self._lines  # Rollback lines to buffer on failure
+            log.error(f"[writer] Flush error: {e}")
 ```
 
 ## config.py
@@ -488,7 +434,7 @@ def discover_universe() -> MatchedUniverse:
 
 ## docs/explanations.md
 
-````markdown
+```md
 # Korean Sunrise — Аналитические заметки и дорожная карта боевого исполнения
 
 ## 1. Телеметрия сигналов и отсев токсичных монет
@@ -519,8 +465,7 @@ def discover_universe() -> MatchedUniverse:
 - Эмуляция исполнения по реальному `best_ask` в момент сигнала.
 - Расчет честного PnL по ходу движения стакана фолловера.
 - Проверка Realized PnL с учетом реальных проскальзываний на потоке данных.
-
-````
+```
 
 ## korean_engine.py
 
@@ -610,7 +555,7 @@ class PairState:
         # slow down baseline adaptation by 20x so the baseline doesn't chase the pump.
         cur_sig = self.sigma(now)
         is_spike = self.is_warmed_up and abs(deviation) > (self.spike_sigma * cur_sig)
-        eff_tau = BASELINE_TAU * 20.0 if is_spike else BASELINE_TAU
+        eff_tau = 10.0 if not self.is_warmed_up else (BASELINE_TAU * 20.0 if is_spike else BASELINE_TAU)
 
         a = 1.0 - math.exp(-dt / eff_tau) if eff_tau > 0 else 0.001
         self.baseline_bps += a * deviation
@@ -730,7 +675,22 @@ class KoreanEngine:
     def maybe_reload_thresholds(self, now: float) -> None:
         if now - self._last_thresh_check >= 30.0:
             self._last_thresh_check = now
-            self.reload_thresholds()
+            try:
+                self.reload_thresholds()
+            except Exception as e:
+                log.warning(f"[engine] Error reloading thresholds: {e}")
+
+            if self.pool_state is not None and hasattr(self.pool_state, "reload"):
+                try:
+                    self.pool_state.reload()
+                except Exception as e:
+                    log.warning(f"[engine] Error reloading pool_state: {e}")
+
+            if self.profile_manager is not None and hasattr(self.profile_manager, "reload"):
+                try:
+                    self.profile_manager.reload()
+                except Exception as e:
+                    log.warning(f"[engine] Error reloading profile_manager: {e}")
 
     def get_pair_threshold_config(self, coin: str, follower_ex: str) -> Dict[str, Any]:
         pk = f"{coin.upper()}:upbit-{follower_ex.lower()}"
@@ -749,6 +709,7 @@ class KoreanEngine:
 
     def on_book_update(self, snap: OrderBookDepth5) -> None:
         now = time.time()
+        self.maybe_reload_thresholds(now)
         ex = snap.exchange.lower()
         coin = snap.symbol.upper()
         key = (ex, coin)
@@ -769,7 +730,8 @@ class KoreanEngine:
                 st = self._get_or_create_pair_state(coin, ex)
                 if upbit_snap.mid_price > 0 and snap.mid_price > 0:
                     raw_diff_bps = (upbit_snap.mid_price - snap.mid_price) / snap.mid_price * 1e4
-                    st.learn(raw_diff_bps, now)
+                    if st.open_signal is None:
+                        st.learn(raw_diff_bps, now)
 
             self._track_follower_move(coin, ex, snap, now)
 
@@ -894,7 +856,8 @@ class KoreanEngine:
                     now=now,
                 )
 
-            st.learn(raw_diff_bps, now)
+            if st.open_signal is None:
+                st.learn(raw_diff_bps, now)
 
     def _check_entry(
         self,
@@ -1098,10 +1061,10 @@ class KoreanEngine:
 
             # Closure evaluation:
             hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
-            if f_mid_move >= (sig.net_exec_edge_bps * 0.8):
+            if f_exec_move >= (sig.net_exec_edge_bps * 0.8):
                 self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
             elif rem_edge <= 0.0:
-                if f_mid_move >= (sig.net_exec_edge_bps * 0.35) and f_mid_move > 0:
+                if cur_net_pnl > 0.0:
                     self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
                 else:
                     self._close_signal(sig, now, "reversed", f_mid_move, f_exec_move)
@@ -1135,11 +1098,14 @@ class KoreanEngine:
 
         pair_key = (sig.coin, sig.follower_exchange)
         st = self._pairs.get(pair_key)
-        if st and st.open_signal == sig:
+        if st and st.open_signal is not None and getattr(st.open_signal, "id", None) == sig.id:
             st.open_signal = None
 
-        if sig.coin in self._active_signals and sig in self._active_signals[sig.coin]:
-            self._active_signals[sig.coin].remove(sig)
+        if sig.coin in self._active_signals:
+            if sig in self._active_signals[sig.coin]:
+                self._active_signals[sig.coin].remove(sig)
+            if not self._active_signals[sig.coin]:
+                self._active_signals.pop(sig.coin, None)
 
     def sweep_timeouts(self, now: float) -> None:
         """
@@ -1159,13 +1125,6 @@ class KoreanEngine:
                         f_mid_move = 0.0
                         f_exec_move = 0.0
                     self._close_signal(sig, now, "timeout", f_mid_move, f_exec_move)
-```
-
-## logs/.gitkeep
-
-```
-# Keep logs directory in git
-
 ```
 
 ## main.py
@@ -1273,25 +1232,21 @@ class KoreanSunriseService:
                 self.universe = None
 
         if self.universe is None or not self.universe.coins:
-            log.info("=== Discovering overlapping Upbit KRW alts & Binance/Bybit Perps ===")
-            self.universe = await asyncio.to_thread(C.discover_universe)
-            try:
-                doc = {
-                    "_meta": {
-                        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "updated_ts": round(time.time(), 3),
-                        "coins_count": len(self.universe.coins),
-                    },
-                    "coins": self.universe.coins,
-                    "upbit_krw_to_coin": self.universe.upbit_krw_to_coin,
-                    "binance_sym_map": self.universe.binance_sym_map,
-                    "bybit_sym_map": self.universe.bybit_sym_map,
-                }
-                with open(univ_file + ".tmp", "w", encoding="utf-8") as f:
-                    json.dump(doc, f, indent=2, ensure_ascii=False)
-                os.replace(univ_file + ".tmp", univ_file)
-            except Exception as e:
-                log.warning(f"Could not persist universe_live.json: {e}")
+            log.info("=== universe_live.json not found or empty: Running multi-venue UniverseScreener ===")
+            from screening.screener import UniverseScreener
+            screener = UniverseScreener(output_file=univ_file)
+            doc = await asyncio.to_thread(screener.run)
+            coins = doc.get("coins", [])
+            upbit_krw_to_coin = doc.get("upbit_krw_to_coin", {})
+            binance_sym_map = {k: tuple(v) for k, v in doc.get("binance_sym_map", {}).items()}
+            bybit_sym_map = {k: tuple(v) for k, v in doc.get("bybit_sym_map", {}).items()}
+            self.universe = C.MatchedUniverse(
+                coins=coins,
+                upbit_krw_to_coin=upbit_krw_to_coin,
+                binance_sym_map=binance_sym_map,
+                bybit_sym_map=bybit_sym_map,
+            )
+            self.universe._raw_doc = doc
 
         self.pool_state.reload()
 
@@ -1313,7 +1268,7 @@ class KoreanSunriseService:
             while not self._shutdown_event.is_set():
                 now = time.time()
                 self.engine.sweep_timeouts(now)
-                self.writer.maybe_flush(now)
+                await asyncio.to_thread(self.writer.maybe_flush, now)
 
                 if now - last_heartbeat >= 15.0:
                     self._log_heartbeat()
@@ -1363,7 +1318,7 @@ class KoreanSunriseService:
             await self.stream_manager.stop_all()
         if self.api_server is not None:
             self.api_server.stop()
-        self.writer.flush()
+        await asyncio.to_thread(self.writer.flush)
         log.info("Korean Sunrise stopped cleanly.")
 
 
@@ -4564,7 +4519,6 @@ __all__ = [
     "SunriseEvaluator",
     "TradingProfileManager",
 ]
-
 ```
 
 ## pipeline/evaluator.py
@@ -4814,7 +4768,6 @@ class SunriseEvaluator:
             self.pool.promote_to_battle(qualified)
 
         return qualified
-
 ```
 
 ## pipeline/pool_state.py
@@ -4986,15 +4939,28 @@ class PoolStateManager:
         self._overrides: Dict[str, Any] = {}
         self._universe_raw: Dict[str, Any] = {}
         self._last_reload: float = 0.0
+        self._mtimes: Dict[str, float] = {}
 
-    def reload(self) -> None:
+    def reload(self, force: bool = False) -> None:
         """Reloads all JSON configuration files and merges state atomically."""
         with self._lock:
+            current_mtimes = {}
+            for path in (self._universe_file, self._battle_pool_file, self._overrides_file):
+                if os.path.exists(path):
+                    try:
+                        current_mtimes[path] = os.path.getmtime(path)
+                    except OSError:
+                        pass
+            if not force and current_mtimes and current_mtimes == self._mtimes:
+                return
+
+            self._coins = {}
             self._overrides = _read_json(self._overrides_file, default={})
             self._load_incubator()
             self._load_battle_pool()
             self._apply_overrides()
             self._last_reload = time.time()
+            self._mtimes = current_mtimes
             log.info(
                 f"[pool_state] Reloaded: {self._count_basket('incubator')} incubator, "
                 f"{self._count_basket('battle')} battle "
@@ -5074,6 +5040,11 @@ class PoolStateManager:
             overrides["paused_coins"] = paused
             _write_json_atomic(self._overrides_file, overrides)
             self._overrides = overrides
+            if os.path.exists(self._overrides_file):
+                try:
+                    self._mtimes[self._overrides_file] = os.path.getmtime(self._overrides_file)
+                except OSError:
+                    pass
             log.info(f"[pool_state] Paused coin: {coin} (reason={reason})")
             return True
 
@@ -5091,6 +5062,11 @@ class PoolStateManager:
             overrides["paused_coins"] = paused
             _write_json_atomic(self._overrides_file, overrides)
             self._overrides = overrides
+            if os.path.exists(self._overrides_file):
+                try:
+                    self._mtimes[self._overrides_file] = os.path.getmtime(self._overrides_file)
+                except OSError:
+                    pass
             log.info(f"[pool_state] Resumed coin: {coin}")
             return True
 
@@ -5138,13 +5114,19 @@ class PoolStateManager:
             return True
 
     def demote_to_incubator(self, coin: str, reason: str = "manual_demote") -> bool:
-        """Demotes a single coin from Battle back to Incubator."""
+        """Demotes a single coin from Battle back to Incubator, resetting battle metrics."""
         with self._lock:
             coin = coin.upper()
             entry = self._coins.get(coin)
             if not entry:
                 return False
             entry.basket = "incubator"
+            entry.mean_net_pnl_bps = 0.0
+            entry.median_net_pnl_bps = 0.0
+            entry.win_rate_pct = 0.0
+            entry.profit_factor = 0.0
+            entry.promoted_at = 0.0
+            entry.event_count = 0
             self._persist_battle_pool()
             log.info(f"[pool_state] Demoted {coin} to Incubator (reason={reason})")
             return True
@@ -5155,6 +5137,12 @@ class PoolStateManager:
         quantitative performance. Demotes degraded coins back to Incubator.
         """
         with self._lock:
+            self._overrides = _read_json(self._overrides_file, default={})
+            if os.path.exists(self._overrides_file):
+                try:
+                    self._mtimes[self._overrides_file] = os.path.getmtime(self._overrides_file)
+                except OSError:
+                    pass
             overrides = self._overrides
             qualified_coins: Set[str] = set()
 
@@ -5177,16 +5165,19 @@ class PoolStateManager:
                 entry.event_count = int(stat.get("event_count", 0))
                 entry.promoted_at = time.time()
 
-                if coin not in overrides.get("paused_coins", {}):
-                    entry.enabled = True
-                    entry.pause_reason = None
-
             # Demote battle coins that failed qualification this cycle
             for coin, entry in self._coins.items():
                 if entry.basket == "battle" and coin not in qualified_coins:
                     entry.basket = "incubator"
+                    entry.mean_net_pnl_bps = 0.0
+                    entry.median_net_pnl_bps = 0.0
+                    entry.win_rate_pct = 0.0
+                    entry.profit_factor = 0.0
+                    entry.promoted_at = 0.0
+                    entry.event_count = 0
                     log.info(f"[pool_state] Demoted {coin} from Battle -> Incubator (failed criteria)")
 
+            self._apply_overrides()
             self._persist_battle_pool()
             log.info(
                 f"[pool_state] Updated Battle pool: {len(qualified_coins)} coins qualified. "
@@ -5257,7 +5248,7 @@ class PoolStateManager:
                 entry.enabled = False
                 info = paused[coin]
                 entry.pause_reason = info.get("reason", "manual") if isinstance(info, dict) else str(info)
-            elif entry.pause_reason == "manual":
+            else:
                 entry.enabled = True
                 entry.pause_reason = None
 
@@ -5276,10 +5267,14 @@ class PoolStateManager:
             },
         }
         _write_json_atomic(self._battle_pool_file, doc)
+        if os.path.exists(self._battle_pool_file):
+            try:
+                self._mtimes[self._battle_pool_file] = os.path.getmtime(self._battle_pool_file)
+            except OSError:
+                pass
 
     def _count_basket(self, basket: str) -> int:
         return sum(1 for e in self._coins.values() if e.basket == basket)
-
 ```
 
 ## pipeline/profile.py
@@ -5377,15 +5372,29 @@ class TradingProfileManager:
         self.profile_file = profile_file
         self._lock = threading.RLock()
         self._profile: Dict[str, Any] = {}
-        self.reload()
+        self._file_mtime: float = 0.0
+        self.reload(force=True)
 
-    def reload(self) -> None:
+    def reload(self, force: bool = False) -> None:
         with self._lock:
+            if os.path.exists(self.profile_file):
+                try:
+                    mtime = os.path.getmtime(self.profile_file)
+                    if not force and mtime == self._file_mtime:
+                        return
+                    self._file_mtime = mtime
+                except OSError:
+                    pass
             data = _read_json(self.profile_file)
             if not data:
                 log.info(f"[profile] Initializing default trading profile at {self.profile_file}")
                 data = json.loads(json.dumps(DEFAULT_PROFILE))
                 _write_json_atomic(self.profile_file, data)
+                if os.path.exists(self.profile_file):
+                    try:
+                        self._file_mtime = os.path.getmtime(self.profile_file)
+                    except OSError:
+                        pass
             self._profile = data
 
     def get_profile(self) -> Dict[str, Any]:
@@ -5403,6 +5412,11 @@ class TradingProfileManager:
 
             _merge(self._profile, updates)
             _write_json_atomic(self.profile_file, self._profile)
+            if os.path.exists(self.profile_file):
+                try:
+                    self._file_mtime = os.path.getmtime(self.profile_file)
+                except OSError:
+                    pass
             return self.get_profile()
 
     def set_venue_capital(self, venue: str, capital_usd: float) -> None:
@@ -5411,12 +5425,22 @@ class TradingProfileManager:
             caps = self._profile.setdefault("capital", {}).setdefault("per_venue_usd", {})
             caps[venue] = max(0.0, float(capital_usd))
             _write_json_atomic(self.profile_file, self._profile)
+            if os.path.exists(self.profile_file):
+                try:
+                    self._file_mtime = os.path.getmtime(self.profile_file)
+                except OSError:
+                    pass
             log.info(f"[profile] Updated capital for {venue}: ${capital_usd:.2f}")
 
     def set_max_slots(self, slots: int) -> None:
         with self._lock:
             self._profile["max_active_slots"] = max(1, int(slots))
             _write_json_atomic(self.profile_file, self._profile)
+            if os.path.exists(self.profile_file):
+                try:
+                    self._file_mtime = os.path.getmtime(self.profile_file)
+                except OSError:
+                    pass
             log.info(f"[profile] Updated max_active_slots: {slots}")
 
     def is_venue_active(self, venue: str) -> bool:
@@ -5463,7 +5487,6 @@ class TradingProfileManager:
                 return None
 
             return round(size, 2)
-
 ```
 
 ## reports/daily/report_2026-10-18.json
@@ -5577,7 +5600,7 @@ class TradingProfileManager:
 
 ## reports/daily/report_2026-10-18.md
 
-````markdown
+```md
 # Korean Sunrise: Суточный Квантовый Отчёт (2026-10-18)
 *Сгенерирован:* `2026-10-18T14:09:54.306603+00:00` | *Окно:* `1.0 d` | *Размер слота:* `$10.0` | *Комиссия:* `10.0 bps`
 
@@ -5619,14 +5642,6 @@ class TradingProfileManager:
 | Монета | Сделок | Win Rate | Net PnL USD | Ср. MFE (bps) | Медиана $T_{peak}$ |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | *Нет накопленных данных по монетам* | - | - | - | - | - |
-````
-
-## requirements.txt
-
-```text
-websockets>=12.0
-aiohttp>=3.9.0
-
 ```
 
 ## runtime_overrides.json
@@ -5649,7 +5664,6 @@ from screening.metrics import evaluate_pair_klines
 from screening.screener import UniverseScreener
 
 __all__ = ["evaluate_pair_klines", "UniverseScreener"]
-
 ```
 
 ## screening/metrics.py
@@ -5771,7 +5785,6 @@ def evaluate_pair_klines(
         "p90_dev_bps": round(p90_dev_bps, 1),
         "passed": passed,
     }
-
 ```
 
 ## screening/screener.py
@@ -5818,7 +5831,7 @@ DEFAULT_MAX_PRICE_DIFF_PCT = 15.0       # Max 15% price diff (eliminates namesak
 DEFAULT_MIN_CORR = 0.65                 # Min correlation of minute log-returns
 DEFAULT_MIN_BOTH_TRADE = 0.15           # Min 15% of minutes traded on both sides
 DEFAULT_MIN_DEV_BPS = 8.0               # Min 8.0 bps P90 spread volatility
-DEFAULT_KLINE_LIMIT = 1440             # 1440 1-minute candles (24 hours = 1 day)
+DEFAULT_KLINE_LIMIT = 200               # 200 1-minute candles (~3.3h, uniform across all 10 CEXs without rate-limit pagination)
 
 CLIENT_FACTORIES: Dict[str, Any] = {
     "binance": BinanceRestClient,
@@ -5905,12 +5918,15 @@ class UniverseScreener:
         up_ticks = self.upbit.fetch_tickers_24h(list(up_mkts.values()), usdt_krw_rate)
         log.info(f"[Stage 1/2] Upbit 24h tickers fetched: {len(up_ticks)}")
 
-        # Build reverse base map for each venue: canonical_base -> (raw_sym, mult)
-        venue_base_maps: Dict[str, Dict[str, Tuple[str, float]]] = {}
+        # Build reverse base map for each venue: canonical_base -> (raw_sym, mult, c_size)
+        venue_base_maps: Dict[str, Dict[str, Tuple[str, float, float]]] = {}
         for v, perps in venue_perps.items():
-            b_map: Dict[str, Tuple[str, float]] = {}
-            for raw, (base, mult) in perps.items():
-                b_map[base] = (raw, mult)
+            b_map: Dict[str, Tuple[str, float, float]] = {}
+            for raw, val in perps.items():
+                base = val[0]
+                mult = float(val[1]) if len(val) > 1 else 1.0
+                c_size = float(val[2]) if len(val) > 2 else 1.0
+                b_map[base] = (raw, mult, c_size)
             venue_base_maps[v] = b_map
 
         # Stage 1 Matching and Fast Volume + Namesake Price Sanity Filter
@@ -5933,7 +5949,7 @@ class UniverseScreener:
                 rejected_volume += 1
                 continue
 
-            matched_venues_meta: Dict[str, Tuple[str, float, float, float]] = {}
+            matched_venues_meta: Dict[str, Tuple[str, float, float, float, float]] = {}
 
             for v in self.target_venues:
                 b_map = venue_base_maps.get(v, {})
@@ -5944,7 +5960,7 @@ class UniverseScreener:
                 if not matched:
                     continue
 
-                raw_sym, mult = matched
+                raw_sym, mult, c_size = matched
                 t_info = venue_ticks.get(v, {}).get(raw_sym)
                 if not t_info:
                     continue
@@ -5957,7 +5973,7 @@ class UniverseScreener:
 
                 diff_pct = abs(up_px - px_v) / max(up_px, px_v) * 100.0
                 if diff_pct <= self.max_price_diff_pct:
-                    matched_venues_meta[v] = (raw_sym, mult, px_v, vol_v)
+                    matched_venues_meta[v] = (raw_sym, mult, px_v, vol_v, c_size)
                 else:
                     rejected_namesakes += 1
                     log.debug(f"[sanity] Rejected namesake {coin} on {v} (diff {diff_pct:.1f}%)")
@@ -5989,7 +6005,7 @@ class UniverseScreener:
             confirmed_venues: Dict[str, Dict[str, Any]] = {}
             best_res: Optional[Dict[str, Any]] = None
 
-            for v, (raw_sym, mult, _, _) in item["matched_venues"].items():
+            for v, (raw_sym, mult, _, _, c_size) in item["matched_venues"].items():
                 client = self.clients.get(v)
                 if not client:
                     continue
@@ -6009,6 +6025,7 @@ class UniverseScreener:
                     confirmed_venues[v] = {
                         "raw_sym": raw_sym,
                         "mult": mult,
+                        "c_size": c_size,
                         "metrics": res,
                     }
                     if best_res is None or res["corr"] > best_res["corr"]:
@@ -6068,7 +6085,7 @@ class UniverseScreener:
         upbit_krw_to_coin: Dict[str, str] = {c["market"]: c["coin"] for c in vetted_coins}
 
         # Build sym_map per venue
-        sym_maps: Dict[str, Dict[str, Tuple[str, float]]] = {v: {} for v in self.target_venues}
+        sym_maps: Dict[str, Dict[str, Tuple[str, float, float]]] = {v: {} for v in self.target_venues}
         pairs_meta: Dict[str, Any] = {}
 
         for c in vetted_coins:
@@ -6081,7 +6098,8 @@ class UniverseScreener:
                 if dt:
                     raw_sym = dt["raw_sym"]
                     mult = dt["mult"]
-                    sym_maps[v][raw_sym] = (coin, mult)
+                    c_size = dt.get("c_size", 1.0)
+                    sym_maps[v][raw_sym] = (coin, mult, c_size)
 
             pairs_meta[coin] = {
                 "coin": coin,
@@ -6127,100 +6145,6 @@ class UniverseScreener:
                     os.remove(tmp)
                 except OSError:
                     pass
-
-```
-
-## scripts/cron_daily.sh
-
-```bash
-#!/usr/bin/env bash
-# scripts/cron_daily.sh - Daily automated maintenance cycle for Korean Sunrise
-# Designed for cron execution on Linux/VPS servers (e.g. at 00:00 UTC)
-
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-
-cd "${PROJECT_ROOT}"
-
-if [ -d "${PROJECT_ROOT}/venv" ]; then
-    source "${PROJECT_ROOT}/venv/bin/activate"
-elif [ -d "/root/venv" ]; then
-    source "/root/venv/bin/activate"
-fi
-
-mkdir -p "${PROJECT_ROOT}/logs"
-
-TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
-echo "================================================================================"
-echo "[CRON] Starting Korean Sunrise Daily Lifecycle Pipeline at ${TIMESTAMP}"
-echo "================================================================================"
-
-python3 tools/run_daily_pipeline.py "$@"
-
-EXIT_CODE=$?
-echo "[CRON] Daily Lifecycle finished with exit code ${EXIT_CODE} at $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
-exit ${EXIT_CODE}
-
-```
-
-## scripts/daily-pipeline.service
-
-```
-[Unit]
-Description=Korean Sunrise 24-Hour Autonomous Lifecycle Pipeline Service
-After=network.target
-
-[Service]
-Type=oneshot
-User=root
-WorkingDirectory=/root/KoreanSunrise
-ExecStart=/usr/bin/python3 tools/run_daily_pipeline.py
-StandardOutput=append:/root/KoreanSunrise/logs/daily_pipeline.log
-StandardError=append:/root/KoreanSunrise/logs/daily_pipeline.log
-
-```
-
-## scripts/daily-pipeline.timer
-
-```
-[Unit]
-Description=Daily Timer for Korean Sunrise 24-Hour Autonomous Lifecycle Pipeline
-
-[Timer]
-OnCalendar=*-*-* 00:00:00 UTC
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-
-```
-
-## scripts/korean-sunrise.service
-
-```
-[Unit]
-Description=Korean Sunrise Lead-Lag Sniping & Data Telemetry Service
-After=network.target network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/root/KoreanSunrise
-ExecStart=/usr/bin/python3 main.py
-Restart=always
-RestartSec=5
-KillMode=mixed
-TimeoutStopSec=15
-LimitNOFILE=65535
-StandardOutput=append:/root/KoreanSunrise/logs/service_stdout.log
-StandardError=append:/root/KoreanSunrise/logs/service_stderr.log
-
-[Install]
-WantedBy=multi-user.target
-
 ```
 
 ## tests/test_pipeline_e2e.py
@@ -6241,6 +6165,7 @@ import gzip
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timezone
 
 # Ensure project root is in path
@@ -6592,10 +6517,894 @@ class TestPipelineE2E(unittest.TestCase):
         self.assertEqual(len(emitted), 1)
         self.assertEqual(emitted[0]["max_hold_sec"], 3.2)
 
+    def test_engine_hot_reload_pool_and_profile(self):
+        # 1. Initialize fresh PoolStateManager and TradingProfileManager
+        psm = PoolStateManager(
+            universe_file=self.universe_file,
+            battle_pool_file=self.battle_file,
+            overrides_file=self.overrides_file
+        )
+        psm.reload()
+        profile_mgr = TradingProfileManager(profile_file=self.profile_file)
+        profile_mgr.set_venue_capital("binance", 100.0)
+
+        # 2. Initialize KoreanEngine with pool_state and profile_manager
+        engine = KoreanEngine(
+            emit_callback=lambda sig: None,
+            pool_state=psm,
+            profile_manager=profile_mgr,
+        )
+
+        # Initially DOGE is in Incubator, not Battle
+        self.assertFalse(engine.pool_state.is_battle_coin("DOGE"))
+        self.assertEqual(engine.profile_manager.get_profile()["capital"]["per_venue_usd"]["binance"], 100.0)
+
+        # 3. Simulate external process (nightly cron or CLI) modifying live_trading_pool.json on disk
+        battle_doc = {
+            "_meta": {"updated_at": "2026-10-18T14:00:00Z"},
+            "coins": {
+                "DOGE": {
+                    "coin": "DOGE",
+                    "basket": "battle",
+                    "venues": ["binance", "bybit"],
+                    "mean_net_pnl_bps": 22.0,
+                    "top3_depth_usd": 1200.0,
+                    "win_rate_pct": 88.0,
+                    "profit_factor": 2.5,
+                    "event_count": 15,
+                    "promoted_at": 1792300000.0,
+                }
+            }
+        }
+        with open(self.battle_file, "w", encoding="utf-8") as f:
+            json.dump(battle_doc, f)
+
+        # Simulate external process modifying trading_profile.json
+        prof_doc = profile_mgr.get_profile()
+        prof_doc["capital"]["per_venue_usd"]["binance"] = 850.0
+        with open(self.profile_file, "w", encoding="utf-8") as f:
+            json.dump(prof_doc, f)
+
+        # 4. Trigger engine.maybe_reload_thresholds after 35 seconds
+        now = 1000.0
+        engine._last_thresh_check = now - 35.0
+        engine.maybe_reload_thresholds(now)
+
+        # 5. Verify hot reloading took effect without restarting engine!
+        self.assertTrue(engine.pool_state.is_battle_coin("DOGE"))
+        self.assertEqual(engine.profile_manager.get_profile()["capital"]["per_venue_usd"]["binance"], 850.0)
+
+    def test_signal_closure_real_pnl_convergence_vs_reversal(self):
+        emitted = []
+        engine = KoreanEngine(
+            emit_callback=lambda sig_dict: emitted.append(sig_dict),
+            roundtrip_fee_bps=10.0,
+            taker_fee_bps=5.0,
+            max_hold_sec=10.0,
+        )
+
+        now = 1000.0
+        sig = SunriseSignal(
+            id="test_sig_1",
+            coin="SOL",
+            leader_exchange="upbit",
+            follower_exchange="binance",
+            follower_contract="SOLUSDT",
+            open_ts=now,
+            trigger_type="depth_drain",
+            leader_mid=100.5,
+            leader_best_ask=100.55,
+            leader_spread_bps=5.0,
+            leader_norm_spread_bps=5.0,
+            leader_top5_ask_usd=1000.0,
+            leader_norm_depth_usd=1000.0,
+            leader_swept_usd=500.0,
+            leader_imbalance_top5=0.5,
+            drain_ratio=0.5,
+            spread_blowout_ratio=1.0,
+            follower_mid=100.0,
+            follower_best_bid=99.95,
+            follower_best_ask=100.05,
+            follower_spread_bps=10.0,
+            follower_top3_ask_usd=2000.0,
+            follower_top3_bid_usd=2000.0,
+            follower_imbalance_top3=0.5,
+            kimchi_baseline_bps=0.0,
+            pair_sigma_bps=2.0,
+            raw_dislocation_bps=50.0,
+            dev_z=3.0,
+            gross_exec_edge_bps=35.0,
+            net_exec_edge_bps=30.0,
+            leader_latency_ms=10.0,
+            follower_latency_ms=15.0,
+            follower_book_age_ms=5.0,
+            suggested_size_usd=100.0,
+            basket="battle",
+            is_actionable=True,
+            max_hold_sec=10.0,
+        )
+        engine._active_signals["SOL"].append(sig)
+
+        # 1. Upbit retreats so rem_edge <= 0, but follower barely moved:
+        # Entry best_ask was 100.05. Current best_bid is 100.07.
+        # f_exec_move = (100.07 - 100.05) / 100.05 * 1e4 = +2.0 bps
+        # cur_net_pnl = 2.0 - 10.0 = -8.0 bps < 0!
+        u_retreat = OrderBookDepth5(
+            exchange="upbit", symbol="SOL", raw_symbol="KRW-SOL",
+            ts=now + 1.0, exchange_ts=int((now + 1.0) * 1000),
+            bids=[(100.00, 10.0)], asks=[(100.05, 10.0)]
+        )
+        f_lagging = OrderBookDepth5(
+            exchange="binance", symbol="SOL", raw_symbol="SOLUSDT",
+            ts=now + 1.0, exchange_ts=int((now + 1.0) * 1000),
+            bids=[(100.07, 10.0)], asks=[(100.12, 10.0)]
+        )
+        engine._books[("upbit", "SOL")] = u_retreat
+        engine._books[("binance", "SOL")] = f_lagging
+
+        engine._track_follower_move("SOL", "binance", f_lagging, now + 1.0)
+
+        # Must close as "reversed" because net PnL was negative!
+        self.assertTrue(sig.closed)
+        self.assertEqual(sig.close_reason, "reversed")
+        self.assertLess(sig.net_pnl_bps, 0.0)
+
+    def test_pair_state_cold_start_warmup(self):
+        from korean_engine import PairState
+        st = PairState("SOL", "binance", warmup_samples=30)
+        now = 1000.0
+
+        # Tick 0 hits an extreme initial spike: 150 bps
+        st.learn(150.0, now)
+        self.assertEqual(st.baseline_bps, 150.0)
+        self.assertFalse(st.is_warmed_up)
+
+        # Subsequent 30 ticks are quiet normal spread: 10 bps
+        for i in range(1, 31):
+            st.learn(10.0, now + i)
+
+        # With eff_tau = 10.0 during warmup, the baseline should have adapted rapidly
+        # and forgotten the initial 150 bps spike (down to < 20 bps instead of remaining ~145 bps)
+        self.assertTrue(st.is_warmed_up)
+        self.assertLess(st.baseline_bps, 20.0)
+        self.assertGreater(st.baseline_bps, 9.0)
+
+    def test_no_learn_during_open_signal_and_cleanup_memory_leak(self):
+        engine = KoreanEngine(emit_callback=lambda sig: None)
+        st = engine._get_or_create_pair_state("SOL", "binance")
+
+        # Warm up
+        now = 1000.0
+        for i in range(35):
+            st.learn(10.0, now + i)
+        self.assertTrue(st.is_warmed_up)
+        obs_before = st.n_obs
+
+        # Create active signal
+        sig = SunriseSignal(
+            id="sig_test_100",
+            coin="SOL",
+            leader_exchange="upbit",
+            follower_exchange="binance",
+            follower_contract="SOLUSDT",
+            open_ts=now + 50,
+            trigger_type="depth_drain",
+            leader_mid=100.5, leader_best_ask=100.55,
+            leader_spread_bps=5.0, leader_norm_spread_bps=5.0,
+            leader_top5_ask_usd=1000.0, leader_norm_depth_usd=1000.0,
+            leader_swept_usd=500.0, leader_imbalance_top5=0.5,
+            drain_ratio=0.5, spread_blowout_ratio=1.0,
+            follower_mid=100.0, follower_best_bid=99.95, follower_best_ask=100.05,
+            follower_spread_bps=10.0, follower_top3_ask_usd=2000.0,
+            follower_top3_bid_usd=2000.0, follower_imbalance_top3=0.5,
+            kimchi_baseline_bps=10.0, pair_sigma_bps=2.0,
+            raw_dislocation_bps=50.0, dev_z=3.0,
+            gross_exec_edge_bps=35.0, net_exec_edge_bps=30.0,
+            leader_latency_ms=10.0, follower_latency_ms=15.0,
+            follower_book_age_ms=5.0, suggested_size_usd=100.0,
+            basket="battle", is_actionable=True, max_hold_sec=10.0,
+        )
+        st.open_signal = sig
+        engine._active_signals["SOL"].append(sig)
+
+        # Feed follower tick: must NOT call st.learn because st.open_signal is active
+        f_snap = OrderBookDepth5(
+            exchange="binance", symbol="SOL", raw_symbol="SOLUSDT",
+            ts=now + 51, exchange_ts=int((now + 51) * 1000),
+            bids=[(100.0, 10.0)], asks=[(100.05, 10.0)]
+        )
+        engine._books[("upbit", "SOL")] = OrderBookDepth5(
+            exchange="upbit", symbol="SOL", raw_symbol="KRW-SOL",
+            ts=now + 51, exchange_ts=int((now + 51) * 1000),
+            bids=[(100.0, 10.0)], asks=[(100.05, 10.0)]
+        )
+        engine._recv_ts[("upbit", "SOL")] = now + 51
+        engine.on_book_update(f_snap)
+
+        self.assertEqual(st.n_obs, obs_before)
+
+        # Close signal: test by-id clearing and memory cleanup of _active_signals
+        import copy
+        sig_copy = copy.copy(sig)  # different object reference, same id
+        engine._close_signal(sig_copy, now + 52, "converged", 10.0, 25.0)
+
+        self.assertIsNone(st.open_signal)
+        self.assertNotIn("SOL", engine._active_signals)  # list was popped, no memory leak
+
+    def test_screener_contract_size_propagation(self):
+        from screening.screener import UniverseScreener
+        screener = UniverseScreener(venues=["gateio", "okx"])
+        vetted = [{
+            "coin": "BTC",
+            "market": "KRW-BTC",
+            "venues": ["gateio", "okx"],
+            "venue_details": {
+                "gateio": {"raw_sym": "BTC_USDT", "mult": 1.0, "c_size": 0.0001},
+                "okx": {"raw_sym": "BTC-USDT-SWAP", "mult": 1.0, "c_size": 0.01},
+            },
+            "best_metrics": {"corr": 0.98, "p90_dev_bps": 12.0},
+        }]
+        doc = screener._build_universe_doc(vetted, 1350.0, 1.0)
+        self.assertEqual(doc["gateio_sym_map"]["BTC_USDT"], ("BTC", 1.0, 0.0001))
+        self.assertEqual(doc["okx_sym_map"]["BTC-USDT-SWAP"], ("BTC", 1.0, 0.01))
+
+    def test_microstructure_noise_filtering_in_calibration(self):
+        from unittest.mock import patch
+        import tools.calibrate_thresholds as ct
+
+        noise_row = {
+            "coin": "SOL", "follower_exchange": "binance",
+            "net_pnl_bps": 20.0, "gross_exec_edge_bps": 25.0,
+            "drain_ratio": 0.1, "leader_swept_usd": 10.0, "follower_top3_ask_usd": 100.0,
+        }
+        valid_row = {
+            "coin": "SOL", "follower_exchange": "binance",
+            "net_pnl_bps": 20.0, "gross_exec_edge_bps": 25.0,
+            "drain_ratio": 0.5, "leader_swept_usd": 500.0, "follower_top3_ask_usd": 1000.0,
+        }
+
+        tmp_gz = os.path.join(self.test_dir, "signals_test.jsonl.gz")
+        with gzip.open(tmp_gz, "wt", encoding="utf-8") as gz:
+            gz.write(json.dumps(noise_row) + "\n")
+            gz.write(json.dumps(valid_row) + "\n")
+
+        with patch.object(ct, "_collect_signal_files", return_value=[tmp_gz]):
+            res = ct.calibrate(days_back=1.0, min_trades=1, min_winrate=0.5, dry_run=True, as_json=True)
+            self.assertEqual(res["metadata"]["total_signals_evaluated"], 1)
+            self.assertIn("SOL:upbit-binance", res["thresholds"])
+            self.assertEqual(res["thresholds"]["SOL:upbit-binance"]["sample_trades"], 1)
+            self.assertEqual(res["thresholds"]["SOL:upbit-binance"]["expected_net_bps"], 20.0)
+
+    def test_screener_kline_limit_default(self):
+        from screening.screener import UniverseScreener, DEFAULT_KLINE_LIMIT
+        self.assertEqual(DEFAULT_KLINE_LIMIT, 200)
+        screener = UniverseScreener(venues=["binance"])
+        self.assertEqual(screener.kline_limit, 200)
+
+    def test_batch_writer_non_blocking_buffer(self):
+        from batch_writer import BatchWriter
+        writer_dir = os.path.join(self.test_dir, "writer_test")
+        writer = BatchWriter(data_root=writer_dir, flush_interval_sec=1.0)
+
+        sig1 = {"coin": "SOL", "pnl": 15.0}
+        sig2 = {"coin": "BTC", "pnl": 25.0}
+
+        writer.add(sig1)
+        writer.add(sig2)
+
+        self.assertEqual(writer.rows_count, 2)
+        self.assertEqual(len(writer._lines), 2)
+        self.assertIn('"coin": "SOL"', writer._lines[0])
+
+        # Flush to disk
+        writer.flush()
+        self.assertEqual(writer.rows_count, 0)
+        self.assertEqual(writer.total_written, 2)
+
+        # Verify gzipped file written on disk
+        import glob
+        files = glob.glob(os.path.join(writer_dir, "signals", "**", "*.jsonl.gz"), recursive=True)
+        self.assertEqual(len(files), 1)
+        with gzip.open(files[0], "rt", encoding="utf-8") as gz:
+            lines = [json.loads(l) for l in gz if l.strip()]
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0]["coin"], "SOL")
+        self.assertEqual(lines[1]["coin"], "BTC")
+
+        # Test rollback on flush error
+        writer.add({"coin": "ETH", "pnl": 5.0})
+        self.assertEqual(writer.rows_count, 1)
+        with patch("os.replace", side_effect=OSError("Disk write error")):
+            writer.flush()
+        # Lines must be preserved in buffer for next retry
+        self.assertEqual(writer.rows_count, 1)
+        self.assertIn('"coin": "ETH"', writer._lines[0])
+
+    def test_pool_state_pause_reload_and_demote_cleanup(self):
+        psm = PoolStateManager(
+            universe_file=self.universe_file,
+            battle_pool_file=self.battle_file,
+            overrides_file=self.overrides_file
+        )
+        psm.reload()
+
+        # Promote SOL to battle
+        psm.promote_to_battle([{
+            "coin": "SOL", "venues": ["binance"],
+            "win_rate_pct": 80.0, "profit_factor": 3.0,
+            "mean_net_pnl_bps": 15.0, "median_net_pnl_bps": 14.0,
+            "top3_depth_usd": 2000.0, "event_count": 8
+        }])
+        self.assertTrue(psm.is_battle_coin("SOL"))
+        sol_entry = psm.get_coin_entry("SOL")
+        self.assertEqual(sol_entry.mean_net_pnl_bps, 15.0)
+        self.assertTrue(sol_entry.enabled)
+
+        # Simulate external pause written to overrides_file
+        with open(self.overrides_file, "w", encoding="utf-8") as f:
+            json.dump({"paused_coins": {"SOL": {"reason": "circuit_breaker"}}}, f)
+
+        # Promote another coin or re-run promotion without manual reload
+        psm.promote_to_battle([{
+            "coin": "SOL", "venues": ["binance"],
+            "win_rate_pct": 85.0, "profit_factor": 3.2,
+            "mean_net_pnl_bps": 16.0, "median_net_pnl_bps": 15.0,
+            "top3_depth_usd": 2000.0, "event_count": 10
+        }])
+        # SOL must be paused now because overrides_file was re-read!
+        sol_entry = psm.get_coin_entry("SOL")
+        self.assertFalse(sol_entry.enabled)
+        self.assertEqual(sol_entry.pause_reason, "circuit_breaker")
+
+        # Now demote SOL back to Incubator (e.g. fails qualification)
+        psm.promote_to_battle([])  # empty list demotes SOL
+        self.assertFalse(psm.is_battle_coin("SOL"))
+        sol_entry = psm.get_coin_entry("SOL")
+        self.assertEqual(sol_entry.basket, "incubator")
+        self.assertEqual(sol_entry.mean_net_pnl_bps, 0.0)
+        self.assertEqual(sol_entry.profit_factor, 0.0)
+        self.assertEqual(sol_entry.promoted_at, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
+```
 
+## tests/test_venues_contract_size.py
+
+```python
+"""
+tests/test_venues_contract_size.py — Unit tests verifying contract size scaling
+(quanto_multiplier, ctVal, multiplier, contractSize) across perpetual follower venues:
+Gate.io, OKX, KuCoin, MEXC, HTX.
+"""
+from __future__ import annotations
+
+import json
+import time
+import unittest
+from typing import List
+
+from models import OrderBookDepth5
+from venues.base import BaseCEXStream
+from venues.bingx import BingXStream
+from venues.gateio import GateioStream
+from venues.htx import HTXStream
+from venues.kucoin import KucoinStream
+from venues.mexc import MEXCStream
+from venues.okx import OKXStream
+from venues.pionex import PionexStream
+
+
+class TestVenuesContractSize(unittest.TestCase):
+    """Verifies that contract lot sizes correctly scale orderbook quantities to base coin units."""
+
+    def test_base_cex_extract_levels(self):
+        """Test _extract_levels with combinations of contract_size and mult."""
+        received: List[OrderBookDepth5] = []
+        stream = BaseCEXStream("test", ["BTC-USDT"], received.append)
+
+        # 1. Default (no contract_size scaling, mult=1.0)
+        raw = [["80000.0", "10.0"]]
+        levels = stream._extract_levels(raw, limit=5, mult=1.0, contract_size=1.0)
+        self.assertEqual(levels, [(80000.0, 10.0)])
+
+        # 2. Contract size scaling only (e.g. OKX BTC: 1 contract = 0.01 BTC)
+        levels = stream._extract_levels(raw, limit=5, mult=1.0, contract_size=0.01)
+        self.assertEqual(levels, [(80000.0, 0.1)])
+
+        # 3. 1000x mult prefix only (e.g. Binance 1000PEPE)
+        pepe_raw = [["0.015", "100.0"]]  # price for 1000, qty in thousands
+        levels = stream._extract_levels(pepe_raw, limit=5, mult=1000.0, contract_size=1.0)
+        self.assertAlmostEqual(levels[0][0], 0.000015)
+        self.assertAlmostEqual(levels[0][1], 100000.0)
+
+        # 4. Both contract_size and mult (e.g. OKX 1000PEPE: ctVal=10 units of 1000PEPE)
+        levels = stream._extract_levels(pepe_raw, limit=5, mult=1000.0, contract_size=10.0)
+        self.assertAlmostEqual(levels[0][0], 0.000015)
+        self.assertAlmostEqual(levels[0][1], 1000000.0)
+
+    def test_gateio_quanto_multiplier(self):
+        """Gate.io: quanto_multiplier scales 's' from contracts to coins."""
+        snaps: List[OrderBookDepth5] = []
+        contract_sizes = {
+            "BTC_USDT": 0.0001,
+            "PEPE_USDT": 10_000_000.0,
+        }
+        stream = GateioStream(
+            ["BTC_USDT", "PEPE_USDT"],
+            snaps.append,
+            contract_sizes=contract_sizes,
+        )
+
+        # 1. BTC_USDT (quanto = 0.0001)
+        msg_btc = json.dumps({
+            "channel": "futures.order_book_update",
+            "event": "all",
+            "result": {
+                "contract": "BTC_USDT",
+                "t": 1700000000000,
+                "b": [{"p": "80000.0", "s": 500}],   # 500 contracts = 0.05 BTC
+                "a": [{"p": "80001.0", "s": 1000}],  # 1000 contracts = 0.1 BTC
+            }
+        })
+        stream._parse_message(msg_btc)
+        self.assertEqual(len(snaps), 1)
+        snap = snaps[0]
+        self.assertEqual(snap.symbol, "BTC")
+        self.assertEqual(snap.bids[0], (80000.0, 0.05))
+        self.assertEqual(snap.asks[0], (80001.0, 0.1))
+        # USD Depth: 80001.0 * 0.1 = $8000.10 (NOT $80,001,000!)
+        self.assertAlmostEqual(snap.depth_ask_usd, 8000.10, places=2)
+
+        # 2. PEPE_USDT (quanto = 10,000,000)
+        snaps.clear()
+        msg_pepe = json.dumps({
+            "channel": "futures.order_book_update",
+            "event": "all",
+            "result": {
+                "contract": "PEPE_USDT",
+                "t": 1700000000000,
+                "b": [{"p": "0.000004", "s": 5}],    # 5 contracts = 50,000,000 PEPE
+                "a": [{"p": "0.0000041", "s": 10}],  # 10 contracts = 100,000,000 PEPE
+            }
+        })
+        stream._parse_message(msg_pepe)
+        self.assertEqual(len(snaps), 1)
+        snap = snaps[0]
+        self.assertEqual(snap.symbol, "PEPE")
+        self.assertEqual(snap.bids[0], (0.000004, 50_000_000.0))
+        self.assertEqual(snap.asks[0], (0.0000041, 100_000_000.0))
+        # USD Depth: 0.0000041 * 100,000,000 = $410.0 (NOT $0.000041!)
+        self.assertAlmostEqual(snap.depth_ask_usd, 410.0, places=2)
+
+    def test_okx_ct_val(self):
+        """OKX: ctVal scales 'sz' from contracts to coins."""
+        snaps: List[OrderBookDepth5] = []
+        contract_sizes = {
+            "BTC-USDT-SWAP": 0.01,
+            "1000PEPE-USDT-SWAP": 10.0,
+        }
+        sym_map = {
+            "BTC-USDT-SWAP": ("BTC", 1.0, 0.01),
+            "1000PEPE-USDT-SWAP": ("PEPE", 1000.0, 10.0),
+        }
+        stream = OKXStream(sym_map, snaps.append, contract_sizes=contract_sizes)
+
+        # 1. BTC-USDT-SWAP (ctVal = 0.01)
+        msg_btc = json.dumps({
+            "arg": {"channel": "books5", "instId": "BTC-USDT-SWAP"},
+            "data": [{
+                "ts": "1700000000000",
+                "bids": [["80000.0", "20", "0", "1"]],  # 20 contracts = 0.2 BTC
+                "asks": [["80002.0", "50", "0", "1"]],  # 50 contracts = 0.5 BTC
+            }]
+        })
+        stream._parse_message(msg_btc)
+        self.assertEqual(len(snaps), 1)
+        snap = snaps[0]
+        self.assertEqual(snap.symbol, "BTC")
+        self.assertEqual(snap.bids[0], (80000.0, 0.2))
+        self.assertEqual(snap.asks[0], (80002.0, 0.5))
+        self.assertAlmostEqual(snap.depth_ask_usd, 80002.0 * 0.5, places=2)
+
+        # 2. 1000PEPE-USDT-SWAP (mult = 1000, ctVal = 10)
+        snaps.clear()
+        msg_pepe = json.dumps({
+            "arg": {"channel": "books5", "instId": "1000PEPE-USDT-SWAP"},
+            "data": [{
+                "ts": "1700000000000",
+                "bids": [["0.004", "15", "0", "1"]],   # px=0.000004, 15*10*1000 = 150,000 PEPE
+                "asks": [["0.0042", "30", "0", "1"]],  # px=0.0000042, 30*10*1000 = 300,000 PEPE
+            }]
+        })
+        stream._parse_message(msg_pepe)
+        self.assertEqual(len(snaps), 1)
+        snap = snaps[0]
+        self.assertEqual(snap.symbol, "PEPE")
+        self.assertAlmostEqual(snap.bids[0][0], 0.000004)
+        self.assertAlmostEqual(snap.bids[0][1], 150_000.0)
+        self.assertAlmostEqual(snap.asks[0][0], 0.0000042)
+        self.assertAlmostEqual(snap.asks[0][1], 300_000.0)
+        self.assertAlmostEqual(snap.depth_ask_usd, 0.0000042 * 300_000.0, places=2)
+
+    def test_kucoin_multiplier(self):
+        """KuCoin: multiplier scales 'size' from contracts to coins."""
+        snaps: List[OrderBookDepth5] = []
+        contract_sizes = {
+            "XBTUSDTM": 0.001,
+            "PEPEUSDTM": 520_000.0,
+        }
+        stream = KucoinStream(["XBTUSDTM", "PEPEUSDTM"], snaps.append, contract_sizes=contract_sizes)
+
+        # 1. XBTUSDTM (multiplier = 0.001)
+        msg_btc = json.dumps({
+            "topic": "/contractMarket/level2Depth5:XBTUSDTM",
+            "data": {
+                "timestamp": 1700000000000,
+                "bids": [["80000.0", "50"]],  # 50 contracts = 0.05 BTC
+                "asks": [["80001.0", "80"]],  # 80 contracts = 0.08 BTC
+            }
+        })
+        stream._parse_message(msg_btc)
+        self.assertEqual(len(snaps), 1)
+        snap = snaps[0]
+        self.assertEqual(snap.symbol, "BTC")
+        self.assertEqual(snap.bids[0], (80000.0, 0.05))
+        self.assertEqual(snap.asks[0], (80001.0, 0.08))
+        self.assertAlmostEqual(snap.depth_ask_usd, 80001.0 * 0.08, places=2)
+
+        # 2. PEPEUSDTM (multiplier = 520,000)
+        snaps.clear()
+        msg_pepe = json.dumps({
+            "topic": "/contractMarket/level2Depth5:PEPEUSDTM",
+            "data": {
+                "timestamp": 1700000000000,
+                "bids": [["0.0000038", "10"]],  # 10 contracts = 5,200,000 PEPE
+                "asks": [["0.0000039", "25"]],  # 25 contracts = 13,000,000 PEPE
+            }
+        })
+        stream._parse_message(msg_pepe)
+        self.assertEqual(len(snaps), 1)
+        snap = snaps[0]
+        self.assertEqual(snap.symbol, "PEPE")
+        self.assertEqual(snap.bids[0], (0.0000038, 5_200_000.0))
+        self.assertEqual(snap.asks[0], (0.0000039, 13_000_000.0))
+        self.assertAlmostEqual(snap.depth_ask_usd, 0.0000039 * 13_000_000.0, places=2)
+
+    def test_mexc_contract_size(self):
+        """MEXC: contractSize scales 'vol' from contracts to coins."""
+        snaps: List[OrderBookDepth5] = []
+        contract_sizes = {
+            "BTC_USDT": 0.0001,
+            "PEPE_USDT": 10_000_000.0,
+        }
+        stream = MEXCStream(["BTC_USDT", "PEPE_USDT"], snaps.append, contract_sizes=contract_sizes)
+
+        # 1. BTC_USDT (contractSize = 0.0001)
+        msg_btc = json.dumps({
+            "channel": "push.depth",
+            "symbol": "BTC_USDT",
+            "data": {
+                "cts": 1700000000000,
+                "bids": [["80000.0", "300", "1"]],  # 300 contracts = 0.03 BTC
+                "asks": [["80002.0", "600", "1"]],  # 600 contracts = 0.06 BTC
+            }
+        })
+        stream._parse_message(msg_btc)
+        self.assertEqual(len(snaps), 1)
+        snap = snaps[0]
+        self.assertEqual(snap.symbol, "BTC")
+        self.assertAlmostEqual(snap.bids[0][0], 80000.0)
+        self.assertAlmostEqual(snap.bids[0][1], 0.03)
+        self.assertAlmostEqual(snap.asks[0][0], 80002.0)
+        self.assertAlmostEqual(snap.asks[0][1], 0.06)
+        self.assertAlmostEqual(snap.depth_ask_usd, 80002.0 * 0.06, places=2)
+
+        # 2. PEPE_USDT (contractSize = 10,000,000)
+        snaps.clear()
+        msg_pepe = json.dumps({
+            "channel": "push.depth",
+            "symbol": "PEPE_USDT",
+            "data": {
+                "cts": 1700000000000,
+                "bids": [["0.00000385", "4", "1"]],  # 4 contracts = 40,000,000 PEPE
+                "asks": [["0.00000388", "8", "1"]],  # 8 contracts = 80,000,000 PEPE
+            }
+        })
+        stream._parse_message(msg_pepe)
+        self.assertEqual(len(snaps), 1)
+        snap = snaps[0]
+        self.assertEqual(snap.symbol, "PEPE")
+        self.assertEqual(snap.bids[0], (0.00000385, 40_000_000.0))
+        self.assertEqual(snap.asks[0], (0.00000388, 80_000_000.0))
+        self.assertAlmostEqual(snap.depth_ask_usd, 0.00000388 * 80_000_000.0, places=2)
+
+    def test_htx_contract_size(self):
+        """HTX: contract_size scales 'amount' from contracts to coins."""
+        snaps: List[OrderBookDepth5] = []
+        contract_sizes = {
+            "BTC-USDT": 0.001,
+            "DOGE-USDT": 100.0,
+        }
+        stream = HTXStream(["BTC-USDT", "DOGE-USDT"], snaps.append, contract_sizes=contract_sizes)
+
+        # 1. BTC-USDT (contract_size = 0.001)
+        msg_btc = json.dumps({
+            "ch": "market.BTC-USDT.depth.step0",
+            "ts": 1700000000000,
+            "tick": {
+                "bids": [[80000.0, 70]],  # 70 contracts = 0.07 BTC
+                "asks": [[80001.0, 90]],  # 90 contracts = 0.09 BTC
+            }
+        })
+        stream._parse_message(msg_btc)
+        self.assertEqual(len(snaps), 1)
+        snap = snaps[0]
+        self.assertEqual(snap.symbol, "BTC")
+        self.assertEqual(snap.bids[0], (80000.0, 0.07))
+        self.assertEqual(snap.asks[0], (80001.0, 0.09))
+        self.assertAlmostEqual(snap.depth_ask_usd, 80001.0 * 0.09, places=2)
+
+        # 2. DOGE-USDT (contract_size = 100.0)
+        snaps.clear()
+        msg_doge = json.dumps({
+            "ch": "market.DOGE-USDT.depth.step0",
+            "ts": 1700000000000,
+            "tick": {
+                "bids": [[0.078, 50]],   # 50 contracts = 5000 DOGE
+                "asks": [[0.0782, 100]],  # 100 contracts = 10000 DOGE
+            }
+        })
+        stream._parse_message(msg_doge)
+        self.assertEqual(len(snaps), 1)
+        snap = snaps[0]
+        self.assertEqual(snap.symbol, "DOGE")
+        self.assertEqual(snap.bids[0], (0.078, 5000.0))
+        self.assertEqual(snap.asks[0], (0.0782, 10000.0))
+        self.assertAlmostEqual(snap.depth_ask_usd, 0.0782 * 10000.0, places=2)
+
+    def test_engine_integration_depth_accuracy(self):
+        """Demonstrates that KoreanEngine receives exact USD depth instead of 10x-10000x distortion."""
+        from korean_engine import KoreanEngine
+        from pipeline.pool_state import PoolStateManager
+
+        signals: List[dict] = []
+        engine = KoreanEngine(
+            emit_callback=signals.append,
+            min_edge_bps=10.0,
+            taker_fee_bps=5.0,
+            pool_state=PoolStateManager(),
+        )
+
+        # Upbit USDT/KRW rate snapshot (e.g. 1350)
+        upbit_rate_book = OrderBookDepth5(
+            exchange="upbit",
+            symbol="USDT",
+            raw_symbol="KRW-USDT",
+            ts=time.time(),
+            exchange_ts=int(time.time() * 1000),
+            bids=[(1350.0, 10000.0)],
+            asks=[(1351.0, 10000.0)],
+        )
+        engine.on_book_update(upbit_rate_book)
+
+        # 1. Gate.io DOGE with quanto_multiplier = 10.0
+        gate_snaps: List[OrderBookDepth5] = []
+        gate_stream = GateioStream(
+            ["DOGE_USDT"],
+            gate_snaps.append,
+            contract_sizes={"DOGE_USDT": 10.0},
+        )
+        gate_msg_doge = json.dumps({
+            "channel": "futures.order_book_update",
+            "event": "all",
+            "result": {
+                "contract": "DOGE_USDT",
+                "t": 1700000000000,
+                "b": [{"p": "0.0800", "s": 500}],   # 500 contracts * 10 = 5000 DOGE ($400)
+                "a": [{"p": "0.0801", "s": 1000}],  # 1000 contracts * 10 = 10000 DOGE ($801)
+            }
+        })
+        gate_stream._parse_message(gate_msg_doge)
+        self.assertEqual(len(gate_snaps), 1)
+        doge_snap = gate_snaps[0]
+
+        # Engine receives the book
+        engine.on_book_update(doge_snap)
+
+        saved_doge_book = engine._books.get(("gateio", "DOGE"))
+        self.assertIsNotNone(saved_doge_book)
+        # Top 1 ask depth USD must be exactly 0.0801 * 10000 DOGE = $801.0
+        self.assertAlmostEqual(saved_doge_book.top_n_ask_depth_usd(1), 801.0, places=2)
+        # Without quanto_multiplier fix, depth would be 0.0801 * 1000 = $80.1 (10x too small!)
+        self.assertNotEqual(saved_doge_book.top_n_ask_depth_usd(1), 80.1)
+
+        # 2. Gate.io BTC with quanto_multiplier = 0.0001
+        gate_snaps.clear()
+        gate_stream_btc = GateioStream(
+            ["BTC_USDT"],
+            gate_snaps.append,
+            contract_sizes={"BTC_USDT": 0.0001},
+        )
+        gate_msg_btc = json.dumps({
+            "channel": "futures.order_book_update",
+            "event": "all",
+            "result": {
+                "contract": "BTC_USDT",
+                "t": 1700000000000,
+                "b": [{"p": "80000.0", "s": 50}],  # 50 contracts * 0.0001 = 0.005 BTC ($400)
+                "a": [{"p": "80002.0", "s": 100}], # 100 contracts * 0.0001 = 0.01 BTC ($800.02)
+            }
+        })
+        gate_stream_btc._parse_message(gate_msg_btc)
+        self.assertEqual(len(gate_snaps), 1)
+        btc_snap = gate_snaps[0]
+
+        engine.on_book_update(btc_snap)
+        saved_btc_book = engine._books.get(("gateio", "BTC"))
+        self.assertIsNotNone(saved_btc_book)
+        # Top 1 ask depth USD must be exactly 80002.0 * 0.01 BTC = $800.02
+        self.assertAlmostEqual(saved_btc_book.top_n_ask_depth_usd(1), 800.02, places=2)
+        # Without quanto_multiplier fix, depth would be 80002.0 * 100 = $8,000,200 (10,000x too large!)
+        self.assertNotEqual(saved_btc_book.top_n_ask_depth_usd(1), 8_000_200.0)
+
+    def test_bingx_1000x_contracts(self):
+        """BingX: 1000x contracts subscribe with raw symbol and scale price/qty by mult."""
+        snaps: List[OrderBookDepth5] = []
+        sym_map = {
+            "1000PEPE-USDT": ("PEPE", 1000.0),
+        }
+        stream = BingXStream(sym_map, snaps.append)
+
+        # 1. Reverse symbol resolution ensures subscription matches exchange symbol
+        self.assertEqual(stream._to_raw_symbol("PEPE"), "1000PEPE-USDT")
+        self.assertEqual(stream._to_raw_symbol("1000PEPE-USDT"), "1000PEPE-USDT")
+
+        # 2. Parsing scales price down by 1000, qty up by 1000
+        msg_pepe = json.dumps({
+            "code": 0,
+            "dataType": "1000PEPE-USDT@depth20",
+            "ts": 1700000000000,
+            "data": {
+                "bids": [["0.0038", "100.0"]],
+                "asks": [["0.0039", "200.0"]],
+            }
+        })
+        stream._parse_message(msg_pepe)
+        self.assertEqual(len(snaps), 1)
+        snap = snaps[0]
+        self.assertEqual(snap.symbol, "PEPE")
+        self.assertEqual(snap.raw_symbol, "1000PEPE-USDT")
+        # Price scaled: 0.0038 / 1000 = 0.0000038
+        self.assertAlmostEqual(snap.bids[0][0], 0.0000038)
+        # Quantity scaled: 100.0 * 1000 = 100,000.0
+        self.assertAlmostEqual(snap.bids[0][1], 100_000.0)
+        # Depth in USD: 0.0039 * 200 = 0.78 USD
+        self.assertAlmostEqual(snap.depth_ask_usd, 0.78, places=4)
+
+    def test_gateio_1000x_contracts(self):
+        """Gate.io: 1000x ticker prefix scales price/qty alongside quanto_multiplier."""
+        snaps: List[OrderBookDepth5] = []
+        sym_map = {
+            "1000BONK_USDT": ("BONK", 1000.0),
+        }
+        # quanto = 100 (1 contract = 100 units of 1000BONK = 100,000 BONK)
+        contract_sizes = {"1000BONK_USDT": 100.0}
+        stream = GateioStream(sym_map, snaps.append, contract_sizes=contract_sizes)
+
+        self.assertEqual(stream._to_raw_symbol("BONK"), "1000BONK_USDT")
+
+        msg = json.dumps({
+            "channel": "futures.order_book_update",
+            "event": "all",
+            "result": {
+                "contract": "1000BONK_USDT",
+                "t": 1700000000000,
+                "b": [{"p": "0.0108", "s": 50}],   # 50 contracts * 100 quanto * 1000 mult = 5,000,000 BONK
+                "a": [{"p": "0.0109", "s": 100}],  # 100 contracts * 100 quanto * 1000 mult = 10,000,000 BONK
+            }
+        })
+        stream._parse_message(msg)
+        self.assertEqual(len(snaps), 1)
+        snap = snaps[0]
+        self.assertEqual(snap.symbol, "BONK")
+        # Price: 0.0108 / 1000 = 0.0000108
+        self.assertAlmostEqual(snap.bids[0][0], 0.0000108)
+        # Qty: 50 * 100 * 1000 = 5,000,000
+        self.assertAlmostEqual(snap.bids[0][1], 5_000_000.0)
+        # USD Depth: 0.0109 * 100 * 100 = 109.0 USD
+        self.assertAlmostEqual(snap.depth_ask_usd, 109.0, places=2)
+
+    def test_pionex_1000x_contracts(self):
+        """Pionex: 1000x contracts resolve base coin, scale price down and qty up."""
+        snaps: List[OrderBookDepth5] = []
+        sym_map = {
+            "1000PEPE_USDT_PERP": ("PEPE", 1000.0),
+        }
+        stream = PionexStream(sym_map, snaps.append)
+
+        self.assertEqual(stream._to_raw_symbol("PEPE"), "1000PEPE_USDT_PERP")
+
+        msg = json.dumps({
+            "topic": "DEPTH",
+            "symbol": "1000PEPE_USDT_PERP",
+            "timestamp": 1700000000000,
+            "data": {
+                "bids": [["0.00385", "50"]],
+                "asks": [["0.00388", "100"]],
+            }
+        })
+        stream._parse_message(msg)
+        self.assertEqual(len(snaps), 1)
+        snap = snaps[0]
+        self.assertEqual(snap.symbol, "PEPE")
+        self.assertEqual(snap.raw_symbol, "1000PEPE_USDT_PERP")
+        self.assertAlmostEqual(snap.bids[0][0], 0.00000385)
+        self.assertAlmostEqual(snap.bids[0][1], 50_000.0)
+        self.assertAlmostEqual(snap.asks[0][0], 0.00000388)
+        self.assertAlmostEqual(snap.asks[0][1], 100_000.0)
+        self.assertAlmostEqual(snap.depth_ask_usd, 0.00388 * 100, places=4)
+
+    def test_gateio_session_isolation_user_agent(self):
+        """GateioRestClient must not mutate the shared session's User-Agent."""
+        from venues.base import create_http_session
+        from venues.gateio import GateioRestClient
+
+        shared_session = create_http_session()
+        original_ua = shared_session.headers.get("User-Agent")
+        self.assertIsNotNone(original_ua)
+
+        # Initialize GateioRestClient passing shared_session
+        client = GateioRestClient(shared_session)
+
+        # Gate.io's session must not have User-Agent (for its WAF requirements)
+        self.assertNotIn("User-Agent", client.session.headers)
+
+        # Shared session must RETAIN its User-Agent for Binance/Bybit/Upbit/OKX/etc.
+        self.assertEqual(shared_session.headers.get("User-Agent"), original_ua)
+
+    def test_gateio_timestamp_parsing_fallbacks(self):
+        """GateioStream must safely parse timestamps even if time is null or time_ms is present."""
+        snaps: List[OrderBookDepth5] = []
+        stream = GateioStream(["BTC_USDT"], snaps.append)
+
+        # 1. Message with result.t present and time is null (would crash old code with None * 1000!)
+        msg1 = json.dumps({
+            "channel": "futures.order_book_update",
+            "event": "update",
+            "time": None,
+            "result": {
+                "s": "BTC_USDT",
+                "t": 1700000000123,
+                "b": [{"p": "80000.0", "s": "1.0"}],
+                "a": [{"p": "80001.0", "s": "1.0"}],
+            }
+        })
+        stream._parse_message(msg1)
+        self.assertEqual(len(snaps), 1)
+        self.assertEqual(snaps[0].exchange_ts, 1700000000123)
+
+        # 2. Message with time_ms present, result.t absent, time is null
+        snaps.clear()
+        msg2 = json.dumps({
+            "channel": "futures.order_book_update",
+            "event": "update",
+            "time": None,
+            "time_ms": 1700000000456,
+            "result": {
+                "s": "BTC_USDT",
+                "b": [{"p": "80000.0", "s": "1.0"}],
+                "a": [{"p": "80001.0", "s": "1.0"}],
+            }
+        })
+        stream._parse_message(msg2)
+        self.assertEqual(len(snaps), 1)
+        self.assertEqual(snaps[0].exchange_ts, 1700000000456)
+
+
+if __name__ == "__main__":
+    unittest.main()
 ```
 
 ## tools/__init__.py
@@ -6604,7 +7413,6 @@ if __name__ == "__main__":
 """
 tools - Operator CLI tools and pipeline orchestration for Korean Sunrise.
 """
-
 ```
 
 ## tools/analyze_signals.py
@@ -6800,7 +7608,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 ```
 
 ## tools/audit_venues.py
@@ -6925,7 +7732,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 ```
 
 ## tools/calibrate_thresholds.py
@@ -7093,6 +7899,14 @@ def calibrate(
                             or (float(d.get("net_exec_edge_bps", 0.0)) + roundtrip_fee_bps * 0.5)
                         )
 
+                        # Microstructure physical validity check (consistent with evaluator.py)
+                        drain_ratio = float(d.get("drain_ratio", 0.0))
+                        swept_usd = float(d.get("leader_swept_usd", 0.0))
+                        f_top3_ask = float(d.get("follower_top3_ask_usd", 0.0))
+                        cross_ratio = (swept_usd / f_top3_ask) if f_top3_ask > 0 else 0.0
+                        if drain_ratio < 0.40 and cross_ratio < 0.50:
+                            continue
+
                         pair_key = f"{coin}:upbit-{follower_ex}"
                         valid_events += 1
 
@@ -7104,7 +7918,7 @@ def calibrate(
                         if dz is not None and float(dz) > 0:
                             pair_metrics[pair_key]["dev_zs"].append(float(dz))
 
-                        gross = pos_size * (gross_edge / 10000.0)
+                        gross = pos_size * ((net_pnl + roundtrip_fee_bps) / 10000.0)
                         net = pos_size * (net_pnl / 10000.0)
 
                         sw = pair_sweeps[pair_key]
@@ -7307,7 +8121,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 ```
 
 ## tools/full_daily_report.py
@@ -7481,6 +8294,14 @@ def generate_daily_report(
                             b["losses"] += abs(net)
 
                     _add_to_bucket(pnl_scenarios["all_signals"])
+
+                    # Microstructure physical validity check (consistent with evaluator.py)
+                    drain_ratio = float(d.get("drain_ratio", 0.0))
+                    swept_usd = float(d.get("leader_swept_usd", 0.0))
+                    f_top3_ask = float(d.get("follower_top3_ask_usd", 0.0))
+                    cross_ratio = (swept_usd / f_top3_ask) if f_top3_ask > 0 else 0.0
+                    if drain_ratio < 0.40 and cross_ratio < 0.50:
+                        continue
 
                     pk = f"{coin}:upbit-{f_ex}"
                     req_edge = calibrated_thresholds.get(pk, 20.0)
@@ -7710,7 +8531,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 ```
 
 ## tools/manage_pool.py
@@ -8007,7 +8827,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 ```
 
 ## tools/run_daily_pipeline.py
@@ -8091,11 +8910,11 @@ def run_pipeline(
     if skip_screening:
         logger.info("[PHASE 1/4] Universe Screening: SKIPPED (--skip-screening)")
     else:
-        logger.info("[PHASE 1/4] Universe Screening: Fetching 1440 1m candles across Upbit & 9 followers...")
+        logger.info("[PHASE 1/4] Universe Screening: Fetching 200 1m candles across Upbit & 9 followers...")
         cmd_scr = [
             sys.executable,
             os.path.join(PROJECT_ROOT, "tools", "screen_universe.py"),
-            "--kline-limit", "1440",
+            "--kline-limit", "200",
             "--workers", "8",
         ]
         if not dry_run:
@@ -8181,7 +9000,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 ```
 
 ## tools/screen_universe.py
@@ -8221,7 +9039,7 @@ def main() -> None:
     parser.add_argument("--min-corr", type=float, default=0.65, help="Min 1m log-returns correlation (default: 0.65)")
     parser.add_argument("--min-both-trade", type=float, default=0.15, help="Min fraction of active trading minutes (default: 0.15)")
     parser.add_argument("--min-dev-bps", type=float, default=8.0, help="Min P90 basis deviation in bps (default: 8.0 bps)")
-    parser.add_argument("--kline-limit", type=int, default=1440, help="Number of 1m candles to evaluate (default: 1440 = 24h)")
+    parser.add_argument("--kline-limit", type=int, default=200, help="Number of 1m candles to evaluate (default: 200 = ~3.3h)")
     parser.add_argument("--workers", type=int, default=8, help="Parallel worker threads (default: 8)")
     args = parser.parse_args()
 
@@ -8246,7 +9064,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 ```
 
 ## tools/validate_data.py
@@ -8432,7 +9249,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 ```
 
 ## trading_profile.json
@@ -8480,10 +9296,10 @@ if __name__ == "__main__":
 ```json
 {
   "_meta": {
-    "updated_at": "2026-10-18T13:58:13Z",
-    "updated_ts": 1792331893.775,
-    "usdt_krw_rate": 1350.0,
-    "coins_count": 65,
+    "updated_at": "2026-10-18T16:34:02Z",
+    "updated_ts": 1792341242.422,
+    "usdt_krw_rate": 1353.0,
+    "coins_count": 98,
     "active_venues": [
       "binance",
       "bybit",
@@ -8495,155 +9311,221 @@ if __name__ == "__main__":
       "htx",
       "pionex"
     ],
-    "screening_elapsed_sec": 100.26,
-    "binance_count": 42,
-    "bybit_count": 44,
-    "okx_count": 26,
-    "gateio_count": 22,
-    "mexc_count": 45,
-    "kucoin_count": 30,
-    "bingx_count": 42,
-    "htx_count": 2,
-    "pionex_count": 16
+    "screening_elapsed_sec": 84.15,
+    "binance_count": 76,
+    "bybit_count": 70,
+    "okx_count": 61,
+    "gateio_count": 48,
+    "mexc_count": 70,
+    "kucoin_count": 62,
+    "bingx_count": 73,
+    "htx_count": 12,
+    "pionex_count": 36
   },
   "coins": [
-    "VVV",
-    "LIT",
-    "ICP",
     "ETHFI",
-    "RAY",
-    "PROM",
-    "AXL",
-    "TRUMP",
-    "WLD",
-    "ELSA",
+    "AXS",
     "SPX",
-    "SOMI",
-    "GRT",
-    "EUL",
-    "ZRO",
-    "ZORA",
-    "CAP",
-    "PIEVERSE",
-    "WCT",
-    "PROS",
+    "CFX",
+    "LIT",
+    "SYRUP",
     "ENSO",
-    "BREV",
-    "ESP",
-    "NEAR",
-    "VET",
-    "KMNO",
-    "GTC",
-    "B3",
-    "CYBER",
-    "HYPER",
-    "SENT",
-    "AWE",
-    "ZKC",
-    "ZKP",
-    "NEO",
-    "IO",
-    "INJ",
-    "SKR",
-    "CARV",
-    "ERA",
-    "SEI",
-    "ARX",
-    "MMT",
-    "MNT",
-    "PONS",
-    "API3",
-    "ENS",
-    "IOTA",
+    "TAO",
+    "SAND",
+    "ELSA",
     "O",
-    "BCH",
-    "BEAM",
-    "BAT",
+    "ORCA",
+    "ZORA",
+    "VET",
+    "WLFI",
+    "WLD",
+    "FIL",
+    "BREV",
+    "EUL",
+    "KMNO",
+    "ERA",
+    "UNI",
     "PUMP",
-    "DOS",
-    "RENDER",
+    "CELO",
+    "AERO",
+    "NEAR",
+    "ICP",
+    "BAT",
+    "PROM",
+    "MINA",
+    "MORPHO",
+    "VVV",
+    "PONS",
+    "TRUMP",
+    "XRP",
+    "NEO",
+    "SENT",
+    "RAY",
+    "ZRO",
+    "PIEVERSE",
+    "SUI",
+    "OPG",
+    "WCT",
+    "JTO",
+    "SEI",
+    "WAL",
+    "LINK",
+    "SPK",
+    "ETC",
+    "PENDLE",
+    "TREE",
+    "CYBER",
+    "GTC",
     "APT",
-    "2Z",
-    "F",
-    "BIO",
-    "NMR",
-    "MANA",
-    "VTHO",
-    "MOODENG",
+    "ENS",
+    "DOT",
+    "THETA",
+    "VANA",
+    "LINEA",
+    "HYPER",
+    "FLOCK",
+    "TAIKO",
+    "MMT",
+    "GMT",
+    "ZKC",
+    "MIRA",
+    "ZKP",
+    "MEGA",
+    "PROS",
+    "MASK",
+    "BCH",
+    "LA",
+    "CAP",
+    "ARX",
+    "TIA",
+    "MON",
+    "AAVE",
+    "AXL",
     "ATOM",
-    "BIGTIME"
+    "RENDER",
+    "MANA",
+    "ATH",
+    "NXPC",
+    "ESP",
+    "F",
+    "IOST",
+    "ZBT",
+    "BEAM",
+    "2Z",
+    "FF",
+    "PUFFER",
+    "VIRTUAL",
+    "T",
+    "AWE",
+    "STX",
+    "INJ",
+    "GRT",
+    "ONT"
   ],
   "upbit_krw_to_coin": {
-    "KRW-VVV": "VVV",
-    "KRW-LIT": "LIT",
-    "KRW-ICP": "ICP",
     "KRW-ETHFI": "ETHFI",
-    "KRW-RAY": "RAY",
-    "KRW-PROM": "PROM",
-    "KRW-AXL": "AXL",
-    "KRW-TRUMP": "TRUMP",
-    "KRW-WLD": "WLD",
-    "KRW-ELSA": "ELSA",
+    "KRW-AXS": "AXS",
     "KRW-SPX": "SPX",
-    "KRW-SOMI": "SOMI",
-    "KRW-GRT": "GRT",
-    "KRW-EUL": "EUL",
-    "KRW-ZRO": "ZRO",
-    "KRW-ZORA": "ZORA",
-    "KRW-CAP": "CAP",
-    "KRW-PIEVERSE": "PIEVERSE",
-    "KRW-WCT": "WCT",
-    "KRW-PROS": "PROS",
+    "KRW-CFX": "CFX",
+    "KRW-LIT": "LIT",
+    "KRW-SYRUP": "SYRUP",
     "KRW-ENSO": "ENSO",
-    "KRW-BREV": "BREV",
-    "KRW-ESP": "ESP",
-    "KRW-NEAR": "NEAR",
-    "KRW-VET": "VET",
-    "KRW-KMNO": "KMNO",
-    "KRW-GTC": "GTC",
-    "KRW-B3": "B3",
-    "KRW-CYBER": "CYBER",
-    "KRW-HYPER": "HYPER",
-    "KRW-SENT": "SENT",
-    "KRW-AWE": "AWE",
-    "KRW-ZKC": "ZKC",
-    "KRW-ZKP": "ZKP",
-    "KRW-NEO": "NEO",
-    "KRW-IO": "IO",
-    "KRW-INJ": "INJ",
-    "KRW-SKR": "SKR",
-    "KRW-CARV": "CARV",
-    "KRW-ERA": "ERA",
-    "KRW-SEI": "SEI",
-    "KRW-ARX": "ARX",
-    "KRW-MMT": "MMT",
-    "KRW-MNT": "MNT",
-    "KRW-PONS": "PONS",
-    "KRW-API3": "API3",
-    "KRW-ENS": "ENS",
-    "KRW-IOTA": "IOTA",
+    "KRW-TAO": "TAO",
+    "KRW-SAND": "SAND",
+    "KRW-ELSA": "ELSA",
     "KRW-O": "O",
-    "KRW-BCH": "BCH",
-    "KRW-BEAM": "BEAM",
-    "KRW-BAT": "BAT",
+    "KRW-ORCA": "ORCA",
+    "KRW-ZORA": "ZORA",
+    "KRW-VET": "VET",
+    "KRW-WLFI": "WLFI",
+    "KRW-WLD": "WLD",
+    "KRW-FIL": "FIL",
+    "KRW-BREV": "BREV",
+    "KRW-EUL": "EUL",
+    "KRW-KMNO": "KMNO",
+    "KRW-ERA": "ERA",
+    "KRW-UNI": "UNI",
     "KRW-PUMP": "PUMP",
-    "KRW-DOS": "DOS",
-    "KRW-RENDER": "RENDER",
+    "KRW-CELO": "CELO",
+    "KRW-AERO": "AERO",
+    "KRW-NEAR": "NEAR",
+    "KRW-ICP": "ICP",
+    "KRW-BAT": "BAT",
+    "KRW-PROM": "PROM",
+    "KRW-MINA": "MINA",
+    "KRW-MORPHO": "MORPHO",
+    "KRW-VVV": "VVV",
+    "KRW-PONS": "PONS",
+    "KRW-TRUMP": "TRUMP",
+    "KRW-XRP": "XRP",
+    "KRW-NEO": "NEO",
+    "KRW-SENT": "SENT",
+    "KRW-RAY": "RAY",
+    "KRW-ZRO": "ZRO",
+    "KRW-PIEVERSE": "PIEVERSE",
+    "KRW-SUI": "SUI",
+    "KRW-OPG": "OPG",
+    "KRW-WCT": "WCT",
+    "KRW-JTO": "JTO",
+    "KRW-SEI": "SEI",
+    "KRW-WAL": "WAL",
+    "KRW-LINK": "LINK",
+    "KRW-SPK": "SPK",
+    "KRW-ETC": "ETC",
+    "KRW-PENDLE": "PENDLE",
+    "KRW-TREE": "TREE",
+    "KRW-CYBER": "CYBER",
+    "KRW-GTC": "GTC",
     "KRW-APT": "APT",
-    "KRW-2Z": "2Z",
-    "KRW-F": "F",
-    "KRW-BIO": "BIO",
-    "KRW-NMR": "NMR",
-    "KRW-MANA": "MANA",
-    "KRW-VTHO": "VTHO",
-    "KRW-MOODENG": "MOODENG",
+    "KRW-ENS": "ENS",
+    "KRW-DOT": "DOT",
+    "KRW-THETA": "THETA",
+    "KRW-VANA": "VANA",
+    "KRW-LINEA": "LINEA",
+    "KRW-HYPER": "HYPER",
+    "KRW-FLOCK": "FLOCK",
+    "KRW-TAIKO": "TAIKO",
+    "KRW-MMT": "MMT",
+    "KRW-GMT": "GMT",
+    "KRW-ZKC": "ZKC",
+    "KRW-MIRA": "MIRA",
+    "KRW-ZKP": "ZKP",
+    "KRW-MEGA": "MEGA",
+    "KRW-PROS": "PROS",
+    "KRW-MASK": "MASK",
+    "KRW-BCH": "BCH",
+    "KRW-LA": "LA",
+    "KRW-CAP": "CAP",
+    "KRW-ARX": "ARX",
+    "KRW-TIA": "TIA",
+    "KRW-MON": "MON",
+    "KRW-AAVE": "AAVE",
+    "KRW-AXL": "AXL",
     "KRW-ATOM": "ATOM",
-    "KRW-BIGTIME": "BIGTIME"
+    "KRW-RENDER": "RENDER",
+    "KRW-MANA": "MANA",
+    "KRW-ATH": "ATH",
+    "KRW-NXPC": "NXPC",
+    "KRW-ESP": "ESP",
+    "KRW-F": "F",
+    "KRW-IOST": "IOST",
+    "KRW-ZBT": "ZBT",
+    "KRW-BEAM": "BEAM",
+    "KRW-2Z": "2Z",
+    "KRW-FF": "FF",
+    "KRW-PUFFER": "PUFFER",
+    "KRW-VIRTUAL": "VIRTUAL",
+    "KRW-T": "T",
+    "KRW-AWE": "AWE",
+    "KRW-STX": "STX",
+    "KRW-INJ": "INJ",
+    "KRW-GRT": "GRT",
+    "KRW-ONT": "ONT"
   },
   "pairs": {
-    "VVV": {
-      "coin": "VVV",
-      "upbit_symbol": "KRW-VVV",
+    "ETHFI": {
+      "coin": "ETHFI",
+      "upbit_symbol": "KRW-ETHFI",
       "venues": [
         "binance",
         "bingx",
@@ -8654,17 +9536,93 @@ if __name__ == "__main__":
         "okx",
         "pionex"
       ],
-      "best_corr": 0.924,
-      "best_p90_dev_bps": 32.0,
+      "best_corr": 0.917,
+      "best_p90_dev_bps": 23.5,
       "venue_symbols": {
-        "binance": "VVVUSDT",
-        "bingx": "VVV-USDT",
-        "bybit": "VVVUSDT",
-        "gateio": "VVV_USDT",
-        "kucoin": "VVVUSDTM",
-        "mexc": "VVV_USDT",
-        "okx": "VVV-USDT-SWAP",
-        "pionex": "VVV_USDT_PERP"
+        "binance": "ETHFIUSDT",
+        "bingx": "ETHFI-USDT",
+        "bybit": "ETHFIUSDT",
+        "gateio": "ETHFI_USDT",
+        "kucoin": "ETHFIUSDTM",
+        "mexc": "ETHFI_USDT",
+        "okx": "ETHFI-USDT-SWAP",
+        "pionex": "ETHFI_USDT_PERP"
+      }
+    },
+    "AXS": {
+      "coin": "AXS",
+      "upbit_symbol": "KRW-AXS",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "gateio",
+        "kucoin",
+        "mexc",
+        "okx",
+        "pionex"
+      ],
+      "best_corr": 0.895,
+      "best_p90_dev_bps": 19.7,
+      "venue_symbols": {
+        "binance": "AXSUSDT",
+        "bingx": "AXS-USDT",
+        "bybit": "AXSUSDT",
+        "gateio": "AXS_USDT",
+        "kucoin": "AXSUSDTM",
+        "mexc": "AXS_USDT",
+        "okx": "AXS-USDT-SWAP",
+        "pionex": "AXS_USDT_PERP"
+      }
+    },
+    "SPX": {
+      "coin": "SPX",
+      "upbit_symbol": "KRW-SPX",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "gateio",
+        "kucoin",
+        "mexc",
+        "okx",
+        "pionex"
+      ],
+      "best_corr": 0.89,
+      "best_p90_dev_bps": 35.0,
+      "venue_symbols": {
+        "binance": "SPXUSDT",
+        "bingx": "SPX-USDT",
+        "bybit": "SPXUSDT",
+        "gateio": "SPX_USDT",
+        "kucoin": "SPXUSDTM",
+        "mexc": "SPX_USDT",
+        "okx": "SPX-USDT-SWAP",
+        "pionex": "SPX_USDT_PERP"
+      }
+    },
+    "CFX": {
+      "coin": "CFX",
+      "upbit_symbol": "KRW-CFX",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "gateio",
+        "kucoin",
+        "mexc",
+        "okx"
+      ],
+      "best_corr": 0.885,
+      "best_p90_dev_bps": 23.1,
+      "venue_symbols": {
+        "binance": "CFXUSDT",
+        "bingx": "CFX-USDT",
+        "bybit": "CFXUSDT",
+        "gateio": "CFX_USDT",
+        "kucoin": "CFXUSDTM",
+        "mexc": "CFX_USDT",
+        "okx": "CFX-USDT-SWAP"
       }
     },
     "LIT": {
@@ -8674,149 +9632,255 @@ if __name__ == "__main__":
         "binance",
         "bybit",
         "gateio",
+        "htx",
         "kucoin",
         "mexc",
         "okx",
         "pionex"
       ],
-      "best_corr": 0.875,
-      "best_p90_dev_bps": 25.0,
+      "best_corr": 0.88,
+      "best_p90_dev_bps": 20.8,
       "venue_symbols": {
         "binance": "LITUSDT",
         "bybit": "LITUSDT",
         "gateio": "LIT_USDT",
+        "htx": "LIT-USDT",
         "kucoin": "LITUSDTM",
         "mexc": "LIT_USDT",
         "okx": "LIT-USDT-SWAP",
         "pionex": "LIT_USDT_PERP"
       }
     },
-    "ICP": {
-      "coin": "ICP",
-      "upbit_symbol": "KRW-ICP",
+    "SYRUP": {
+      "coin": "SYRUP",
+      "upbit_symbol": "KRW-SYRUP",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "kucoin",
+        "mexc",
+        "okx"
+      ],
+      "best_corr": 0.872,
+      "best_p90_dev_bps": 40.8,
+      "venue_symbols": {
+        "binance": "SYRUPUSDT",
+        "bingx": "SYRUP-USDT",
+        "bybit": "SYRUPUSDT",
+        "kucoin": "SYRUPUSDTM",
+        "mexc": "SYRUP_USDT",
+        "okx": "SYRUP-USDT-SWAP"
+      }
+    },
+    "ENSO": {
+      "coin": "ENSO",
+      "upbit_symbol": "KRW-ENSO",
       "venues": [
         "binance",
         "bingx",
         "bybit",
         "gateio",
-        "kucoin",
         "mexc",
-        "okx",
-        "pionex"
+        "okx"
       ],
       "best_corr": 0.87,
-      "best_p90_dev_bps": 25.4,
+      "best_p90_dev_bps": 30.6,
       "venue_symbols": {
-        "binance": "ICPUSDT",
-        "bingx": "ICP-USDT",
-        "bybit": "ICPUSDT",
-        "gateio": "ICP_USDT",
-        "kucoin": "ICPUSDTM",
-        "mexc": "ICP_USDT",
-        "okx": "ICP-USDT-SWAP",
-        "pionex": "ICP_USDT_PERP"
+        "binance": "ENSOUSDT",
+        "bingx": "ENSO-USDT",
+        "bybit": "ENSOUSDT",
+        "gateio": "ENSO_USDT",
+        "mexc": "ENSO_USDT",
+        "okx": "ENSO-USDT-SWAP"
       }
     },
-    "ETHFI": {
-      "coin": "ETHFI",
-      "upbit_symbol": "KRW-ETHFI",
+    "TAO": {
+      "coin": "TAO",
+      "upbit_symbol": "KRW-TAO",
       "venues": [
         "binance",
         "bingx",
         "bybit",
         "gateio",
+        "htx",
+        "kucoin",
         "mexc",
-        "okx",
         "pionex"
       ],
-      "best_corr": 0.862,
-      "best_p90_dev_bps": 26.4,
+      "best_corr": 0.858,
+      "best_p90_dev_bps": 17.1,
       "venue_symbols": {
-        "binance": "ETHFIUSDT",
-        "bingx": "ETHFI-USDT",
-        "bybit": "ETHFIUSDT",
-        "gateio": "ETHFI_USDT",
-        "mexc": "ETHFI_USDT",
-        "okx": "ETHFI-USDT-SWAP",
-        "pionex": "ETHFI_USDT_PERP"
+        "binance": "TAOUSDT",
+        "bingx": "TAO-USDT",
+        "bybit": "TAOUSDT",
+        "gateio": "TAO_USDT",
+        "htx": "TAO-USDT",
+        "kucoin": "TAOUSDTM",
+        "mexc": "TAO_USDT",
+        "pionex": "TAO_USDT_PERP"
       }
     },
-    "RAY": {
-      "coin": "RAY",
-      "upbit_symbol": "KRW-RAY",
+    "SAND": {
+      "coin": "SAND",
+      "upbit_symbol": "KRW-SAND",
       "venues": [
+        "binance",
         "bingx",
+        "bybit",
         "gateio",
         "kucoin",
         "mexc",
         "okx",
         "pionex"
       ],
-      "best_corr": 0.844,
-      "best_p90_dev_bps": 21.4,
+      "best_corr": 0.851,
+      "best_p90_dev_bps": 40.1,
       "venue_symbols": {
-        "bingx": "RAY-USDT",
-        "gateio": "RAY_USDT",
-        "kucoin": "RAYUSDTM",
-        "mexc": "RAY_USDT",
-        "okx": "RAY-USDT-SWAP",
-        "pionex": "RAY_USDT_PERP"
+        "binance": "SANDUSDT",
+        "bingx": "SAND-USDT",
+        "bybit": "SANDUSDT",
+        "gateio": "SAND_USDT",
+        "kucoin": "SANDUSDTM",
+        "mexc": "SAND_USDT",
+        "okx": "SAND-USDT-SWAP",
+        "pionex": "SAND_USDT_PERP"
       }
     },
-    "PROM": {
-      "coin": "PROM",
-      "upbit_symbol": "KRW-PROM",
+    "ELSA": {
+      "coin": "ELSA",
+      "upbit_symbol": "KRW-ELSA",
       "venues": [
         "binance",
         "bingx",
+        "bybit",
+        "gateio",
+        "mexc",
+        "pionex"
+      ],
+      "best_corr": 0.85,
+      "best_p90_dev_bps": 35.8,
+      "venue_symbols": {
+        "binance": "ELSAUSDT",
+        "bingx": "ELSA-USDT",
+        "bybit": "ELSAUSDT",
+        "gateio": "ELSA_USDT",
+        "mexc": "ELSA_USDT",
+        "pionex": "ELSA_USDT_PERP"
+      }
+    },
+    "O": {
+      "coin": "O",
+      "upbit_symbol": "KRW-O",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "gateio",
+        "kucoin",
+        "mexc",
+        "okx"
+      ],
+      "best_corr": 0.849,
+      "best_p90_dev_bps": 42.5,
+      "venue_symbols": {
+        "binance": "OUSDT",
+        "bingx": "O-USDT",
+        "bybit": "OUSDT",
+        "gateio": "O_USDT",
+        "kucoin": "OUSDTM",
+        "mexc": "O_USDT",
+        "okx": "O-USDT-SWAP"
+      }
+    },
+    "ORCA": {
+      "coin": "ORCA",
+      "upbit_symbol": "KRW-ORCA",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
         "gateio",
         "kucoin",
         "mexc"
       ],
-      "best_corr": 0.836,
-      "best_p90_dev_bps": 30.6,
+      "best_corr": 0.842,
+      "best_p90_dev_bps": 17.9,
       "venue_symbols": {
-        "binance": "PROMUSDT",
-        "bingx": "PROM-USDT",
-        "gateio": "PROM_USDT",
-        "kucoin": "PROMUSDTM",
-        "mexc": "PROM_USDT"
+        "binance": "ORCAUSDT",
+        "bingx": "ORCA-USDT",
+        "bybit": "ORCAUSDT",
+        "gateio": "ORCA_USDT",
+        "kucoin": "ORCAUSDTM",
+        "mexc": "ORCA_USDT"
       }
     },
-    "AXL": {
-      "coin": "AXL",
-      "upbit_symbol": "KRW-AXL",
+    "ZORA": {
+      "coin": "ZORA",
+      "upbit_symbol": "KRW-ZORA",
       "venues": [
         "binance",
         "bingx",
         "bybit",
+        "kucoin",
+        "mexc",
+        "okx"
+      ],
+      "best_corr": 0.842,
+      "best_p90_dev_bps": 22.2,
+      "venue_symbols": {
+        "binance": "ZORAUSDT",
+        "bingx": "ZORA-USDT",
+        "bybit": "ZORAUSDT",
+        "kucoin": "ZORAUSDTM",
+        "mexc": "ZORA_USDT",
+        "okx": "ZORA-USDT-SWAP"
+      }
+    },
+    "VET": {
+      "coin": "VET",
+      "upbit_symbol": "KRW-VET",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "kucoin",
         "mexc",
         "pionex"
       ],
-      "best_corr": 0.827,
-      "best_p90_dev_bps": 27.7,
+      "best_corr": 0.835,
+      "best_p90_dev_bps": 23.7,
       "venue_symbols": {
-        "binance": "AXLUSDT",
-        "bingx": "AXL-USDT",
-        "bybit": "AXLUSDT",
-        "mexc": "AXL_USDT",
-        "pionex": "AXL_USDT_PERP"
+        "binance": "VETUSDT",
+        "bingx": "VET-USDT",
+        "bybit": "VETUSDT",
+        "kucoin": "VETUSDTM",
+        "mexc": "VET_USDT",
+        "pionex": "VET_USDT_PERP"
       }
     },
-    "TRUMP": {
-      "coin": "TRUMP",
-      "upbit_symbol": "KRW-TRUMP",
+    "WLFI": {
+      "coin": "WLFI",
+      "upbit_symbol": "KRW-WLFI",
       "venues": [
+        "binance",
+        "bingx",
         "bybit",
+        "gateio",
         "kucoin",
+        "mexc",
         "okx"
       ],
-      "best_corr": 0.824,
-      "best_p90_dev_bps": 11.3,
+      "best_corr": 0.834,
+      "best_p90_dev_bps": 21.2,
       "venue_symbols": {
-        "bybit": "TRUMPUSDT",
-        "kucoin": "TRUMPUSDTM",
-        "okx": "TRUMP-USDT-SWAP"
+        "binance": "WLFIUSDT",
+        "bingx": "WLFI-USDT",
+        "bybit": "WLFIUSDT",
+        "gateio": "WLFI_USDT",
+        "kucoin": "WLFIUSDTM",
+        "mexc": "WLFI_USDT",
+        "okx": "WLFI-USDT-SWAP"
       }
     },
     "WLD": {
@@ -8833,8 +9897,8 @@ if __name__ == "__main__":
         "okx",
         "pionex"
       ],
-      "best_corr": 0.819,
-      "best_p90_dev_bps": 15.7,
+      "best_corr": 0.834,
+      "best_p90_dev_bps": 21.0,
       "venue_symbols": {
         "binance": "WLDUSDT",
         "bingx": "WLD-USDT",
@@ -8847,250 +9911,30 @@ if __name__ == "__main__":
         "pionex": "WLD_USDT_PERP"
       }
     },
-    "ELSA": {
-      "coin": "ELSA",
-      "upbit_symbol": "KRW-ELSA",
+    "FIL": {
+      "coin": "FIL",
+      "upbit_symbol": "KRW-FIL",
       "venues": [
         "binance",
         "bingx",
         "bybit",
         "gateio",
-        "mexc",
-        "pionex"
-      ],
-      "best_corr": 0.816,
-      "best_p90_dev_bps": 56.1,
-      "venue_symbols": {
-        "binance": "ELSAUSDT",
-        "bingx": "ELSA-USDT",
-        "bybit": "ELSAUSDT",
-        "gateio": "ELSA_USDT",
-        "mexc": "ELSA_USDT",
-        "pionex": "ELSA_USDT_PERP"
-      }
-    },
-    "SPX": {
-      "coin": "SPX",
-      "upbit_symbol": "KRW-SPX",
-      "venues": [
-        "binance",
-        "bingx",
-        "bybit",
-        "gateio",
+        "htx",
         "kucoin",
-        "mexc",
         "okx",
         "pionex"
       ],
-      "best_corr": 0.809,
-      "best_p90_dev_bps": 37.3,
+      "best_corr": 0.824,
+      "best_p90_dev_bps": 20.3,
       "venue_symbols": {
-        "binance": "SPXUSDT",
-        "bingx": "SPX-USDT",
-        "bybit": "SPXUSDT",
-        "gateio": "SPX_USDT",
-        "kucoin": "SPXUSDTM",
-        "mexc": "SPX_USDT",
-        "okx": "SPX-USDT-SWAP",
-        "pionex": "SPX_USDT_PERP"
-      }
-    },
-    "SOMI": {
-      "coin": "SOMI",
-      "upbit_symbol": "KRW-SOMI",
-      "venues": [
-        "binance",
-        "bingx",
-        "bybit",
-        "mexc"
-      ],
-      "best_corr": 0.802,
-      "best_p90_dev_bps": 41.3,
-      "venue_symbols": {
-        "binance": "SOMIUSDT",
-        "bingx": "SOMI-USDT",
-        "bybit": "SOMIUSDT",
-        "mexc": "SOMI_USDT"
-      }
-    },
-    "GRT": {
-      "coin": "GRT",
-      "upbit_symbol": "KRW-GRT",
-      "venues": [
-        "binance",
-        "bybit",
-        "kucoin",
-        "mexc"
-      ],
-      "best_corr": 0.8,
-      "best_p90_dev_bps": 25.2,
-      "venue_symbols": {
-        "binance": "GRTUSDT",
-        "bybit": "GRTUSDT",
-        "kucoin": "GRTUSDTM",
-        "mexc": "GRT_USDT"
-      }
-    },
-    "EUL": {
-      "coin": "EUL",
-      "upbit_symbol": "KRW-EUL",
-      "venues": [
-        "kucoin"
-      ],
-      "best_corr": 0.798,
-      "best_p90_dev_bps": 24.0,
-      "venue_symbols": {
-        "kucoin": "EULUSDTM"
-      }
-    },
-    "ZRO": {
-      "coin": "ZRO",
-      "upbit_symbol": "KRW-ZRO",
-      "venues": [
-        "binance",
-        "bingx",
-        "bybit",
-        "gateio",
-        "kucoin",
-        "mexc",
-        "okx",
-        "pionex"
-      ],
-      "best_corr": 0.797,
-      "best_p90_dev_bps": 22.2,
-      "venue_symbols": {
-        "binance": "ZROUSDT",
-        "bingx": "ZRO-USDT",
-        "bybit": "ZROUSDT",
-        "gateio": "ZRO_USDT",
-        "kucoin": "ZROUSDTM",
-        "mexc": "ZRO_USDT",
-        "okx": "ZRO-USDT-SWAP",
-        "pionex": "ZRO_USDT_PERP"
-      }
-    },
-    "ZORA": {
-      "coin": "ZORA",
-      "upbit_symbol": "KRW-ZORA",
-      "venues": [
-        "binance",
-        "bingx",
-        "bybit",
-        "kucoin",
-        "mexc",
-        "okx"
-      ],
-      "best_corr": 0.796,
-      "best_p90_dev_bps": 27.4,
-      "venue_symbols": {
-        "binance": "ZORAUSDT",
-        "bingx": "ZORA-USDT",
-        "bybit": "ZORAUSDT",
-        "kucoin": "ZORAUSDTM",
-        "mexc": "ZORA_USDT",
-        "okx": "ZORA-USDT-SWAP"
-      }
-    },
-    "CAP": {
-      "coin": "CAP",
-      "upbit_symbol": "KRW-CAP",
-      "venues": [
-        "binance",
-        "bingx",
-        "bybit",
-        "gateio",
-        "kucoin",
-        "mexc",
-        "okx"
-      ],
-      "best_corr": 0.791,
-      "best_p90_dev_bps": 21.0,
-      "venue_symbols": {
-        "binance": "CAPUSDT",
-        "bingx": "CAP-USDT",
-        "bybit": "CAPUSDT",
-        "gateio": "CAP_USDT",
-        "kucoin": "CAPUSDTM",
-        "mexc": "CAP_USDT",
-        "okx": "CAP-USDT-SWAP"
-      }
-    },
-    "PIEVERSE": {
-      "coin": "PIEVERSE",
-      "upbit_symbol": "KRW-PIEVERSE",
-      "venues": [
-        "binance",
-        "bingx",
-        "bybit",
-        "gateio",
-        "kucoin",
-        "mexc",
-        "okx"
-      ],
-      "best_corr": 0.788,
-      "best_p90_dev_bps": 22.1,
-      "venue_symbols": {
-        "binance": "PIEVERSEUSDT",
-        "bingx": "PIEVERSE-USDT",
-        "bybit": "PIEVERSEUSDT",
-        "gateio": "PIEVERSE_USDT",
-        "kucoin": "PIEVERSEUSDTM",
-        "mexc": "PIEVERSE_USDT",
-        "okx": "PIEVERSE-USDT-SWAP"
-      }
-    },
-    "WCT": {
-      "coin": "WCT",
-      "upbit_symbol": "KRW-WCT",
-      "venues": [
-        "binance",
-        "bingx",
-        "bybit",
-        "mexc",
-        "okx"
-      ],
-      "best_corr": 0.785,
-      "best_p90_dev_bps": 32.4,
-      "venue_symbols": {
-        "binance": "WCTUSDT",
-        "bingx": "WCT-USDT",
-        "bybit": "WCTUSDT",
-        "mexc": "WCT_USDT",
-        "okx": "WCT-USDT-SWAP"
-      }
-    },
-    "PROS": {
-      "coin": "PROS",
-      "upbit_symbol": "KRW-PROS",
-      "venues": [
-        "kucoin",
-        "okx"
-      ],
-      "best_corr": 0.777,
-      "best_p90_dev_bps": 32.6,
-      "venue_symbols": {
-        "kucoin": "PROSUSDTM",
-        "okx": "PROS-USDT-SWAP"
-      }
-    },
-    "ENSO": {
-      "coin": "ENSO",
-      "upbit_symbol": "KRW-ENSO",
-      "venues": [
-        "binance",
-        "bingx",
-        "bybit",
-        "mexc",
-        "okx"
-      ],
-      "best_corr": 0.774,
-      "best_p90_dev_bps": 22.6,
-      "venue_symbols": {
-        "binance": "ENSOUSDT",
-        "bingx": "ENSO-USDT",
-        "bybit": "ENSOUSDT",
-        "mexc": "ENSO_USDT",
-        "okx": "ENSO-USDT-SWAP"
+        "binance": "FILUSDT",
+        "bingx": "FIL-USDT",
+        "bybit": "FILUSDT",
+        "gateio": "FIL_USDT",
+        "htx": "FIL-USDT",
+        "kucoin": "FILUSDTM",
+        "okx": "FIL-USDT-SWAP",
+        "pionex": "FIL_USDT_PERP"
       }
     },
     "BREV": {
@@ -9103,8 +9947,8 @@ if __name__ == "__main__":
         "mexc",
         "okx"
       ],
-      "best_corr": 0.765,
-      "best_p90_dev_bps": 33.8,
+      "best_corr": 0.824,
+      "best_p90_dev_bps": 24.7,
       "venue_symbols": {
         "binance": "BREVUSDT",
         "bingx": "BREV-USDT",
@@ -9113,18 +9957,156 @@ if __name__ == "__main__":
         "okx": "BREV-USDT-SWAP"
       }
     },
-    "ESP": {
-      "coin": "ESP",
-      "upbit_symbol": "KRW-ESP",
+    "EUL": {
+      "coin": "EUL",
+      "upbit_symbol": "KRW-EUL",
       "venues": [
-        "kucoin",
+        "kucoin"
+      ],
+      "best_corr": 0.82,
+      "best_p90_dev_bps": 25.5,
+      "venue_symbols": {
+        "kucoin": "EULUSDTM"
+      }
+    },
+    "KMNO": {
+      "coin": "KMNO",
+      "upbit_symbol": "KRW-KMNO",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "mexc",
         "okx"
       ],
-      "best_corr": 0.764,
-      "best_p90_dev_bps": 44.6,
+      "best_corr": 0.818,
+      "best_p90_dev_bps": 25.2,
       "venue_symbols": {
-        "kucoin": "ESPUSDTM",
-        "okx": "ESP-USDT-SWAP"
+        "binance": "KMNOUSDT",
+        "bingx": "KMNO-USDT",
+        "bybit": "KMNOUSDT",
+        "mexc": "KMNO_USDT",
+        "okx": "KMNO-USDT-SWAP"
+      }
+    },
+    "ERA": {
+      "coin": "ERA",
+      "upbit_symbol": "KRW-ERA",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "gateio",
+        "kucoin",
+        "mexc"
+      ],
+      "best_corr": 0.815,
+      "best_p90_dev_bps": 63.8,
+      "venue_symbols": {
+        "binance": "ERAUSDT",
+        "bingx": "ERA-USDT",
+        "bybit": "ERAUSDT",
+        "gateio": "ERA_USDT",
+        "kucoin": "ERAUSDTM",
+        "mexc": "ERA_USDT"
+      }
+    },
+    "UNI": {
+      "coin": "UNI",
+      "upbit_symbol": "KRW-UNI",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "gateio",
+        "htx",
+        "kucoin",
+        "mexc",
+        "okx",
+        "pionex"
+      ],
+      "best_corr": 0.814,
+      "best_p90_dev_bps": 16.9,
+      "venue_symbols": {
+        "binance": "UNIUSDT",
+        "bingx": "UNI-USDT",
+        "bybit": "UNIUSDT",
+        "gateio": "UNI_USDT",
+        "htx": "UNI-USDT",
+        "kucoin": "UNIUSDTM",
+        "mexc": "UNI_USDT",
+        "okx": "UNI-USDT-SWAP",
+        "pionex": "UNI_USDT_PERP"
+      }
+    },
+    "PUMP": {
+      "coin": "PUMP",
+      "upbit_symbol": "KRW-PUMP",
+      "venues": [
+        "binance",
+        "bingx",
+        "gateio",
+        "htx",
+        "kucoin",
+        "okx",
+        "pionex"
+      ],
+      "best_corr": 0.813,
+      "best_p90_dev_bps": 23.8,
+      "venue_symbols": {
+        "binance": "PUMPUSDT",
+        "bingx": "PUMP-USDT",
+        "gateio": "PUMP_USDT",
+        "htx": "PUMP-USDT",
+        "kucoin": "PUMPUSDTM",
+        "okx": "PUMP-USDT-SWAP",
+        "pionex": "PUMP_USDT_PERP"
+      }
+    },
+    "CELO": {
+      "coin": "CELO",
+      "upbit_symbol": "KRW-CELO",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "mexc",
+        "okx"
+      ],
+      "best_corr": 0.811,
+      "best_p90_dev_bps": 75.3,
+      "venue_symbols": {
+        "binance": "CELOUSDT",
+        "bingx": "CELO-USDT",
+        "bybit": "CELOUSDT",
+        "mexc": "CELO_USDT",
+        "okx": "CELO-USDT-SWAP"
+      }
+    },
+    "AERO": {
+      "coin": "AERO",
+      "upbit_symbol": "KRW-AERO",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "gateio",
+        "kucoin",
+        "mexc",
+        "okx",
+        "pionex"
+      ],
+      "best_corr": 0.811,
+      "best_p90_dev_bps": 30.1,
+      "venue_symbols": {
+        "binance": "AEROUSDT",
+        "bingx": "AERO-USDT",
+        "bybit": "AEROUSDT",
+        "gateio": "AERO_USDT",
+        "kucoin": "AEROUSDTM",
+        "mexc": "AERO_USDT",
+        "okx": "AERO-USDT-SWAP",
+        "pionex": "AERO_USDT_PERP"
       }
     },
     "NEAR": {
@@ -9141,8 +10123,8 @@ if __name__ == "__main__":
         "okx",
         "pionex"
       ],
-      "best_corr": 0.762,
-      "best_p90_dev_bps": 12.2,
+      "best_corr": 0.811,
+      "best_p90_dev_bps": 16.1,
       "venue_symbols": {
         "binance": "NEARUSDT",
         "bingx": "NEAR-USDT",
@@ -9155,176 +10137,206 @@ if __name__ == "__main__":
         "pionex": "NEAR_USDT_PERP"
       }
     },
-    "VET": {
-      "coin": "VET",
-      "upbit_symbol": "KRW-VET",
+    "ICP": {
+      "coin": "ICP",
+      "upbit_symbol": "KRW-ICP",
       "venues": [
         "binance",
         "bingx",
         "bybit",
+        "gateio",
+        "kucoin",
+        "mexc",
+        "okx",
+        "pionex"
+      ],
+      "best_corr": 0.811,
+      "best_p90_dev_bps": 19.2,
+      "venue_symbols": {
+        "binance": "ICPUSDT",
+        "bingx": "ICP-USDT",
+        "bybit": "ICPUSDT",
+        "gateio": "ICP_USDT",
+        "kucoin": "ICPUSDTM",
+        "mexc": "ICP_USDT",
+        "okx": "ICP-USDT-SWAP",
+        "pionex": "ICP_USDT_PERP"
+      }
+    },
+    "BAT": {
+      "coin": "BAT",
+      "upbit_symbol": "KRW-BAT",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "gateio",
+        "kucoin",
+        "mexc",
+        "okx",
+        "pionex"
+      ],
+      "best_corr": 0.81,
+      "best_p90_dev_bps": 40.3,
+      "venue_symbols": {
+        "binance": "BATUSDT",
+        "bingx": "BAT-USDT",
+        "bybit": "BATUSDT",
+        "gateio": "BAT_USDT",
+        "kucoin": "BATUSDTM",
+        "mexc": "BAT_USDT",
+        "okx": "BAT-USDT-SWAP",
+        "pionex": "BAT_USDT_PERP"
+      }
+    },
+    "PROM": {
+      "coin": "PROM",
+      "upbit_symbol": "KRW-PROM",
+      "venues": [
+        "binance",
+        "bingx",
+        "gateio",
         "kucoin",
         "mexc"
       ],
-      "best_corr": 0.761,
-      "best_p90_dev_bps": 17.7,
+      "best_corr": 0.807,
+      "best_p90_dev_bps": 22.9,
       "venue_symbols": {
-        "binance": "VETUSDT",
-        "bingx": "VET-USDT",
-        "bybit": "VETUSDT",
-        "kucoin": "VETUSDTM",
-        "mexc": "VET_USDT"
+        "binance": "PROMUSDT",
+        "bingx": "PROM-USDT",
+        "gateio": "PROM_USDT",
+        "kucoin": "PROMUSDTM",
+        "mexc": "PROM_USDT"
       }
     },
-    "KMNO": {
-      "coin": "KMNO",
-      "upbit_symbol": "KRW-KMNO",
+    "MINA": {
+      "coin": "MINA",
+      "upbit_symbol": "KRW-MINA",
       "venues": [
         "binance",
         "bingx",
         "bybit",
+        "gateio",
+        "kucoin",
         "mexc",
         "okx"
       ],
-      "best_corr": 0.75,
-      "best_p90_dev_bps": 24.0,
+      "best_corr": 0.807,
+      "best_p90_dev_bps": 24.7,
       "venue_symbols": {
-        "binance": "KMNOUSDT",
-        "bingx": "KMNO-USDT",
-        "bybit": "KMNOUSDT",
-        "mexc": "KMNO_USDT",
-        "okx": "KMNO-USDT-SWAP"
+        "binance": "MINAUSDT",
+        "bingx": "MINA-USDT",
+        "bybit": "MINAUSDT",
+        "gateio": "MINA_USDT",
+        "kucoin": "MINAUSDTM",
+        "mexc": "MINA_USDT",
+        "okx": "MINA-USDT-SWAP"
       }
     },
-    "GTC": {
-      "coin": "GTC",
-      "upbit_symbol": "KRW-GTC",
-      "venues": [
-        "binance",
-        "bingx"
-      ],
-      "best_corr": 0.741,
-      "best_p90_dev_bps": 59.8,
-      "venue_symbols": {
-        "binance": "GTCUSDT",
-        "bingx": "GTC-USDT"
-      }
-    },
-    "B3": {
-      "coin": "B3",
-      "upbit_symbol": "KRW-B3",
-      "venues": [
-        "bybit",
-        "mexc"
-      ],
-      "best_corr": 0.739,
-      "best_p90_dev_bps": 63.7,
-      "venue_symbols": {
-        "bybit": "B3USDT",
-        "mexc": "B3_USDT"
-      }
-    },
-    "CYBER": {
-      "coin": "CYBER",
-      "upbit_symbol": "KRW-CYBER",
+    "MORPHO": {
+      "coin": "MORPHO",
+      "upbit_symbol": "KRW-MORPHO",
       "venues": [
         "binance",
         "bingx",
-        "bybit",
-        "mexc"
+        "kucoin",
+        "mexc",
+        "okx"
       ],
-      "best_corr": 0.738,
-      "best_p90_dev_bps": 35.6,
+      "best_corr": 0.801,
+      "best_p90_dev_bps": 26.4,
       "venue_symbols": {
-        "binance": "CYBERUSDT",
-        "bingx": "CYBER-USDT",
-        "bybit": "CYBERUSDT",
-        "mexc": "CYBER_USDT"
+        "binance": "MORPHOUSDT",
+        "bingx": "MORPHO-USDT",
+        "kucoin": "MORPHOUSDTM",
+        "mexc": "MORPHO_USDT",
+        "okx": "MORPHO-USDT-SWAP"
       }
     },
-    "HYPER": {
-      "coin": "HYPER",
-      "upbit_symbol": "KRW-HYPER",
-      "venues": [
-        "binance",
-        "bybit",
-        "mexc"
-      ],
-      "best_corr": 0.737,
-      "best_p90_dev_bps": 29.9,
-      "venue_symbols": {
-        "binance": "HYPERUSDT",
-        "bybit": "HYPERUSDT",
-        "mexc": "HYPER_USDT"
-      }
-    },
-    "SENT": {
-      "coin": "SENT",
-      "upbit_symbol": "KRW-SENT",
+    "VVV": {
+      "coin": "VVV",
+      "upbit_symbol": "KRW-VVV",
       "venues": [
         "kucoin"
       ],
-      "best_corr": 0.736,
-      "best_p90_dev_bps": 37.5,
+      "best_corr": 0.789,
+      "best_p90_dev_bps": 30.7,
       "venue_symbols": {
-        "kucoin": "SENTUSDTM"
+        "kucoin": "VVVUSDTM"
       }
     },
-    "AWE": {
-      "coin": "AWE",
-      "upbit_symbol": "KRW-AWE",
+    "PONS": {
+      "coin": "PONS",
+      "upbit_symbol": "KRW-PONS",
       "venues": [
         "binance",
         "bingx",
         "bybit",
-        "mexc"
-      ],
-      "best_corr": 0.735,
-      "best_p90_dev_bps": 30.1,
-      "venue_symbols": {
-        "binance": "AWEUSDT",
-        "bingx": "AWE-USDT",
-        "bybit": "AWEUSDT",
-        "mexc": "AWE_USDT"
-      }
-    },
-    "ZKC": {
-      "coin": "ZKC",
-      "upbit_symbol": "KRW-ZKC",
-      "venues": [
-        "binance",
-        "bingx",
-        "bybit",
-        "mexc"
-      ],
-      "best_corr": 0.731,
-      "best_p90_dev_bps": 29.3,
-      "venue_symbols": {
-        "binance": "ZKCUSDT",
-        "bingx": "ZKC-USDT",
-        "bybit": "ZKCUSDT",
-        "mexc": "ZKC_USDT"
-      }
-    },
-    "ZKP": {
-      "coin": "ZKP",
-      "upbit_symbol": "KRW-ZKP",
-      "venues": [
-        "binance",
-        "bingx",
-        "bybit",
+        "gateio",
+        "htx",
         "kucoin",
         "mexc",
-        "okx"
+        "okx",
+        "pionex"
       ],
-      "best_corr": 0.728,
-      "best_p90_dev_bps": 27.9,
+      "best_corr": 0.789,
+      "best_p90_dev_bps": 35.0,
       "venue_symbols": {
-        "binance": "ZKPUSDT",
-        "bingx": "ZKP-USDT",
-        "bybit": "ZKPUSDT",
-        "kucoin": "ZKPUSDTM",
-        "mexc": "ZKP_USDT",
-        "okx": "ZKP-USDT-SWAP"
+        "binance": "PONSUSDT",
+        "bingx": "PONS-USDT",
+        "bybit": "PONSUSDT",
+        "gateio": "PONS_USDT",
+        "htx": "PONS-USDT",
+        "kucoin": "PONSUSDTM",
+        "mexc": "PONS_USDT",
+        "okx": "PONS-USDT-SWAP",
+        "pionex": "PONS_USDT_PERP"
+      }
+    },
+    "TRUMP": {
+      "coin": "TRUMP",
+      "upbit_symbol": "KRW-TRUMP",
+      "venues": [
+        "binance",
+        "bybit",
+        "gateio",
+        "kucoin",
+        "okx",
+        "pionex"
+      ],
+      "best_corr": 0.784,
+      "best_p90_dev_bps": 16.6,
+      "venue_symbols": {
+        "binance": "TRUMPUSDT",
+        "bybit": "TRUMPUSDT",
+        "gateio": "TRUMP_USDT",
+        "kucoin": "TRUMPUSDTM",
+        "okx": "TRUMP-USDT-SWAP",
+        "pionex": "TRUMP_USDT_PERP"
+      }
+    },
+    "XRP": {
+      "coin": "XRP",
+      "upbit_symbol": "KRW-XRP",
+      "venues": [
+        "binance",
+        "bingx",
+        "gateio",
+        "kucoin",
+        "mexc",
+        "okx",
+        "pionex"
+      ],
+      "best_corr": 0.781,
+      "best_p90_dev_bps": 11.2,
+      "venue_symbols": {
+        "binance": "XRPUSDT",
+        "bingx": "XRP-USDT",
+        "gateio": "XRP_USDT",
+        "kucoin": "XRPUSDTM",
+        "mexc": "XRP_USDT",
+        "okx": "XRP-USDT-SWAP",
+        "pionex": "XRP_USDT_PERP"
       }
     },
     "NEO": {
@@ -9336,8 +10348,8 @@ if __name__ == "__main__":
         "bybit",
         "mexc"
       ],
-      "best_corr": 0.727,
-      "best_p90_dev_bps": 24.3,
+      "best_corr": 0.777,
+      "best_p90_dev_bps": 21.1,
       "venue_symbols": {
         "binance": "NEOUSDT",
         "bingx": "NEO-USDT",
@@ -9345,98 +10357,194 @@ if __name__ == "__main__":
         "mexc": "NEO_USDT"
       }
     },
-    "IO": {
-      "coin": "IO",
-      "upbit_symbol": "KRW-IO",
-      "venues": [
-        "bybit",
-        "mexc",
-        "pionex"
-      ],
-      "best_corr": 0.719,
-      "best_p90_dev_bps": 47.4,
-      "venue_symbols": {
-        "bybit": "IOUSDT",
-        "mexc": "IO_USDT",
-        "pionex": "IO_USDT_PERP"
-      }
-    },
-    "INJ": {
-      "coin": "INJ",
-      "upbit_symbol": "KRW-INJ",
+    "SENT": {
+      "coin": "SENT",
+      "upbit_symbol": "KRW-SENT",
       "venues": [
         "binance",
         "bingx",
         "bybit",
         "gateio",
+        "kucoin",
         "mexc",
+        "okx",
         "pionex"
       ],
-      "best_corr": 0.718,
+      "best_corr": 0.777,
+      "best_p90_dev_bps": 33.2,
+      "venue_symbols": {
+        "binance": "SENTUSDT",
+        "bingx": "SENT-USDT",
+        "bybit": "SENTUSDT",
+        "gateio": "SENT_USDT",
+        "kucoin": "SENTUSDTM",
+        "mexc": "SENT_USDT",
+        "okx": "SENT-USDT-SWAP",
+        "pionex": "SENT_USDT_PERP"
+      }
+    },
+    "RAY": {
+      "coin": "RAY",
+      "upbit_symbol": "KRW-RAY",
+      "venues": [
+        "bingx",
+        "gateio",
+        "kucoin",
+        "mexc",
+        "okx",
+        "pionex"
+      ],
+      "best_corr": 0.777,
       "best_p90_dev_bps": 25.3,
       "venue_symbols": {
-        "binance": "INJUSDT",
-        "bingx": "INJ-USDT",
-        "bybit": "INJUSDT",
-        "gateio": "INJ_USDT",
-        "mexc": "INJ_USDT",
-        "pionex": "INJ_USDT_PERP"
+        "bingx": "RAY-USDT",
+        "gateio": "RAY_USDT",
+        "kucoin": "RAYUSDTM",
+        "mexc": "RAY_USDT",
+        "okx": "RAY-USDT-SWAP",
+        "pionex": "RAY_USDT_PERP"
       }
     },
-    "SKR": {
-      "coin": "SKR",
-      "upbit_symbol": "KRW-SKR",
-      "venues": [
-        "binance",
-        "bingx",
-        "bybit",
-        "pionex"
-      ],
-      "best_corr": 0.717,
-      "best_p90_dev_bps": 50.7,
-      "venue_symbols": {
-        "binance": "SKRUSDT",
-        "bingx": "SKR-USDT",
-        "bybit": "SKRUSDT",
-        "pionex": "SKR_USDT_PERP"
-      }
-    },
-    "CARV": {
-      "coin": "CARV",
-      "upbit_symbol": "KRW-CARV",
-      "venues": [
-        "binance",
-        "bingx",
-        "bybit",
-        "mexc"
-      ],
-      "best_corr": 0.712,
-      "best_p90_dev_bps": 47.9,
-      "venue_symbols": {
-        "binance": "CARVUSDT",
-        "bingx": "CARV-USDT",
-        "bybit": "CARVUSDT",
-        "mexc": "CARV_USDT"
-      }
-    },
-    "ERA": {
-      "coin": "ERA",
-      "upbit_symbol": "KRW-ERA",
+    "ZRO": {
+      "coin": "ZRO",
+      "upbit_symbol": "KRW-ZRO",
       "venues": [
         "binance",
         "bingx",
         "bybit",
         "gateio",
-        "mexc"
+        "kucoin",
+        "mexc",
+        "okx",
+        "pionex"
       ],
-      "best_corr": 0.71,
-      "best_p90_dev_bps": 70.0,
+      "best_corr": 0.777,
+      "best_p90_dev_bps": 23.9,
       "venue_symbols": {
-        "binance": "ERAUSDT",
-        "bingx": "ERA-USDT",
-        "bybit": "ERAUSDT",
-        "gateio": "ERA_USDT",
-        "mexc": "ERA_USDT"
+        "binance": "ZROUSDT",
+        "bingx": "ZRO-USDT",
+        "bybit": "ZROUSDT",
+        "gateio": "ZRO_USDT",
+        "kucoin": "ZROUSDTM",
+        "mexc": "ZRO_USDT",
+        "okx": "ZRO-USDT-SWAP",
+        "pionex": "ZRO_USDT_PERP"
+      }
+    },
+    "PIEVERSE": {
+      "coin": "PIEVERSE",
+      "upbit_symbol": "KRW-PIEVERSE",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "gateio",
+        "kucoin",
+        "mexc",
+        "okx"
+      ],
+      "best_corr": 0.776,
+      "best_p90_dev_bps": 20.8,
+      "venue_symbols": {
+        "binance": "PIEVERSEUSDT",
+        "bingx": "PIEVERSE-USDT",
+        "bybit": "PIEVERSEUSDT",
+        "gateio": "PIEVERSE_USDT",
+        "kucoin": "PIEVERSEUSDTM",
+        "mexc": "PIEVERSE_USDT",
+        "okx": "PIEVERSE-USDT-SWAP"
+      }
+    },
+    "SUI": {
+      "coin": "SUI",
+      "upbit_symbol": "KRW-SUI",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "gateio",
+        "htx",
+        "kucoin",
+        "mexc",
+        "okx",
+        "pionex"
+      ],
+      "best_corr": 0.776,
+      "best_p90_dev_bps": 15.7,
+      "venue_symbols": {
+        "binance": "SUIUSDT",
+        "bingx": "SUI-USDT",
+        "bybit": "SUIUSDT",
+        "gateio": "SUI_USDT",
+        "htx": "SUI-USDT",
+        "kucoin": "SUIUSDTM",
+        "mexc": "SUI_USDT",
+        "okx": "SUI-USDT-SWAP",
+        "pionex": "SUI_USDT_PERP"
+      }
+    },
+    "OPG": {
+      "coin": "OPG",
+      "upbit_symbol": "KRW-OPG",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "kucoin",
+        "mexc",
+        "okx"
+      ],
+      "best_corr": 0.773,
+      "best_p90_dev_bps": 39.9,
+      "venue_symbols": {
+        "binance": "OPGUSDT",
+        "bingx": "OPG-USDT",
+        "bybit": "OPGUSDT",
+        "kucoin": "OPGUSDTM",
+        "mexc": "OPG_USDT",
+        "okx": "OPG-USDT-SWAP"
+      }
+    },
+    "WCT": {
+      "coin": "WCT",
+      "upbit_symbol": "KRW-WCT",
+      "venues": [
+        "binance",
+        "bingx",
+        "mexc",
+        "okx"
+      ],
+      "best_corr": 0.772,
+      "best_p90_dev_bps": 32.1,
+      "venue_symbols": {
+        "binance": "WCTUSDT",
+        "bingx": "WCT-USDT",
+        "mexc": "WCT_USDT",
+        "okx": "WCT-USDT-SWAP"
+      }
+    },
+    "JTO": {
+      "coin": "JTO",
+      "upbit_symbol": "KRW-JTO",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "gateio",
+        "mexc",
+        "okx",
+        "pionex"
+      ],
+      "best_corr": 0.769,
+      "best_p90_dev_bps": 22.0,
+      "venue_symbols": {
+        "binance": "JTOUSDT",
+        "bingx": "JTO-USDT",
+        "bybit": "JTOUSDT",
+        "gateio": "JTO_USDT",
+        "mexc": "JTO_USDT",
+        "okx": "JTO-USDT-SWAP",
+        "pionex": "JTO_USDT_PERP"
       }
     },
     "SEI": {
@@ -9448,175 +10556,128 @@ if __name__ == "__main__":
         "bybit",
         "gateio",
         "kucoin",
-        "mexc"
+        "mexc",
+        "okx",
+        "pionex"
       ],
-      "best_corr": 0.705,
-      "best_p90_dev_bps": 22.8,
+      "best_corr": 0.766,
+      "best_p90_dev_bps": 19.3,
       "venue_symbols": {
         "binance": "SEIUSDT",
         "bingx": "SEI-USDT",
         "bybit": "SEIUSDT",
         "gateio": "SEI_USDT",
         "kucoin": "SEIUSDTM",
-        "mexc": "SEI_USDT"
+        "mexc": "SEI_USDT",
+        "okx": "SEI-USDT-SWAP",
+        "pionex": "SEI_USDT_PERP"
       }
     },
-    "ARX": {
-      "coin": "ARX",
-      "upbit_symbol": "KRW-ARX",
+    "WAL": {
+      "coin": "WAL",
+      "upbit_symbol": "KRW-WAL",
       "venues": [
-        "okx"
-      ],
-      "best_corr": 0.704,
-      "best_p90_dev_bps": 39.0,
-      "venue_symbols": {
-        "okx": "ARX-USDT-SWAP"
-      }
-    },
-    "MMT": {
-      "coin": "MMT",
-      "upbit_symbol": "KRW-MMT",
-      "venues": [
-        "kucoin"
-      ],
-      "best_corr": 0.704,
-      "best_p90_dev_bps": 39.6,
-      "venue_symbols": {
-        "kucoin": "MMTUSDTM"
-      }
-    },
-    "MNT": {
-      "coin": "MNT",
-      "upbit_symbol": "KRW-MNT",
-      "venues": [
+        "binance",
         "bingx",
-        "mexc"
+        "bybit",
+        "gateio",
+        "htx",
+        "kucoin",
+        "mexc",
+        "okx",
+        "pionex"
       ],
-      "best_corr": 0.7,
-      "best_p90_dev_bps": 29.1,
+      "best_corr": 0.762,
+      "best_p90_dev_bps": 28.5,
       "venue_symbols": {
-        "bingx": "MNT-USDT",
-        "mexc": "MNT_USDT"
+        "binance": "WALUSDT",
+        "bingx": "WAL-USDT",
+        "bybit": "WALUSDT",
+        "gateio": "WAL_USDT",
+        "htx": "WAL-USDT",
+        "kucoin": "WALUSDTM",
+        "mexc": "WAL_USDT",
+        "okx": "WAL-USDT-SWAP",
+        "pionex": "WAL_USDT_PERP"
       }
     },
-    "PONS": {
-      "coin": "PONS",
-      "upbit_symbol": "KRW-PONS",
+    "LINK": {
+      "coin": "LINK",
+      "upbit_symbol": "KRW-LINK",
       "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "gateio",
+        "htx",
         "kucoin",
+        "mexc",
+        "okx",
+        "pionex"
+      ],
+      "best_corr": 0.762,
+      "best_p90_dev_bps": 16.0,
+      "venue_symbols": {
+        "binance": "LINKUSDT",
+        "bingx": "LINK-USDT",
+        "bybit": "LINKUSDT",
+        "gateio": "LINK_USDT",
+        "htx": "LINK-USDT",
+        "kucoin": "LINKUSDTM",
+        "mexc": "LINK_USDT",
+        "okx": "LINK-USDT-SWAP",
+        "pionex": "LINK_USDT_PERP"
+      }
+    },
+    "SPK": {
+      "coin": "SPK",
+      "upbit_symbol": "KRW-SPK",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
         "mexc",
         "okx"
       ],
-      "best_corr": 0.697,
-      "best_p90_dev_bps": 33.7,
+      "best_corr": 0.762,
+      "best_p90_dev_bps": 24.3,
       "venue_symbols": {
-        "kucoin": "PONSUSDTM",
-        "mexc": "PONS_USDT",
-        "okx": "PONS-USDT-SWAP"
+        "binance": "SPKUSDT",
+        "bingx": "SPK-USDT",
+        "bybit": "SPKUSDT",
+        "mexc": "SPK_USDT",
+        "okx": "SPK-USDT-SWAP"
       }
     },
-    "API3": {
-      "coin": "API3",
-      "upbit_symbol": "KRW-API3",
-      "venues": [
-        "binance",
-        "mexc"
-      ],
-      "best_corr": 0.696,
-      "best_p90_dev_bps": 30.0,
-      "venue_symbols": {
-        "binance": "API3USDT",
-        "mexc": "API3_USDT"
-      }
-    },
-    "ENS": {
-      "coin": "ENS",
-      "upbit_symbol": "KRW-ENS",
-      "venues": [
-        "binance",
-        "bingx",
-        "bybit",
-        "mexc"
-      ],
-      "best_corr": 0.696,
-      "best_p90_dev_bps": 21.2,
-      "venue_symbols": {
-        "binance": "ENSUSDT",
-        "bingx": "ENS-USDT",
-        "bybit": "ENSUSDT",
-        "mexc": "ENS_USDT"
-      }
-    },
-    "IOTA": {
-      "coin": "IOTA",
-      "upbit_symbol": "KRW-IOTA",
-      "venues": [
-        "bingx",
-        "bybit"
-      ],
-      "best_corr": 0.695,
-      "best_p90_dev_bps": 27.0,
-      "venue_symbols": {
-        "bingx": "IOTA-USDT",
-        "bybit": "IOTAUSDT"
-      }
-    },
-    "O": {
-      "coin": "O",
-      "upbit_symbol": "KRW-O",
+    "ETC": {
+      "coin": "ETC",
+      "upbit_symbol": "KRW-ETC",
       "venues": [
         "binance",
         "bingx",
         "gateio",
         "kucoin",
-        "mexc"
+        "mexc",
+        "okx",
+        "pionex"
       ],
-      "best_corr": 0.693,
-      "best_p90_dev_bps": 35.7,
+      "best_corr": 0.761,
+      "best_p90_dev_bps": 20.7,
       "venue_symbols": {
-        "binance": "OUSDT",
-        "bingx": "O-USDT",
-        "gateio": "O_USDT",
-        "kucoin": "OUSDTM",
-        "mexc": "O_USDT"
+        "binance": "ETCUSDT",
+        "bingx": "ETC-USDT",
+        "gateio": "ETC_USDT",
+        "kucoin": "ETCUSDTM",
+        "mexc": "ETC_USDT",
+        "okx": "ETC-USDT-SWAP",
+        "pionex": "ETC_USDT_PERP"
       }
     },
-    "BCH": {
-      "coin": "BCH",
-      "upbit_symbol": "KRW-BCH",
+    "PENDLE": {
+      "coin": "PENDLE",
+      "upbit_symbol": "KRW-PENDLE",
       "venues": [
         "binance",
-        "bingx",
-        "bybit",
-        "gateio",
-        "mexc"
-      ],
-      "best_corr": 0.692,
-      "best_p90_dev_bps": 14.9,
-      "venue_symbols": {
-        "binance": "BCHUSDT",
-        "bingx": "BCH-USDT",
-        "bybit": "BCHUSDT",
-        "gateio": "BCH_USDT",
-        "mexc": "BCH_USDT"
-      }
-    },
-    "BEAM": {
-      "coin": "BEAM",
-      "upbit_symbol": "KRW-BEAM",
-      "venues": [
-        "bybit"
-      ],
-      "best_corr": 0.686,
-      "best_p90_dev_bps": 30.6,
-      "venue_symbols": {
-        "bybit": "BEAMUSDT"
-      }
-    },
-    "BAT": {
-      "coin": "BAT",
-      "upbit_symbol": "KRW-BAT",
-      "venues": [
         "bingx",
         "bybit",
         "gateio",
@@ -9625,62 +10686,67 @@ if __name__ == "__main__":
         "okx",
         "pionex"
       ],
-      "best_corr": 0.685,
-      "best_p90_dev_bps": 31.2,
+      "best_corr": 0.76,
+      "best_p90_dev_bps": 24.6,
       "venue_symbols": {
-        "bingx": "BAT-USDT",
-        "bybit": "BATUSDT",
-        "gateio": "BAT_USDT",
-        "kucoin": "BATUSDTM",
-        "mexc": "BAT_USDT",
-        "okx": "BAT-USDT-SWAP",
-        "pionex": "BAT_USDT_PERP"
+        "binance": "PENDLEUSDT",
+        "bingx": "PENDLE-USDT",
+        "bybit": "PENDLEUSDT",
+        "gateio": "PENDLE_USDT",
+        "kucoin": "PENDLEUSDTM",
+        "mexc": "PENDLE_USDT",
+        "okx": "PENDLE-USDT-SWAP",
+        "pionex": "PENDLE_USDT_PERP"
       }
     },
-    "PUMP": {
-      "coin": "PUMP",
-      "upbit_symbol": "KRW-PUMP",
-      "venues": [
-        "binance",
-        "bingx",
-        "gateio"
-      ],
-      "best_corr": 0.685,
-      "best_p90_dev_bps": 26.7,
-      "venue_symbols": {
-        "binance": "PUMPUSDT",
-        "bingx": "PUMP-USDT",
-        "gateio": "PUMP_USDT"
-      }
-    },
-    "DOS": {
-      "coin": "DOS",
-      "upbit_symbol": "KRW-DOS",
+    "TREE": {
+      "coin": "TREE",
+      "upbit_symbol": "KRW-TREE",
       "venues": [
         "binance",
         "bingx",
         "bybit"
       ],
-      "best_corr": 0.685,
-      "best_p90_dev_bps": 54.1,
+      "best_corr": 0.757,
+      "best_p90_dev_bps": 26.6,
       "venue_symbols": {
-        "binance": "DOSUSDT",
-        "bingx": "DOS-USDT",
-        "bybit": "DOSUSDT"
+        "binance": "TREEUSDT",
+        "bingx": "TREE-USDT",
+        "bybit": "TREEUSDT"
       }
     },
-    "RENDER": {
-      "coin": "RENDER",
-      "upbit_symbol": "KRW-RENDER",
+    "CYBER": {
+      "coin": "CYBER",
+      "upbit_symbol": "KRW-CYBER",
       "venues": [
-        "gateio",
+        "binance",
+        "bingx",
+        "bybit",
+        "mexc"
+      ],
+      "best_corr": 0.752,
+      "best_p90_dev_bps": 30.8,
+      "venue_symbols": {
+        "binance": "CYBERUSDT",
+        "bingx": "CYBER-USDT",
+        "bybit": "CYBERUSDT",
+        "mexc": "CYBER_USDT"
+      }
+    },
+    "GTC": {
+      "coin": "GTC",
+      "upbit_symbol": "KRW-GTC",
+      "venues": [
+        "binance",
+        "bingx",
         "kucoin"
       ],
-      "best_corr": 0.681,
-      "best_p90_dev_bps": 20.2,
+      "best_corr": 0.752,
+      "best_p90_dev_bps": 43.9,
       "venue_symbols": {
-        "gateio": "RENDER_USDT",
-        "kucoin": "RENDERUSDTM"
+        "binance": "GTCUSDT",
+        "bingx": "GTC-USDT",
+        "kucoin": "GTCUSDTM"
       }
     },
     "APT": {
@@ -9696,8 +10762,8 @@ if __name__ == "__main__":
         "okx",
         "pionex"
       ],
-      "best_corr": 0.68,
-      "best_p90_dev_bps": 19.2,
+      "best_corr": 0.751,
+      "best_p90_dev_bps": 23.4,
       "venue_symbols": {
         "binance": "APTUSDT",
         "bingx": "APT-USDT",
@@ -9709,58 +10775,492 @@ if __name__ == "__main__":
         "pionex": "APT_USDT_PERP"
       }
     },
-    "2Z": {
-      "coin": "2Z",
-      "upbit_symbol": "KRW-2Z",
+    "ENS": {
+      "coin": "ENS",
+      "upbit_symbol": "KRW-ENS",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "gateio",
+        "mexc"
+      ],
+      "best_corr": 0.751,
+      "best_p90_dev_bps": 21.0,
+      "venue_symbols": {
+        "binance": "ENSUSDT",
+        "bingx": "ENS-USDT",
+        "bybit": "ENSUSDT",
+        "gateio": "ENS_USDT",
+        "mexc": "ENS_USDT"
+      }
+    },
+    "DOT": {
+      "coin": "DOT",
+      "upbit_symbol": "KRW-DOT",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "kucoin",
+        "mexc",
+        "okx",
+        "pionex"
+      ],
+      "best_corr": 0.749,
+      "best_p90_dev_bps": 20.7,
+      "venue_symbols": {
+        "binance": "DOTUSDT",
+        "bingx": "DOT-USDT",
+        "bybit": "DOTUSDT",
+        "kucoin": "DOTUSDTM",
+        "mexc": "DOT_USDT",
+        "okx": "DOT-USDT-SWAP",
+        "pionex": "DOT_USDT_PERP"
+      }
+    },
+    "THETA": {
+      "coin": "THETA",
+      "upbit_symbol": "KRW-THETA",
       "venues": [
         "kucoin"
       ],
-      "best_corr": 0.676,
-      "best_p90_dev_bps": 24.9,
+      "best_corr": 0.746,
+      "best_p90_dev_bps": 38.7,
       "venue_symbols": {
-        "kucoin": "2ZUSDTM"
+        "kucoin": "THETAUSDTM"
       }
     },
-    "F": {
-      "coin": "F",
-      "upbit_symbol": "KRW-F",
+    "VANA": {
+      "coin": "VANA",
+      "upbit_symbol": "KRW-VANA",
       "venues": [
+        "binance",
+        "bingx",
+        "bybit"
+      ],
+      "best_corr": 0.746,
+      "best_p90_dev_bps": 21.3,
+      "venue_symbols": {
+        "binance": "VANAUSDT",
+        "bingx": "VANA-USDT",
+        "bybit": "VANAUSDT"
+      }
+    },
+    "LINEA": {
+      "coin": "LINEA",
+      "upbit_symbol": "KRW-LINEA",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "mexc",
         "okx"
       ],
-      "best_corr": 0.676,
-      "best_p90_dev_bps": 22.9,
+      "best_corr": 0.745,
+      "best_p90_dev_bps": 22.2,
       "venue_symbols": {
-        "okx": "F-USDT-SWAP"
+        "binance": "LINEAUSDT",
+        "bingx": "LINEA-USDT",
+        "bybit": "LINEAUSDT",
+        "mexc": "LINEA_USDT",
+        "okx": "LINEA-USDT-SWAP"
       }
     },
-    "BIO": {
-      "coin": "BIO",
-      "upbit_symbol": "KRW-BIO",
+    "HYPER": {
+      "coin": "HYPER",
+      "upbit_symbol": "KRW-HYPER",
+      "venues": [
+        "binance",
+        "bybit",
+        "mexc"
+      ],
+      "best_corr": 0.744,
+      "best_p90_dev_bps": 27.4,
+      "venue_symbols": {
+        "binance": "HYPERUSDT",
+        "bybit": "HYPERUSDT",
+        "mexc": "HYPER_USDT"
+      }
+    },
+    "FLOCK": {
+      "coin": "FLOCK",
+      "upbit_symbol": "KRW-FLOCK",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "mexc",
+        "okx"
+      ],
+      "best_corr": 0.743,
+      "best_p90_dev_bps": 20.9,
+      "venue_symbols": {
+        "binance": "FLOCKUSDT",
+        "bingx": "FLOCK-USDT",
+        "bybit": "FLOCKUSDT",
+        "mexc": "FLOCK_USDT",
+        "okx": "FLOCK-USDT-SWAP"
+      }
+    },
+    "TAIKO": {
+      "coin": "TAIKO",
+      "upbit_symbol": "KRW-TAIKO",
       "venues": [
         "binance",
         "bingx",
         "bybit",
         "mexc"
       ],
-      "best_corr": 0.674,
-      "best_p90_dev_bps": 42.3,
+      "best_corr": 0.742,
+      "best_p90_dev_bps": 32.7,
       "venue_symbols": {
-        "binance": "BIOUSDT",
-        "bingx": "BIO-USDT",
-        "bybit": "BIOUSDT",
-        "mexc": "BIO_USDT"
+        "binance": "TAIKOUSDT",
+        "bingx": "TAIKO-USDT",
+        "bybit": "TAIKOUSDT",
+        "mexc": "TAIKO_USDT"
       }
     },
-    "NMR": {
-      "coin": "NMR",
-      "upbit_symbol": "KRW-NMR",
+    "MMT": {
+      "coin": "MMT",
+      "upbit_symbol": "KRW-MMT",
       "venues": [
         "kucoin"
       ],
-      "best_corr": 0.673,
-      "best_p90_dev_bps": 23.2,
+      "best_corr": 0.741,
+      "best_p90_dev_bps": 41.6,
       "venue_symbols": {
-        "kucoin": "NMRUSDTM"
+        "kucoin": "MMTUSDTM"
+      }
+    },
+    "GMT": {
+      "coin": "GMT",
+      "upbit_symbol": "KRW-GMT",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "mexc",
+        "okx"
+      ],
+      "best_corr": 0.738,
+      "best_p90_dev_bps": 19.5,
+      "venue_symbols": {
+        "binance": "GMTUSDT",
+        "bingx": "GMT-USDT",
+        "bybit": "GMTUSDT",
+        "mexc": "GMT_USDT",
+        "okx": "GMT-USDT-SWAP"
+      }
+    },
+    "ZKC": {
+      "coin": "ZKC",
+      "upbit_symbol": "KRW-ZKC",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "mexc"
+      ],
+      "best_corr": 0.725,
+      "best_p90_dev_bps": 25.1,
+      "venue_symbols": {
+        "binance": "ZKCUSDT",
+        "bingx": "ZKC-USDT",
+        "bybit": "ZKCUSDT",
+        "mexc": "ZKC_USDT"
+      }
+    },
+    "MIRA": {
+      "coin": "MIRA",
+      "upbit_symbol": "KRW-MIRA",
+      "venues": [
+        "binance",
+        "bybit",
+        "mexc"
+      ],
+      "best_corr": 0.723,
+      "best_p90_dev_bps": 20.5,
+      "venue_symbols": {
+        "binance": "MIRAUSDT",
+        "bybit": "MIRAUSDT",
+        "mexc": "MIRA_USDT"
+      }
+    },
+    "ZKP": {
+      "coin": "ZKP",
+      "upbit_symbol": "KRW-ZKP",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "kucoin",
+        "mexc",
+        "okx"
+      ],
+      "best_corr": 0.717,
+      "best_p90_dev_bps": 28.7,
+      "venue_symbols": {
+        "binance": "ZKPUSDT",
+        "bingx": "ZKP-USDT",
+        "bybit": "ZKPUSDT",
+        "kucoin": "ZKPUSDTM",
+        "mexc": "ZKP_USDT",
+        "okx": "ZKP-USDT-SWAP"
+      }
+    },
+    "MEGA": {
+      "coin": "MEGA",
+      "upbit_symbol": "KRW-MEGA",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "gateio",
+        "kucoin",
+        "mexc",
+        "okx"
+      ],
+      "best_corr": 0.715,
+      "best_p90_dev_bps": 29.8,
+      "venue_symbols": {
+        "binance": "MEGAUSDT",
+        "bingx": "MEGA-USDT",
+        "bybit": "MEGAUSDT",
+        "gateio": "MEGA_USDT",
+        "kucoin": "MEGAUSDTM",
+        "mexc": "MEGA_USDT",
+        "okx": "MEGA-USDT-SWAP"
+      }
+    },
+    "PROS": {
+      "coin": "PROS",
+      "upbit_symbol": "KRW-PROS",
+      "venues": [
+        "kucoin",
+        "okx"
+      ],
+      "best_corr": 0.712,
+      "best_p90_dev_bps": 31.5,
+      "venue_symbols": {
+        "kucoin": "PROSUSDTM",
+        "okx": "PROS-USDT-SWAP"
+      }
+    },
+    "MASK": {
+      "coin": "MASK",
+      "upbit_symbol": "KRW-MASK",
+      "venues": [
+        "bybit",
+        "okx"
+      ],
+      "best_corr": 0.708,
+      "best_p90_dev_bps": 22.2,
+      "venue_symbols": {
+        "bybit": "MASKUSDT",
+        "okx": "MASK-USDT-SWAP"
+      }
+    },
+    "BCH": {
+      "coin": "BCH",
+      "upbit_symbol": "KRW-BCH",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "gateio",
+        "kucoin",
+        "mexc",
+        "pionex"
+      ],
+      "best_corr": 0.707,
+      "best_p90_dev_bps": 12.3,
+      "venue_symbols": {
+        "binance": "BCHUSDT",
+        "bingx": "BCH-USDT",
+        "bybit": "BCHUSDT",
+        "gateio": "BCH_USDT",
+        "kucoin": "BCHUSDTM",
+        "mexc": "BCH_USDT",
+        "pionex": "BCH_USDT_PERP"
+      }
+    },
+    "LA": {
+      "coin": "LA",
+      "upbit_symbol": "KRW-LA",
+      "venues": [
+        "mexc",
+        "okx"
+      ],
+      "best_corr": 0.707,
+      "best_p90_dev_bps": 18.0,
+      "venue_symbols": {
+        "mexc": "LA_USDT",
+        "okx": "LA-USDT-SWAP"
+      }
+    },
+    "CAP": {
+      "coin": "CAP",
+      "upbit_symbol": "KRW-CAP",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "gateio",
+        "kucoin",
+        "mexc",
+        "okx"
+      ],
+      "best_corr": 0.706,
+      "best_p90_dev_bps": 19.1,
+      "venue_symbols": {
+        "binance": "CAPUSDT",
+        "bingx": "CAP-USDT",
+        "bybit": "CAPUSDT",
+        "gateio": "CAP_USDT",
+        "kucoin": "CAPUSDTM",
+        "mexc": "CAP_USDT",
+        "okx": "CAP-USDT-SWAP"
+      }
+    },
+    "ARX": {
+      "coin": "ARX",
+      "upbit_symbol": "KRW-ARX",
+      "venues": [
+        "bybit",
+        "kucoin",
+        "okx"
+      ],
+      "best_corr": 0.704,
+      "best_p90_dev_bps": 34.4,
+      "venue_symbols": {
+        "bybit": "ARXUSDT",
+        "kucoin": "ARXUSDTM",
+        "okx": "ARX-USDT-SWAP"
+      }
+    },
+    "TIA": {
+      "coin": "TIA",
+      "upbit_symbol": "KRW-TIA",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "gateio",
+        "htx",
+        "kucoin",
+        "mexc",
+        "okx",
+        "pionex"
+      ],
+      "best_corr": 0.703,
+      "best_p90_dev_bps": 26.5,
+      "venue_symbols": {
+        "binance": "TIAUSDT",
+        "bingx": "TIA-USDT",
+        "bybit": "TIAUSDT",
+        "gateio": "TIA_USDT",
+        "htx": "TIA-USDT",
+        "kucoin": "TIAUSDTM",
+        "mexc": "TIA_USDT",
+        "okx": "TIA-USDT-SWAP",
+        "pionex": "TIA_USDT_PERP"
+      }
+    },
+    "MON": {
+      "coin": "MON",
+      "upbit_symbol": "KRW-MON",
+      "venues": [
+        "binance",
+        "bybit",
+        "kucoin"
+      ],
+      "best_corr": 0.703,
+      "best_p90_dev_bps": 31.6,
+      "venue_symbols": {
+        "binance": "MONUSDT",
+        "bybit": "MONUSDT",
+        "kucoin": "MONUSDTM"
+      }
+    },
+    "AAVE": {
+      "coin": "AAVE",
+      "upbit_symbol": "KRW-AAVE",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "gateio",
+        "kucoin",
+        "mexc",
+        "okx",
+        "pionex"
+      ],
+      "best_corr": 0.702,
+      "best_p90_dev_bps": 15.4,
+      "venue_symbols": {
+        "binance": "AAVEUSDT",
+        "bingx": "AAVE-USDT",
+        "bybit": "AAVEUSDT",
+        "gateio": "AAVE_USDT",
+        "kucoin": "AAVEUSDTM",
+        "mexc": "AAVE_USDT",
+        "okx": "AAVE-USDT-SWAP",
+        "pionex": "AAVE_USDT_PERP"
+      }
+    },
+    "AXL": {
+      "coin": "AXL",
+      "upbit_symbol": "KRW-AXL",
+      "venues": [
+        "binance",
+        "bingx",
+        "bybit",
+        "mexc"
+      ],
+      "best_corr": 0.699,
+      "best_p90_dev_bps": 25.9,
+      "venue_symbols": {
+        "binance": "AXLUSDT",
+        "bingx": "AXL-USDT",
+        "bybit": "AXLUSDT",
+        "mexc": "AXL_USDT"
+      }
+    },
+    "ATOM": {
+      "coin": "ATOM",
+      "upbit_symbol": "KRW-ATOM",
+      "venues": [
+        "binance",
+        "kucoin",
+        "okx"
+      ],
+      "best_corr": 0.694,
+      "best_p90_dev_bps": 19.3,
+      "venue_symbols": {
+        "binance": "ATOMUSDT",
+        "kucoin": "ATOMUSDTM",
+        "okx": "ATOM-USDT-SWAP"
+      }
+    },
+    "RENDER": {
+      "coin": "RENDER",
+      "upbit_symbol": "KRW-RENDER",
+      "venues": [
+        "binance",
+        "bybit",
+        "mexc",
+        "okx",
+        "pionex"
+      ],
+      "best_corr": 0.694,
+      "best_p90_dev_bps": 20.8,
+      "venue_symbols": {
+        "binance": "RENDERUSDT",
+        "bybit": "RENDERUSDT",
+        "mexc": "RENDER_USDT",
+        "okx": "RENDER-USDT-SWAP",
+        "pionex": "RENDER_USDT_PERP"
       }
     },
     "MANA": {
@@ -9769,1158 +11269,2812 @@ if __name__ == "__main__":
       "venues": [
         "kucoin"
       ],
-      "best_corr": 0.661,
-      "best_p90_dev_bps": 74.6,
+      "best_corr": 0.691,
+      "best_p90_dev_bps": 60.3,
       "venue_symbols": {
         "kucoin": "MANAUSDTM"
       }
     },
-    "VTHO": {
-      "coin": "VTHO",
-      "upbit_symbol": "KRW-VTHO",
+    "ATH": {
+      "coin": "ATH",
+      "upbit_symbol": "KRW-ATH",
       "venues": [
-        "binance",
+        "bingx",
         "mexc"
       ],
-      "best_corr": 0.66,
-      "best_p90_dev_bps": 29.1,
+      "best_corr": 0.688,
+      "best_p90_dev_bps": 23.3,
       "venue_symbols": {
-        "binance": "VTHOUSDT",
-        "mexc": "VTHO_USDT"
+        "bingx": "ATH-USDT",
+        "mexc": "ATH_USDT"
       }
     },
-    "MOODENG": {
-      "coin": "MOODENG",
-      "upbit_symbol": "KRW-MOODENG",
+    "NXPC": {
+      "coin": "NXPC",
+      "upbit_symbol": "KRW-NXPC",
       "venues": [
-        "bybit"
+        "binance",
+        "bybit",
+        "gateio",
+        "mexc"
       ],
-      "best_corr": 0.66,
-      "best_p90_dev_bps": 30.9,
+      "best_corr": 0.684,
+      "best_p90_dev_bps": 44.9,
       "venue_symbols": {
-        "bybit": "MOODENGUSDT"
+        "binance": "NXPCUSDT",
+        "bybit": "NXPCUSDT",
+        "gateio": "NXPC_USDT",
+        "mexc": "NXPC_USDT"
       }
     },
-    "ATOM": {
-      "coin": "ATOM",
-      "upbit_symbol": "KRW-ATOM",
+    "ESP": {
+      "coin": "ESP",
+      "upbit_symbol": "KRW-ESP",
+      "venues": [
+        "binance",
+        "bingx",
+        "gateio"
+      ],
+      "best_corr": 0.681,
+      "best_p90_dev_bps": 54.4,
+      "venue_symbols": {
+        "binance": "ESPUSDT",
+        "bingx": "ESP-USDT",
+        "gateio": "ESP_USDT"
+      }
+    },
+    "F": {
+      "coin": "F",
+      "upbit_symbol": "KRW-F",
+      "venues": [
+        "binance",
+        "bingx",
+        "okx"
+      ],
+      "best_corr": 0.679,
+      "best_p90_dev_bps": 29.5,
+      "venue_symbols": {
+        "binance": "FUSDT",
+        "bingx": "F-USDT",
+        "okx": "F-USDT-SWAP"
+      }
+    },
+    "IOST": {
+      "coin": "IOST",
+      "upbit_symbol": "KRW-IOST",
+      "venues": [
+        "binance",
+        "bingx",
+        "mexc"
+      ],
+      "best_corr": 0.677,
+      "best_p90_dev_bps": 28.8,
+      "venue_symbols": {
+        "binance": "IOSTUSDT",
+        "bingx": "IOST-USDT",
+        "mexc": "IOST_USDT"
+      }
+    },
+    "ZBT": {
+      "coin": "ZBT",
+      "upbit_symbol": "KRW-ZBT",
       "venues": [
         "bingx",
         "bybit",
-        "mexc"
+        "okx"
       ],
-      "best_corr": 0.657,
-      "best_p90_dev_bps": 21.0,
+      "best_corr": 0.676,
+      "best_p90_dev_bps": 21.7,
       "venue_symbols": {
-        "bingx": "ATOM-USDT",
-        "bybit": "ATOMUSDT",
-        "mexc": "ATOM_USDT"
+        "bingx": "ZBT-USDT",
+        "bybit": "ZBTUSDT",
+        "okx": "ZBT-USDT-SWAP"
       }
     },
-    "BIGTIME": {
-      "coin": "BIGTIME",
-      "upbit_symbol": "KRW-BIGTIME",
+    "BEAM": {
+      "coin": "BEAM",
+      "upbit_symbol": "KRW-BEAM",
+      "venues": [
+        "bingx",
+        "bybit"
+      ],
+      "best_corr": 0.675,
+      "best_p90_dev_bps": 27.4,
+      "venue_symbols": {
+        "bingx": "BEAM-USDT",
+        "bybit": "BEAMUSDT"
+      }
+    },
+    "2Z": {
+      "coin": "2Z",
+      "upbit_symbol": "KRW-2Z",
+      "venues": [
+        "kucoin"
+      ],
+      "best_corr": 0.675,
+      "best_p90_dev_bps": 23.6,
+      "venue_symbols": {
+        "kucoin": "2ZUSDTM"
+      }
+    },
+    "FF": {
+      "coin": "FF",
+      "upbit_symbol": "KRW-FF",
+      "venues": [
+        "bingx",
+        "gateio",
+        "mexc"
+      ],
+      "best_corr": 0.675,
+      "best_p90_dev_bps": 49.3,
+      "venue_symbols": {
+        "bingx": "FF-USDT",
+        "gateio": "FF_USDT",
+        "mexc": "FF_USDT"
+      }
+    },
+    "PUFFER": {
+      "coin": "PUFFER",
+      "upbit_symbol": "KRW-PUFFER",
+      "venues": [
+        "bybit"
+      ],
+      "best_corr": 0.671,
+      "best_p90_dev_bps": 42.2,
+      "venue_symbols": {
+        "bybit": "PUFFERUSDT"
+      }
+    },
+    "VIRTUAL": {
+      "coin": "VIRTUAL",
+      "upbit_symbol": "KRW-VIRTUAL",
+      "venues": [
+        "bingx",
+        "gateio",
+        "okx",
+        "pionex"
+      ],
+      "best_corr": 0.67,
+      "best_p90_dev_bps": 20.0,
+      "venue_symbols": {
+        "bingx": "VIRTUAL-USDT",
+        "gateio": "VIRTUAL_USDT",
+        "okx": "VIRTUAL-USDT-SWAP",
+        "pionex": "VIRTUAL_USDT_PERP"
+      }
+    },
+    "T": {
+      "coin": "T",
+      "upbit_symbol": "KRW-T",
+      "venues": [
+        "binance",
+        "bybit",
+        "mexc"
+      ],
+      "best_corr": 0.663,
+      "best_p90_dev_bps": 33.6,
+      "venue_symbols": {
+        "binance": "TUSDT",
+        "bybit": "TUSDT",
+        "mexc": "T_USDT"
+      }
+    },
+    "AWE": {
+      "coin": "AWE",
+      "upbit_symbol": "KRW-AWE",
+      "venues": [
+        "kucoin"
+      ],
+      "best_corr": 0.66,
+      "best_p90_dev_bps": 26.4,
+      "venue_symbols": {
+        "kucoin": "AWEUSDTM"
+      }
+    },
+    "STX": {
+      "coin": "STX",
+      "upbit_symbol": "KRW-STX",
+      "venues": [
+        "kucoin"
+      ],
+      "best_corr": 0.66,
+      "best_p90_dev_bps": 22.5,
+      "venue_symbols": {
+        "kucoin": "STXUSDTM"
+      }
+    },
+    "INJ": {
+      "coin": "INJ",
+      "upbit_symbol": "KRW-INJ",
+      "venues": [
+        "kucoin"
+      ],
+      "best_corr": 0.658,
+      "best_p90_dev_bps": 27.9,
+      "venue_symbols": {
+        "kucoin": "INJUSDTM"
+      }
+    },
+    "GRT": {
+      "coin": "GRT",
+      "upbit_symbol": "KRW-GRT",
+      "venues": [
+        "kucoin"
+      ],
+      "best_corr": 0.657,
+      "best_p90_dev_bps": 33.4,
+      "venue_symbols": {
+        "kucoin": "GRTUSDTM"
+      }
+    },
+    "ONT": {
+      "coin": "ONT",
+      "upbit_symbol": "KRW-ONT",
       "venues": [
         "okx"
       ],
       "best_corr": 0.654,
-      "best_p90_dev_bps": 15.8,
+      "best_p90_dev_bps": 33.8,
       "venue_symbols": {
-        "okx": "BIGTIME-USDT-SWAP"
+        "okx": "ONT-USDT-SWAP"
       }
     }
   },
   "binance_sym_map": {
-    "VVVUSDT": [
-      "VVV",
-      1.0
-    ],
-    "LITUSDT": [
-      "LIT",
-      1.0
-    ],
-    "ICPUSDT": [
-      "ICP",
-      1.0
-    ],
     "ETHFIUSDT": [
       "ETHFI",
+      1.0,
       1.0
     ],
-    "PROMUSDT": [
-      "PROM",
-      1.0
-    ],
-    "AXLUSDT": [
-      "AXL",
-      1.0
-    ],
-    "WLDUSDT": [
-      "WLD",
-      1.0
-    ],
-    "ELSAUSDT": [
-      "ELSA",
+    "AXSUSDT": [
+      "AXS",
+      1.0,
       1.0
     ],
     "SPXUSDT": [
       "SPX",
+      1.0,
       1.0
     ],
-    "SOMIUSDT": [
-      "SOMI",
+    "CFXUSDT": [
+      "CFX",
+      1.0,
       1.0
     ],
-    "GRTUSDT": [
-      "GRT",
+    "LITUSDT": [
+      "LIT",
+      1.0,
       1.0
     ],
-    "ZROUSDT": [
-      "ZRO",
-      1.0
-    ],
-    "ZORAUSDT": [
-      "ZORA",
-      1.0
-    ],
-    "CAPUSDT": [
-      "CAP",
-      1.0
-    ],
-    "PIEVERSEUSDT": [
-      "PIEVERSE",
-      1.0
-    ],
-    "WCTUSDT": [
-      "WCT",
+    "SYRUPUSDT": [
+      "SYRUP",
+      1.0,
       1.0
     ],
     "ENSOUSDT": [
       "ENSO",
+      1.0,
       1.0
     ],
-    "BREVUSDT": [
-      "BREV",
+    "TAOUSDT": [
+      "TAO",
+      1.0,
       1.0
     ],
-    "NEARUSDT": [
-      "NEAR",
+    "SANDUSDT": [
+      "SAND",
+      1.0,
       1.0
     ],
-    "VETUSDT": [
-      "VET",
-      1.0
-    ],
-    "KMNOUSDT": [
-      "KMNO",
-      1.0
-    ],
-    "GTCUSDT": [
-      "GTC",
-      1.0
-    ],
-    "CYBERUSDT": [
-      "CYBER",
-      1.0
-    ],
-    "HYPERUSDT": [
-      "HYPER",
-      1.0
-    ],
-    "AWEUSDT": [
-      "AWE",
-      1.0
-    ],
-    "ZKCUSDT": [
-      "ZKC",
-      1.0
-    ],
-    "ZKPUSDT": [
-      "ZKP",
-      1.0
-    ],
-    "NEOUSDT": [
-      "NEO",
-      1.0
-    ],
-    "INJUSDT": [
-      "INJ",
-      1.0
-    ],
-    "SKRUSDT": [
-      "SKR",
-      1.0
-    ],
-    "CARVUSDT": [
-      "CARV",
-      1.0
-    ],
-    "ERAUSDT": [
-      "ERA",
-      1.0
-    ],
-    "SEIUSDT": [
-      "SEI",
-      1.0
-    ],
-    "API3USDT": [
-      "API3",
-      1.0
-    ],
-    "ENSUSDT": [
-      "ENS",
+    "ELSAUSDT": [
+      "ELSA",
+      1.0,
       1.0
     ],
     "OUSDT": [
       "O",
+      1.0,
       1.0
     ],
-    "BCHUSDT": [
-      "BCH",
-      1.0
-    ],
-    "PUMPUSDT": [
-      "PUMP",
-      1.0
-    ],
-    "DOSUSDT": [
-      "DOS",
-      1.0
-    ],
-    "APTUSDT": [
-      "APT",
-      1.0
-    ],
-    "BIOUSDT": [
-      "BIO",
-      1.0
-    ],
-    "VTHOUSDT": [
-      "VTHO",
-      1.0
-    ]
-  },
-  "bybit_sym_map": {
-    "VVVUSDT": [
-      "VVV",
-      1.0
-    ],
-    "LITUSDT": [
-      "LIT",
-      1.0
-    ],
-    "ICPUSDT": [
-      "ICP",
-      1.0
-    ],
-    "ETHFIUSDT": [
-      "ETHFI",
-      1.0
-    ],
-    "AXLUSDT": [
-      "AXL",
-      1.0
-    ],
-    "TRUMPUSDT": [
-      "TRUMP",
-      1.0
-    ],
-    "WLDUSDT": [
-      "WLD",
-      1.0
-    ],
-    "ELSAUSDT": [
-      "ELSA",
-      1.0
-    ],
-    "SPXUSDT": [
-      "SPX",
-      1.0
-    ],
-    "SOMIUSDT": [
-      "SOMI",
-      1.0
-    ],
-    "GRTUSDT": [
-      "GRT",
-      1.0
-    ],
-    "ZROUSDT": [
-      "ZRO",
+    "ORCAUSDT": [
+      "ORCA",
+      1.0,
       1.0
     ],
     "ZORAUSDT": [
       "ZORA",
-      1.0
-    ],
-    "CAPUSDT": [
-      "CAP",
-      1.0
-    ],
-    "PIEVERSEUSDT": [
-      "PIEVERSE",
-      1.0
-    ],
-    "WCTUSDT": [
-      "WCT",
-      1.0
-    ],
-    "ENSOUSDT": [
-      "ENSO",
-      1.0
-    ],
-    "BREVUSDT": [
-      "BREV",
-      1.0
-    ],
-    "NEARUSDT": [
-      "NEAR",
+      1.0,
       1.0
     ],
     "VETUSDT": [
       "VET",
+      1.0,
+      1.0
+    ],
+    "WLFIUSDT": [
+      "WLFI",
+      1.0,
+      1.0
+    ],
+    "WLDUSDT": [
+      "WLD",
+      1.0,
+      1.0
+    ],
+    "FILUSDT": [
+      "FIL",
+      1.0,
+      1.0
+    ],
+    "BREVUSDT": [
+      "BREV",
+      1.0,
       1.0
     ],
     "KMNOUSDT": [
       "KMNO",
-      1.0
-    ],
-    "B3USDT": [
-      "B3",
-      1.0
-    ],
-    "CYBERUSDT": [
-      "CYBER",
-      1.0
-    ],
-    "HYPERUSDT": [
-      "HYPER",
-      1.0
-    ],
-    "AWEUSDT": [
-      "AWE",
-      1.0
-    ],
-    "ZKCUSDT": [
-      "ZKC",
-      1.0
-    ],
-    "ZKPUSDT": [
-      "ZKP",
-      1.0
-    ],
-    "NEOUSDT": [
-      "NEO",
-      1.0
-    ],
-    "IOUSDT": [
-      "IO",
-      1.0
-    ],
-    "INJUSDT": [
-      "INJ",
-      1.0
-    ],
-    "SKRUSDT": [
-      "SKR",
-      1.0
-    ],
-    "CARVUSDT": [
-      "CARV",
+      1.0,
       1.0
     ],
     "ERAUSDT": [
       "ERA",
+      1.0,
       1.0
     ],
-    "SEIUSDT": [
-      "SEI",
+    "UNIUSDT": [
+      "UNI",
+      1.0,
       1.0
     ],
-    "ENSUSDT": [
-      "ENS",
+    "PUMPUSDT": [
+      "PUMP",
+      1.0,
       1.0
     ],
-    "IOTAUSDT": [
-      "IOTA",
+    "CELOUSDT": [
+      "CELO",
+      1.0,
       1.0
     ],
-    "BCHUSDT": [
-      "BCH",
+    "AEROUSDT": [
+      "AERO",
+      1.0,
       1.0
     ],
-    "BEAMUSDT": [
-      "BEAM",
+    "NEARUSDT": [
+      "NEAR",
+      1.0,
+      1.0
+    ],
+    "ICPUSDT": [
+      "ICP",
+      1.0,
       1.0
     ],
     "BATUSDT": [
       "BAT",
+      1.0,
       1.0
     ],
-    "DOSUSDT": [
-      "DOS",
+    "PROMUSDT": [
+      "PROM",
+      1.0,
+      1.0
+    ],
+    "MINAUSDT": [
+      "MINA",
+      1.0,
+      1.0
+    ],
+    "MORPHOUSDT": [
+      "MORPHO",
+      1.0,
+      1.0
+    ],
+    "PONSUSDT": [
+      "PONS",
+      1.0,
+      1.0
+    ],
+    "TRUMPUSDT": [
+      "TRUMP",
+      1.0,
+      1.0
+    ],
+    "XRPUSDT": [
+      "XRP",
+      1.0,
+      1.0
+    ],
+    "NEOUSDT": [
+      "NEO",
+      1.0,
+      1.0
+    ],
+    "SENTUSDT": [
+      "SENT",
+      1.0,
+      1.0
+    ],
+    "ZROUSDT": [
+      "ZRO",
+      1.0,
+      1.0
+    ],
+    "PIEVERSEUSDT": [
+      "PIEVERSE",
+      1.0,
+      1.0
+    ],
+    "SUIUSDT": [
+      "SUI",
+      1.0,
+      1.0
+    ],
+    "OPGUSDT": [
+      "OPG",
+      1.0,
+      1.0
+    ],
+    "WCTUSDT": [
+      "WCT",
+      1.0,
+      1.0
+    ],
+    "JTOUSDT": [
+      "JTO",
+      1.0,
+      1.0
+    ],
+    "SEIUSDT": [
+      "SEI",
+      1.0,
+      1.0
+    ],
+    "WALUSDT": [
+      "WAL",
+      1.0,
+      1.0
+    ],
+    "LINKUSDT": [
+      "LINK",
+      1.0,
+      1.0
+    ],
+    "SPKUSDT": [
+      "SPK",
+      1.0,
+      1.0
+    ],
+    "ETCUSDT": [
+      "ETC",
+      1.0,
+      1.0
+    ],
+    "PENDLEUSDT": [
+      "PENDLE",
+      1.0,
+      1.0
+    ],
+    "TREEUSDT": [
+      "TREE",
+      1.0,
+      1.0
+    ],
+    "CYBERUSDT": [
+      "CYBER",
+      1.0,
+      1.0
+    ],
+    "GTCUSDT": [
+      "GTC",
+      1.0,
       1.0
     ],
     "APTUSDT": [
       "APT",
+      1.0,
       1.0
     ],
-    "BIOUSDT": [
-      "BIO",
+    "ENSUSDT": [
+      "ENS",
+      1.0,
       1.0
     ],
-    "MOODENGUSDT": [
-      "MOODENG",
+    "DOTUSDT": [
+      "DOT",
+      1.0,
+      1.0
+    ],
+    "VANAUSDT": [
+      "VANA",
+      1.0,
+      1.0
+    ],
+    "LINEAUSDT": [
+      "LINEA",
+      1.0,
+      1.0
+    ],
+    "HYPERUSDT": [
+      "HYPER",
+      1.0,
+      1.0
+    ],
+    "FLOCKUSDT": [
+      "FLOCK",
+      1.0,
+      1.0
+    ],
+    "TAIKOUSDT": [
+      "TAIKO",
+      1.0,
+      1.0
+    ],
+    "GMTUSDT": [
+      "GMT",
+      1.0,
+      1.0
+    ],
+    "ZKCUSDT": [
+      "ZKC",
+      1.0,
+      1.0
+    ],
+    "MIRAUSDT": [
+      "MIRA",
+      1.0,
+      1.0
+    ],
+    "ZKPUSDT": [
+      "ZKP",
+      1.0,
+      1.0
+    ],
+    "MEGAUSDT": [
+      "MEGA",
+      1.0,
+      1.0
+    ],
+    "BCHUSDT": [
+      "BCH",
+      1.0,
+      1.0
+    ],
+    "CAPUSDT": [
+      "CAP",
+      1.0,
+      1.0
+    ],
+    "TIAUSDT": [
+      "TIA",
+      1.0,
+      1.0
+    ],
+    "MONUSDT": [
+      "MON",
+      1.0,
+      1.0
+    ],
+    "AAVEUSDT": [
+      "AAVE",
+      1.0,
+      1.0
+    ],
+    "AXLUSDT": [
+      "AXL",
+      1.0,
       1.0
     ],
     "ATOMUSDT": [
       "ATOM",
+      1.0,
+      1.0
+    ],
+    "RENDERUSDT": [
+      "RENDER",
+      1.0,
+      1.0
+    ],
+    "NXPCUSDT": [
+      "NXPC",
+      1.0,
+      1.0
+    ],
+    "ESPUSDT": [
+      "ESP",
+      1.0,
+      1.0
+    ],
+    "FUSDT": [
+      "F",
+      1.0,
+      1.0
+    ],
+    "IOSTUSDT": [
+      "IOST",
+      1.0,
+      1.0
+    ],
+    "TUSDT": [
+      "T",
+      1.0,
+      1.0
+    ]
+  },
+  "bybit_sym_map": {
+    "ETHFIUSDT": [
+      "ETHFI",
+      1.0,
+      1.0
+    ],
+    "AXSUSDT": [
+      "AXS",
+      1.0,
+      1.0
+    ],
+    "SPXUSDT": [
+      "SPX",
+      1.0,
+      1.0
+    ],
+    "CFXUSDT": [
+      "CFX",
+      1.0,
+      1.0
+    ],
+    "LITUSDT": [
+      "LIT",
+      1.0,
+      1.0
+    ],
+    "SYRUPUSDT": [
+      "SYRUP",
+      1.0,
+      1.0
+    ],
+    "ENSOUSDT": [
+      "ENSO",
+      1.0,
+      1.0
+    ],
+    "TAOUSDT": [
+      "TAO",
+      1.0,
+      1.0
+    ],
+    "SANDUSDT": [
+      "SAND",
+      1.0,
+      1.0
+    ],
+    "ELSAUSDT": [
+      "ELSA",
+      1.0,
+      1.0
+    ],
+    "OUSDT": [
+      "O",
+      1.0,
+      1.0
+    ],
+    "ORCAUSDT": [
+      "ORCA",
+      1.0,
+      1.0
+    ],
+    "ZORAUSDT": [
+      "ZORA",
+      1.0,
+      1.0
+    ],
+    "VETUSDT": [
+      "VET",
+      1.0,
+      1.0
+    ],
+    "WLFIUSDT": [
+      "WLFI",
+      1.0,
+      1.0
+    ],
+    "WLDUSDT": [
+      "WLD",
+      1.0,
+      1.0
+    ],
+    "FILUSDT": [
+      "FIL",
+      1.0,
+      1.0
+    ],
+    "BREVUSDT": [
+      "BREV",
+      1.0,
+      1.0
+    ],
+    "KMNOUSDT": [
+      "KMNO",
+      1.0,
+      1.0
+    ],
+    "ERAUSDT": [
+      "ERA",
+      1.0,
+      1.0
+    ],
+    "UNIUSDT": [
+      "UNI",
+      1.0,
+      1.0
+    ],
+    "CELOUSDT": [
+      "CELO",
+      1.0,
+      1.0
+    ],
+    "AEROUSDT": [
+      "AERO",
+      1.0,
+      1.0
+    ],
+    "NEARUSDT": [
+      "NEAR",
+      1.0,
+      1.0
+    ],
+    "ICPUSDT": [
+      "ICP",
+      1.0,
+      1.0
+    ],
+    "BATUSDT": [
+      "BAT",
+      1.0,
+      1.0
+    ],
+    "MINAUSDT": [
+      "MINA",
+      1.0,
+      1.0
+    ],
+    "PONSUSDT": [
+      "PONS",
+      1.0,
+      1.0
+    ],
+    "TRUMPUSDT": [
+      "TRUMP",
+      1.0,
+      1.0
+    ],
+    "NEOUSDT": [
+      "NEO",
+      1.0,
+      1.0
+    ],
+    "SENTUSDT": [
+      "SENT",
+      1.0,
+      1.0
+    ],
+    "ZROUSDT": [
+      "ZRO",
+      1.0,
+      1.0
+    ],
+    "PIEVERSEUSDT": [
+      "PIEVERSE",
+      1.0,
+      1.0
+    ],
+    "SUIUSDT": [
+      "SUI",
+      1.0,
+      1.0
+    ],
+    "OPGUSDT": [
+      "OPG",
+      1.0,
+      1.0
+    ],
+    "JTOUSDT": [
+      "JTO",
+      1.0,
+      1.0
+    ],
+    "SEIUSDT": [
+      "SEI",
+      1.0,
+      1.0
+    ],
+    "WALUSDT": [
+      "WAL",
+      1.0,
+      1.0
+    ],
+    "LINKUSDT": [
+      "LINK",
+      1.0,
+      1.0
+    ],
+    "SPKUSDT": [
+      "SPK",
+      1.0,
+      1.0
+    ],
+    "PENDLEUSDT": [
+      "PENDLE",
+      1.0,
+      1.0
+    ],
+    "TREEUSDT": [
+      "TREE",
+      1.0,
+      1.0
+    ],
+    "CYBERUSDT": [
+      "CYBER",
+      1.0,
+      1.0
+    ],
+    "APTUSDT": [
+      "APT",
+      1.0,
+      1.0
+    ],
+    "ENSUSDT": [
+      "ENS",
+      1.0,
+      1.0
+    ],
+    "DOTUSDT": [
+      "DOT",
+      1.0,
+      1.0
+    ],
+    "VANAUSDT": [
+      "VANA",
+      1.0,
+      1.0
+    ],
+    "LINEAUSDT": [
+      "LINEA",
+      1.0,
+      1.0
+    ],
+    "HYPERUSDT": [
+      "HYPER",
+      1.0,
+      1.0
+    ],
+    "FLOCKUSDT": [
+      "FLOCK",
+      1.0,
+      1.0
+    ],
+    "TAIKOUSDT": [
+      "TAIKO",
+      1.0,
+      1.0
+    ],
+    "GMTUSDT": [
+      "GMT",
+      1.0,
+      1.0
+    ],
+    "ZKCUSDT": [
+      "ZKC",
+      1.0,
+      1.0
+    ],
+    "MIRAUSDT": [
+      "MIRA",
+      1.0,
+      1.0
+    ],
+    "ZKPUSDT": [
+      "ZKP",
+      1.0,
+      1.0
+    ],
+    "MEGAUSDT": [
+      "MEGA",
+      1.0,
+      1.0
+    ],
+    "MASKUSDT": [
+      "MASK",
+      1.0,
+      1.0
+    ],
+    "BCHUSDT": [
+      "BCH",
+      1.0,
+      1.0
+    ],
+    "CAPUSDT": [
+      "CAP",
+      1.0,
+      1.0
+    ],
+    "ARXUSDT": [
+      "ARX",
+      1.0,
+      1.0
+    ],
+    "TIAUSDT": [
+      "TIA",
+      1.0,
+      1.0
+    ],
+    "MONUSDT": [
+      "MON",
+      1.0,
+      1.0
+    ],
+    "AAVEUSDT": [
+      "AAVE",
+      1.0,
+      1.0
+    ],
+    "AXLUSDT": [
+      "AXL",
+      1.0,
+      1.0
+    ],
+    "RENDERUSDT": [
+      "RENDER",
+      1.0,
+      1.0
+    ],
+    "NXPCUSDT": [
+      "NXPC",
+      1.0,
+      1.0
+    ],
+    "ZBTUSDT": [
+      "ZBT",
+      1.0,
+      1.0
+    ],
+    "BEAMUSDT": [
+      "BEAM",
+      1.0,
+      1.0
+    ],
+    "PUFFERUSDT": [
+      "PUFFER",
+      1.0,
+      1.0
+    ],
+    "TUSDT": [
+      "T",
+      1.0,
       1.0
     ]
   },
   "okx_sym_map": {
-    "VVV-USDT-SWAP": [
-      "VVV",
-      1.0
-    ],
-    "LIT-USDT-SWAP": [
-      "LIT",
-      1.0
-    ],
-    "ICP-USDT-SWAP": [
-      "ICP",
-      1.0
-    ],
     "ETHFI-USDT-SWAP": [
       "ETHFI",
+      1.0,
       1.0
     ],
-    "RAY-USDT-SWAP": [
-      "RAY",
-      1.0
-    ],
-    "TRUMP-USDT-SWAP": [
-      "TRUMP",
-      1.0
-    ],
-    "WLD-USDT-SWAP": [
-      "WLD",
-      1.0
+    "AXS-USDT-SWAP": [
+      "AXS",
+      1.0,
+      0.1
     ],
     "SPX-USDT-SWAP": [
       "SPX",
+      1.0,
       1.0
     ],
-    "ZRO-USDT-SWAP": [
-      "ZRO",
+    "CFX-USDT-SWAP": [
+      "CFX",
+      1.0,
+      10.0
+    ],
+    "LIT-USDT-SWAP": [
+      "LIT",
+      1.0,
       1.0
     ],
-    "ZORA-USDT-SWAP": [
-      "ZORA",
-      1.0
-    ],
-    "CAP-USDT-SWAP": [
-      "CAP",
-      1.0
-    ],
-    "PIEVERSE-USDT-SWAP": [
-      "PIEVERSE",
-      1.0
-    ],
-    "WCT-USDT-SWAP": [
-      "WCT",
-      1.0
-    ],
-    "PROS-USDT-SWAP": [
-      "PROS",
-      1.0
+    "SYRUP-USDT-SWAP": [
+      "SYRUP",
+      1.0,
+      10.0
     ],
     "ENSO-USDT-SWAP": [
       "ENSO",
+      1.0,
       1.0
+    ],
+    "SAND-USDT-SWAP": [
+      "SAND",
+      1.0,
+      10.0
+    ],
+    "O-USDT-SWAP": [
+      "O",
+      1.0,
+      10.0
+    ],
+    "ZORA-USDT-SWAP": [
+      "ZORA",
+      1.0,
+      10.0
+    ],
+    "WLFI-USDT-SWAP": [
+      "WLFI",
+      1.0,
+      10.0
+    ],
+    "WLD-USDT-SWAP": [
+      "WLD",
+      1.0,
+      1.0
+    ],
+    "FIL-USDT-SWAP": [
+      "FIL",
+      1.0,
+      0.1
     ],
     "BREV-USDT-SWAP": [
       "BREV",
-      1.0
-    ],
-    "ESP-USDT-SWAP": [
-      "ESP",
-      1.0
-    ],
-    "NEAR-USDT-SWAP": [
-      "NEAR",
+      1.0,
       1.0
     ],
     "KMNO-USDT-SWAP": [
       "KMNO",
+      1.0,
+      100.0
+    ],
+    "UNI-USDT-SWAP": [
+      "UNI",
+      1.0,
       1.0
     ],
-    "ZKP-USDT-SWAP": [
-      "ZKP",
+    "PUMP-USDT-SWAP": [
+      "PUMP",
+      1.0,
+      1000.0
+    ],
+    "CELO-USDT-SWAP": [
+      "CELO",
+      1.0,
       1.0
     ],
-    "ARX-USDT-SWAP": [
-      "ARX",
+    "AERO-USDT-SWAP": [
+      "AERO",
+      1.0,
+      10.0
+    ],
+    "NEAR-USDT-SWAP": [
+      "NEAR",
+      1.0,
+      10.0
+    ],
+    "ICP-USDT-SWAP": [
+      "ICP",
+      1.0,
+      0.01
+    ],
+    "BAT-USDT-SWAP": [
+      "BAT",
+      1.0,
+      10.0
+    ],
+    "MINA-USDT-SWAP": [
+      "MINA",
+      1.0,
+      1.0
+    ],
+    "MORPHO-USDT-SWAP": [
+      "MORPHO",
+      1.0,
       1.0
     ],
     "PONS-USDT-SWAP": [
       "PONS",
+      1.0,
+      10.0
+    ],
+    "TRUMP-USDT-SWAP": [
+      "TRUMP",
+      1.0,
+      0.1
+    ],
+    "XRP-USDT-SWAP": [
+      "XRP",
+      1.0,
+      100.0
+    ],
+    "SENT-USDT-SWAP": [
+      "SENT",
+      1.0,
+      100.0
+    ],
+    "RAY-USDT-SWAP": [
+      "RAY",
+      1.0,
       1.0
     ],
-    "BAT-USDT-SWAP": [
-      "BAT",
+    "ZRO-USDT-SWAP": [
+      "ZRO",
+      1.0,
+      1.0
+    ],
+    "PIEVERSE-USDT-SWAP": [
+      "PIEVERSE",
+      1.0,
+      10.0
+    ],
+    "SUI-USDT-SWAP": [
+      "SUI",
+      1.0,
+      1.0
+    ],
+    "OPG-USDT-SWAP": [
+      "OPG",
+      1.0,
+      10.0
+    ],
+    "WCT-USDT-SWAP": [
+      "WCT",
+      1.0,
+      10.0
+    ],
+    "JTO-USDT-SWAP": [
+      "JTO",
+      1.0,
+      1.0
+    ],
+    "SEI-USDT-SWAP": [
+      "SEI",
+      1.0,
+      10.0
+    ],
+    "WAL-USDT-SWAP": [
+      "WAL",
+      1.0,
+      10.0
+    ],
+    "LINK-USDT-SWAP": [
+      "LINK",
+      1.0,
+      1.0
+    ],
+    "SPK-USDT-SWAP": [
+      "SPK",
+      1.0,
+      100.0
+    ],
+    "ETC-USDT-SWAP": [
+      "ETC",
+      1.0,
+      10.0
+    ],
+    "PENDLE-USDT-SWAP": [
+      "PENDLE",
+      1.0,
       1.0
     ],
     "APT-USDT-SWAP": [
       "APT",
+      1.0,
+      1.0
+    ],
+    "DOT-USDT-SWAP": [
+      "DOT",
+      1.0,
+      1.0
+    ],
+    "LINEA-USDT-SWAP": [
+      "LINEA",
+      1.0,
+      100.0
+    ],
+    "FLOCK-USDT-SWAP": [
+      "FLOCK",
+      1.0,
+      100.0
+    ],
+    "GMT-USDT-SWAP": [
+      "GMT",
+      1.0,
+      1.0
+    ],
+    "ZKP-USDT-SWAP": [
+      "ZKP",
+      1.0,
+      10.0
+    ],
+    "MEGA-USDT-SWAP": [
+      "MEGA",
+      1.0,
+      10.0
+    ],
+    "PROS-USDT-SWAP": [
+      "PROS",
+      1.0,
+      1.0
+    ],
+    "MASK-USDT-SWAP": [
+      "MASK",
+      1.0,
+      1.0
+    ],
+    "LA-USDT-SWAP": [
+      "LA",
+      1.0,
+      10.0
+    ],
+    "CAP-USDT-SWAP": [
+      "CAP",
+      1.0,
+      100.0
+    ],
+    "ARX-USDT-SWAP": [
+      "ARX",
+      1.0,
+      10.0
+    ],
+    "TIA-USDT-SWAP": [
+      "TIA",
+      1.0,
+      1.0
+    ],
+    "AAVE-USDT-SWAP": [
+      "AAVE",
+      1.0,
+      0.1
+    ],
+    "ATOM-USDT-SWAP": [
+      "ATOM",
+      1.0,
+      1.0
+    ],
+    "RENDER-USDT-SWAP": [
+      "RENDER",
+      1.0,
       1.0
     ],
     "F-USDT-SWAP": [
       "F",
+      1.0,
+      100.0
+    ],
+    "ZBT-USDT-SWAP": [
+      "ZBT",
+      1.0,
       1.0
     ],
-    "BIGTIME-USDT-SWAP": [
-      "BIGTIME",
+    "VIRTUAL-USDT-SWAP": [
+      "VIRTUAL",
+      1.0,
       1.0
+    ],
+    "ONT-USDT-SWAP": [
+      "ONT",
+      1.0,
+      10.0
     ]
   },
   "gateio_sym_map": {
-    "VVV_USDT": [
-      "VVV",
-      1.0
-    ],
-    "LIT_USDT": [
-      "LIT",
-      1.0
-    ],
-    "ICP_USDT": [
-      "ICP",
-      1.0
-    ],
     "ETHFI_USDT": [
       "ETHFI",
-      1.0
+      1.0,
+      0.1
     ],
-    "RAY_USDT": [
-      "RAY",
-      1.0
-    ],
-    "PROM_USDT": [
-      "PROM",
-      1.0
-    ],
-    "WLD_USDT": [
-      "WLD",
-      1.0
-    ],
-    "ELSA_USDT": [
-      "ELSA",
-      1.0
+    "AXS_USDT": [
+      "AXS",
+      1.0,
+      0.1
     ],
     "SPX_USDT": [
       "SPX",
-      1.0
+      1.0,
+      10.0
     ],
-    "ZRO_USDT": [
-      "ZRO",
-      1.0
-    ],
-    "CAP_USDT": [
-      "CAP",
-      1.0
-    ],
-    "PIEVERSE_USDT": [
-      "PIEVERSE",
-      1.0
-    ],
-    "NEAR_USDT": [
-      "NEAR",
-      1.0
-    ],
-    "INJ_USDT": [
-      "INJ",
-      1.0
-    ],
-    "ERA_USDT": [
-      "ERA",
-      1.0
-    ],
-    "SEI_USDT": [
-      "SEI",
-      1.0
-    ],
-    "O_USDT": [
-      "O",
-      1.0
-    ],
-    "BCH_USDT": [
-      "BCH",
-      1.0
-    ],
-    "BAT_USDT": [
-      "BAT",
-      1.0
-    ],
-    "PUMP_USDT": [
-      "PUMP",
-      1.0
-    ],
-    "RENDER_USDT": [
-      "RENDER",
-      1.0
-    ],
-    "APT_USDT": [
-      "APT",
-      1.0
-    ]
-  },
-  "mexc_sym_map": {
-    "VVV_USDT": [
-      "VVV",
-      1.0
+    "CFX_USDT": [
+      "CFX",
+      1.0,
+      10.0
     ],
     "LIT_USDT": [
       "LIT",
-      1.0
-    ],
-    "ICP_USDT": [
-      "ICP",
-      1.0
-    ],
-    "ETHFI_USDT": [
-      "ETHFI",
-      1.0
-    ],
-    "RAY_USDT": [
-      "RAY",
-      1.0
-    ],
-    "PROM_USDT": [
-      "PROM",
-      1.0
-    ],
-    "AXL_USDT": [
-      "AXL",
-      1.0
-    ],
-    "WLD_USDT": [
-      "WLD",
-      1.0
-    ],
-    "ELSA_USDT": [
-      "ELSA",
-      1.0
-    ],
-    "SPX_USDT": [
-      "SPX",
-      1.0
-    ],
-    "SOMI_USDT": [
-      "SOMI",
-      1.0
-    ],
-    "GRT_USDT": [
-      "GRT",
-      1.0
-    ],
-    "ZRO_USDT": [
-      "ZRO",
-      1.0
-    ],
-    "ZORA_USDT": [
-      "ZORA",
-      1.0
-    ],
-    "CAP_USDT": [
-      "CAP",
-      1.0
-    ],
-    "PIEVERSE_USDT": [
-      "PIEVERSE",
-      1.0
-    ],
-    "WCT_USDT": [
-      "WCT",
+      1.0,
       1.0
     ],
     "ENSO_USDT": [
       "ENSO",
+      1.0,
       1.0
     ],
-    "BREV_USDT": [
-      "BREV",
+    "TAO_USDT": [
+      "TAO",
+      1.0,
+      0.01
+    ],
+    "SAND_USDT": [
+      "SAND",
+      1.0,
+      1.0
+    ],
+    "ELSA_USDT": [
+      "ELSA",
+      1.0,
+      10.0
+    ],
+    "O_USDT": [
+      "O",
+      1.0,
+      10.0
+    ],
+    "ORCA_USDT": [
+      "ORCA",
+      1.0,
+      0.1
+    ],
+    "WLFI_USDT": [
+      "WLFI",
+      1.0,
+      10.0
+    ],
+    "WLD_USDT": [
+      "WLD",
+      1.0,
+      1.0
+    ],
+    "FIL_USDT": [
+      "FIL",
+      1.0,
+      0.01
+    ],
+    "ERA_USDT": [
+      "ERA",
+      1.0,
+      10.0
+    ],
+    "UNI_USDT": [
+      "UNI",
+      1.0,
+      1.0
+    ],
+    "PUMP_USDT": [
+      "PUMP",
+      1.0,
+      1000.0
+    ],
+    "AERO_USDT": [
+      "AERO",
+      1.0,
       1.0
     ],
     "NEAR_USDT": [
       "NEAR",
+      1.0,
       1.0
     ],
-    "VET_USDT": [
-      "VET",
+    "ICP_USDT": [
+      "ICP",
+      1.0,
+      0.001
+    ],
+    "BAT_USDT": [
+      "BAT",
+      1.0,
+      10.0
+    ],
+    "PROM_USDT": [
+      "PROM",
+      1.0,
+      0.1
+    ],
+    "MINA_USDT": [
+      "MINA",
+      1.0,
+      0.1
+    ],
+    "PONS_USDT": [
+      "PONS",
+      1.0,
+      10.0
+    ],
+    "TRUMP_USDT": [
+      "TRUMP",
+      1.0,
+      0.1
+    ],
+    "XRP_USDT": [
+      "XRP",
+      1.0,
+      10.0
+    ],
+    "SENT_USDT": [
+      "SENT",
+      1.0,
+      100.0
+    ],
+    "RAY_USDT": [
+      "RAY",
+      1.0,
+      0.1
+    ],
+    "ZRO_USDT": [
+      "ZRO",
+      1.0,
       1.0
     ],
-    "KMNO_USDT": [
-      "KMNO",
+    "PIEVERSE_USDT": [
+      "PIEVERSE",
+      1.0,
+      10.0
+    ],
+    "SUI_USDT": [
+      "SUI",
+      1.0,
       1.0
     ],
-    "B3_USDT": [
-      "B3",
-      1.0
-    ],
-    "CYBER_USDT": [
-      "CYBER",
-      1.0
-    ],
-    "HYPER_USDT": [
-      "HYPER",
-      1.0
-    ],
-    "AWE_USDT": [
-      "AWE",
-      1.0
-    ],
-    "ZKC_USDT": [
-      "ZKC",
-      1.0
-    ],
-    "ZKP_USDT": [
-      "ZKP",
-      1.0
-    ],
-    "NEO_USDT": [
-      "NEO",
-      1.0
-    ],
-    "IO_USDT": [
-      "IO",
-      1.0
-    ],
-    "INJ_USDT": [
-      "INJ",
-      1.0
-    ],
-    "CARV_USDT": [
-      "CARV",
-      1.0
-    ],
-    "ERA_USDT": [
-      "ERA",
+    "JTO_USDT": [
+      "JTO",
+      1.0,
       1.0
     ],
     "SEI_USDT": [
       "SEI",
+      1.0,
+      10.0
+    ],
+    "WAL_USDT": [
+      "WAL",
+      1.0,
+      10.0
+    ],
+    "LINK_USDT": [
+      "LINK",
+      1.0,
       1.0
     ],
-    "MNT_USDT": [
-      "MNT",
-      1.0
+    "ETC_USDT": [
+      "ETC",
+      1.0,
+      0.1
     ],
-    "PONS_USDT": [
-      "PONS",
-      1.0
-    ],
-    "API3_USDT": [
-      "API3",
-      1.0
-    ],
-    "ENS_USDT": [
-      "ENS",
-      1.0
-    ],
-    "O_USDT": [
-      "O",
-      1.0
-    ],
-    "BCH_USDT": [
-      "BCH",
-      1.0
-    ],
-    "BAT_USDT": [
-      "BAT",
+    "PENDLE_USDT": [
+      "PENDLE",
+      1.0,
       1.0
     ],
     "APT_USDT": [
       "APT",
+      1.0,
+      0.1
+    ],
+    "ENS_USDT": [
+      "ENS",
+      1.0,
+      0.1
+    ],
+    "MEGA_USDT": [
+      "MEGA",
+      1.0,
+      10.0
+    ],
+    "BCH_USDT": [
+      "BCH",
+      1.0,
+      0.01
+    ],
+    "CAP_USDT": [
+      "CAP",
+      1.0,
+      100.0
+    ],
+    "TIA_USDT": [
+      "TIA",
+      1.0,
       1.0
     ],
-    "BIO_USDT": [
-      "BIO",
+    "AAVE_USDT": [
+      "AAVE",
+      1.0,
+      0.01
+    ],
+    "NXPC_USDT": [
+      "NXPC",
+      1.0,
       1.0
     ],
-    "VTHO_USDT": [
-      "VTHO",
+    "ESP_USDT": [
+      "ESP",
+      1.0,
+      10.0
+    ],
+    "FF_USDT": [
+      "FF",
+      1.0,
+      10.0
+    ],
+    "VIRTUAL_USDT": [
+      "VIRTUAL",
+      1.0,
+      10.0
+    ]
+  },
+  "mexc_sym_map": {
+    "ETHFI_USDT": [
+      "ETHFI",
+      1.0,
       1.0
     ],
-    "ATOM_USDT": [
-      "ATOM",
+    "AXS_USDT": [
+      "AXS",
+      1.0,
       1.0
+    ],
+    "SPX_USDT": [
+      "SPX",
+      1.0,
+      1.0
+    ],
+    "CFX_USDT": [
+      "CFX",
+      1.0,
+      1.0
+    ],
+    "LIT_USDT": [
+      "LIT",
+      1.0,
+      0.1
+    ],
+    "SYRUP_USDT": [
+      "SYRUP",
+      1.0,
+      10.0
+    ],
+    "ENSO_USDT": [
+      "ENSO",
+      1.0,
+      1.0
+    ],
+    "TAO_USDT": [
+      "TAO",
+      1.0,
+      0.01
+    ],
+    "SAND_USDT": [
+      "SAND",
+      1.0,
+      1.0
+    ],
+    "ELSA_USDT": [
+      "ELSA",
+      1.0,
+      10.0
+    ],
+    "O_USDT": [
+      "O",
+      1.0,
+      1.0
+    ],
+    "ORCA_USDT": [
+      "ORCA",
+      1.0,
+      1.0
+    ],
+    "ZORA_USDT": [
+      "ZORA",
+      1.0,
+      10.0
+    ],
+    "VET_USDT": [
+      "VET",
+      1.0,
+      1.0
+    ],
+    "WLFI_USDT": [
+      "WLFI",
+      1.0,
+      1.0
+    ],
+    "WLD_USDT": [
+      "WLD",
+      1.0,
+      1.0
+    ],
+    "BREV_USDT": [
+      "BREV",
+      1.0,
+      10.0
+    ],
+    "KMNO_USDT": [
+      "KMNO",
+      1.0,
+      100.0
+    ],
+    "ERA_USDT": [
+      "ERA",
+      1.0,
+      1.0
+    ],
+    "UNI_USDT": [
+      "UNI",
+      1.0,
+      0.1
+    ],
+    "CELO_USDT": [
+      "CELO",
+      1.0,
+      1.0
+    ],
+    "AERO_USDT": [
+      "AERO",
+      1.0,
+      10.0
+    ],
+    "NEAR_USDT": [
+      "NEAR",
+      1.0,
+      1.0
+    ],
+    "ICP_USDT": [
+      "ICP",
+      1.0,
+      0.01
+    ],
+    "BAT_USDT": [
+      "BAT",
+      1.0,
+      1.0
+    ],
+    "PROM_USDT": [
+      "PROM",
+      1.0,
+      1.0
+    ],
+    "MINA_USDT": [
+      "MINA",
+      1.0,
+      1.0
+    ],
+    "MORPHO_USDT": [
+      "MORPHO",
+      1.0,
+      1.0
+    ],
+    "PONS_USDT": [
+      "PONS",
+      1.0,
+      100.0
+    ],
+    "XRP_USDT": [
+      "XRP",
+      1.0,
+      1.0
+    ],
+    "NEO_USDT": [
+      "NEO",
+      1.0,
+      0.1
+    ],
+    "SENT_USDT": [
+      "SENT",
+      1.0,
+      10.0
+    ],
+    "RAY_USDT": [
+      "RAY",
+      1.0,
+      0.1
+    ],
+    "ZRO_USDT": [
+      "ZRO",
+      1.0,
+      1.0
+    ],
+    "PIEVERSE_USDT": [
+      "PIEVERSE",
+      1.0,
+      10.0
+    ],
+    "SUI_USDT": [
+      "SUI",
+      1.0,
+      1.0
+    ],
+    "OPG_USDT": [
+      "OPG",
+      1.0,
+      10.0
+    ],
+    "WCT_USDT": [
+      "WCT",
+      1.0,
+      10.0
+    ],
+    "JTO_USDT": [
+      "JTO",
+      1.0,
+      1.0
+    ],
+    "SEI_USDT": [
+      "SEI",
+      1.0,
+      10.0
+    ],
+    "WAL_USDT": [
+      "WAL",
+      1.0,
+      10.0
+    ],
+    "LINK_USDT": [
+      "LINK",
+      1.0,
+      0.1
+    ],
+    "SPK_USDT": [
+      "SPK",
+      1.0,
+      10.0
+    ],
+    "ETC_USDT": [
+      "ETC",
+      1.0,
+      0.1
+    ],
+    "PENDLE_USDT": [
+      "PENDLE",
+      1.0,
+      1.0
+    ],
+    "CYBER_USDT": [
+      "CYBER",
+      1.0,
+      1.0
+    ],
+    "APT_USDT": [
+      "APT",
+      1.0,
+      0.1
+    ],
+    "ENS_USDT": [
+      "ENS",
+      1.0,
+      0.1
+    ],
+    "DOT_USDT": [
+      "DOT",
+      1.0,
+      0.1
+    ],
+    "LINEA_USDT": [
+      "LINEA",
+      1.0,
+      10.0
+    ],
+    "HYPER_USDT": [
+      "HYPER",
+      1.0,
+      10.0
+    ],
+    "FLOCK_USDT": [
+      "FLOCK",
+      1.0,
+      1.0
+    ],
+    "TAIKO_USDT": [
+      "TAIKO",
+      1.0,
+      1.0
+    ],
+    "GMT_USDT": [
+      "GMT",
+      1.0,
+      10.0
+    ],
+    "ZKC_USDT": [
+      "ZKC",
+      1.0,
+      1.0
+    ],
+    "MIRA_USDT": [
+      "MIRA",
+      1.0,
+      1.0
+    ],
+    "ZKP_USDT": [
+      "ZKP",
+      1.0,
+      10.0
+    ],
+    "MEGA_USDT": [
+      "MEGA",
+      1.0,
+      1.0
+    ],
+    "BCH_USDT": [
+      "BCH",
+      1.0,
+      0.01
+    ],
+    "LA_USDT": [
+      "LA",
+      1.0,
+      1.0
+    ],
+    "CAP_USDT": [
+      "CAP",
+      1.0,
+      10.0
+    ],
+    "TIA_USDT": [
+      "TIA",
+      1.0,
+      1.0
+    ],
+    "AAVE_USDT": [
+      "AAVE",
+      1.0,
+      0.01
+    ],
+    "AXL_USDT": [
+      "AXL",
+      1.0,
+      1.0
+    ],
+    "RENDER_USDT": [
+      "RENDER",
+      1.0,
+      1.0
+    ],
+    "ATH_USDT": [
+      "ATH",
+      1.0,
+      10.0
+    ],
+    "NXPC_USDT": [
+      "NXPC",
+      1.0,
+      1.0
+    ],
+    "IOST_USDT": [
+      "IOST",
+      1.0,
+      100.0
+    ],
+    "FF_USDT": [
+      "FF",
+      1.0,
+      1.0
+    ],
+    "T_USDT": [
+      "T",
+      1.0,
+      100.0
     ]
   },
   "kucoin_sym_map": {
-    "VVVUSDTM": [
-      "VVV",
+    "ETHFIUSDTM": [
+      "ETHFI",
+      1.0,
       1.0
     ],
-    "LITUSDTM": [
-      "LIT",
-      1.0
-    ],
-    "ICPUSDTM": [
-      "ICP",
-      1.0
-    ],
-    "RAYUSDTM": [
-      "RAY",
-      1.0
-    ],
-    "PROMUSDTM": [
-      "PROM",
-      1.0
-    ],
-    "TRUMPUSDTM": [
-      "TRUMP",
-      1.0
-    ],
-    "WLDUSDTM": [
-      "WLD",
-      1.0
+    "AXSUSDTM": [
+      "AXS",
+      1.0,
+      0.1
     ],
     "SPXUSDTM": [
       "SPX",
+      1.0,
       1.0
     ],
-    "GRTUSDTM": [
-      "GRT",
+    "CFXUSDTM": [
+      "CFX",
+      1.0,
+      10.0
+    ],
+    "LITUSDTM": [
+      "LIT",
+      1.0,
       1.0
     ],
-    "EULUSDTM": [
-      "EUL",
-      1.0
+    "SYRUPUSDTM": [
+      "SYRUP",
+      1.0,
+      10.0
     ],
-    "ZROUSDTM": [
-      "ZRO",
-      1.0
+    "TAOUSDTM": [
+      "TAO",
+      1.0,
+      0.01
     ],
-    "ZORAUSDTM": [
-      "ZORA",
-      1.0
-    ],
-    "CAPUSDTM": [
-      "CAP",
-      1.0
-    ],
-    "PIEVERSEUSDTM": [
-      "PIEVERSE",
-      1.0
-    ],
-    "PROSUSDTM": [
-      "PROS",
-      1.0
-    ],
-    "ESPUSDTM": [
-      "ESP",
-      1.0
-    ],
-    "NEARUSDTM": [
-      "NEAR",
-      1.0
-    ],
-    "VETUSDTM": [
-      "VET",
-      1.0
-    ],
-    "SENTUSDTM": [
-      "SENT",
-      1.0
-    ],
-    "ZKPUSDTM": [
-      "ZKP",
-      1.0
-    ],
-    "SEIUSDTM": [
-      "SEI",
-      1.0
-    ],
-    "MMTUSDTM": [
-      "MMT",
-      1.0
-    ],
-    "PONSUSDTM": [
-      "PONS",
+    "SANDUSDTM": [
+      "SAND",
+      1.0,
       1.0
     ],
     "OUSDTM": [
       "O",
+      1.0,
       1.0
+    ],
+    "ORCAUSDTM": [
+      "ORCA",
+      1.0,
+      1.0
+    ],
+    "ZORAUSDTM": [
+      "ZORA",
+      1.0,
+      100.0
+    ],
+    "VETUSDTM": [
+      "VET",
+      1.0,
+      100.0
+    ],
+    "WLFIUSDTM": [
+      "WLFI",
+      1.0,
+      1.0
+    ],
+    "WLDUSDTM": [
+      "WLD",
+      1.0,
+      1.0
+    ],
+    "FILUSDTM": [
+      "FIL",
+      1.0,
+      0.1
+    ],
+    "EULUSDTM": [
+      "EUL",
+      1.0,
+      0.1
+    ],
+    "ERAUSDTM": [
+      "ERA",
+      1.0,
+      10.0
+    ],
+    "UNIUSDTM": [
+      "UNI",
+      1.0,
+      1.0
+    ],
+    "PUMPUSDTM": [
+      "PUMP",
+      1.0,
+      1000.0
+    ],
+    "AEROUSDTM": [
+      "AERO",
+      1.0,
+      1.0
+    ],
+    "NEARUSDTM": [
+      "NEAR",
+      1.0,
+      0.1
+    ],
+    "ICPUSDTM": [
+      "ICP",
+      1.0,
+      0.01
     ],
     "BATUSDTM": [
       "BAT",
+      1.0,
       1.0
     ],
-    "RENDERUSDTM": [
-      "RENDER",
+    "PROMUSDTM": [
+      "PROM",
+      1.0,
+      0.1
+    ],
+    "MINAUSDTM": [
+      "MINA",
+      1.0,
+      1.0
+    ],
+    "MORPHOUSDTM": [
+      "MORPHO",
+      1.0,
+      1.0
+    ],
+    "VVVUSDTM": [
+      "VVV",
+      1.0,
+      0.1
+    ],
+    "PONSUSDTM": [
+      "PONS",
+      1.0,
+      10.0
+    ],
+    "TRUMPUSDTM": [
+      "TRUMP",
+      1.0,
+      0.1
+    ],
+    "XRPUSDTM": [
+      "XRP",
+      1.0,
+      10.0
+    ],
+    "SENTUSDTM": [
+      "SENT",
+      1.0,
+      10.0
+    ],
+    "RAYUSDTM": [
+      "RAY",
+      1.0,
+      1.0
+    ],
+    "ZROUSDTM": [
+      "ZRO",
+      1.0,
+      1.0
+    ],
+    "PIEVERSEUSDTM": [
+      "PIEVERSE",
+      1.0,
+      10.0
+    ],
+    "SUIUSDTM": [
+      "SUI",
+      1.0,
+      1.0
+    ],
+    "OPGUSDTM": [
+      "OPG",
+      1.0,
+      10.0
+    ],
+    "SEIUSDTM": [
+      "SEI",
+      1.0,
+      10.0
+    ],
+    "WALUSDTM": [
+      "WAL",
+      1.0,
+      10.0
+    ],
+    "LINKUSDTM": [
+      "LINK",
+      1.0,
+      0.1
+    ],
+    "ETCUSDTM": [
+      "ETC",
+      1.0,
+      0.1
+    ],
+    "PENDLEUSDTM": [
+      "PENDLE",
+      1.0,
+      1.0
+    ],
+    "GTCUSDTM": [
+      "GTC",
+      1.0,
       1.0
     ],
     "APTUSDTM": [
       "APT",
+      1.0,
+      0.1
+    ],
+    "DOTUSDTM": [
+      "DOT",
+      1.0,
+      1.0
+    ],
+    "THETAUSDTM": [
+      "THETA",
+      1.0,
+      0.1
+    ],
+    "MMTUSDTM": [
+      "MMT",
+      1.0,
+      10.0
+    ],
+    "ZKPUSDTM": [
+      "ZKP",
+      1.0,
+      10.0
+    ],
+    "MEGAUSDTM": [
+      "MEGA",
+      1.0,
+      10.0
+    ],
+    "PROSUSDTM": [
+      "PROS",
+      1.0,
+      1.0
+    ],
+    "BCHUSDTM": [
+      "BCH",
+      1.0,
+      0.01
+    ],
+    "CAPUSDTM": [
+      "CAP",
+      1.0,
+      100.0
+    ],
+    "ARXUSDTM": [
+      "ARX",
+      1.0,
+      10.0
+    ],
+    "TIAUSDTM": [
+      "TIA",
+      1.0,
+      1.0
+    ],
+    "MONUSDTM": [
+      "MON",
+      1.0,
+      10.0
+    ],
+    "AAVEUSDTM": [
+      "AAVE",
+      1.0,
+      0.01
+    ],
+    "ATOMUSDTM": [
+      "ATOM",
+      1.0,
+      0.1
+    ],
+    "MANAUSDTM": [
+      "MANA",
+      1.0,
       1.0
     ],
     "2ZUSDTM": [
       "2Z",
+      1.0,
+      10.0
+    ],
+    "AWEUSDTM": [
+      "AWE",
+      1.0,
+      10.0
+    ],
+    "STXUSDTM": [
+      "STX",
+      1.0,
       1.0
     ],
-    "NMRUSDTM": [
-      "NMR",
+    "INJUSDTM": [
+      "INJ",
+      1.0,
       1.0
     ],
-    "MANAUSDTM": [
-      "MANA",
+    "GRTUSDTM": [
+      "GRT",
+      1.0,
       1.0
     ]
   },
   "bingx_sym_map": {
-    "VVV-USDT": [
-      "VVV",
-      1.0
-    ],
-    "ICP-USDT": [
-      "ICP",
-      1.0
-    ],
     "ETHFI-USDT": [
       "ETHFI",
+      1.0,
       1.0
     ],
-    "RAY-USDT": [
-      "RAY",
-      1.0
-    ],
-    "PROM-USDT": [
-      "PROM",
-      1.0
-    ],
-    "AXL-USDT": [
-      "AXL",
-      1.0
-    ],
-    "WLD-USDT": [
-      "WLD",
-      1.0
-    ],
-    "ELSA-USDT": [
-      "ELSA",
+    "AXS-USDT": [
+      "AXS",
+      1.0,
       1.0
     ],
     "SPX-USDT": [
       "SPX",
+      1.0,
       1.0
     ],
-    "SOMI-USDT": [
-      "SOMI",
+    "CFX-USDT": [
+      "CFX",
+      1.0,
       1.0
     ],
-    "ZRO-USDT": [
-      "ZRO",
-      1.0
-    ],
-    "ZORA-USDT": [
-      "ZORA",
-      1.0
-    ],
-    "CAP-USDT": [
-      "CAP",
-      1.0
-    ],
-    "PIEVERSE-USDT": [
-      "PIEVERSE",
-      1.0
-    ],
-    "WCT-USDT": [
-      "WCT",
+    "SYRUP-USDT": [
+      "SYRUP",
+      1.0,
       1.0
     ],
     "ENSO-USDT": [
       "ENSO",
+      1.0,
       1.0
     ],
-    "BREV-USDT": [
-      "BREV",
+    "TAO-USDT": [
+      "TAO",
+      1.0,
       1.0
     ],
-    "NEAR-USDT": [
-      "NEAR",
+    "SAND-USDT": [
+      "SAND",
+      1.0,
       1.0
     ],
-    "VET-USDT": [
-      "VET",
-      1.0
-    ],
-    "KMNO-USDT": [
-      "KMNO",
-      1.0
-    ],
-    "GTC-USDT": [
-      "GTC",
-      1.0
-    ],
-    "CYBER-USDT": [
-      "CYBER",
-      1.0
-    ],
-    "AWE-USDT": [
-      "AWE",
-      1.0
-    ],
-    "ZKC-USDT": [
-      "ZKC",
-      1.0
-    ],
-    "ZKP-USDT": [
-      "ZKP",
-      1.0
-    ],
-    "NEO-USDT": [
-      "NEO",
-      1.0
-    ],
-    "INJ-USDT": [
-      "INJ",
-      1.0
-    ],
-    "SKR-USDT": [
-      "SKR",
-      1.0
-    ],
-    "CARV-USDT": [
-      "CARV",
-      1.0
-    ],
-    "ERA-USDT": [
-      "ERA",
-      1.0
-    ],
-    "SEI-USDT": [
-      "SEI",
-      1.0
-    ],
-    "MNT-USDT": [
-      "MNT",
-      1.0
-    ],
-    "ENS-USDT": [
-      "ENS",
-      1.0
-    ],
-    "IOTA-USDT": [
-      "IOTA",
+    "ELSA-USDT": [
+      "ELSA",
+      1.0,
       1.0
     ],
     "O-USDT": [
       "O",
+      1.0,
       1.0
     ],
-    "BCH-USDT": [
-      "BCH",
+    "ORCA-USDT": [
+      "ORCA",
+      1.0,
       1.0
     ],
-    "BAT-USDT": [
-      "BAT",
+    "ZORA-USDT": [
+      "ZORA",
+      1.0,
+      1.0
+    ],
+    "VET-USDT": [
+      "VET",
+      1.0,
+      1.0
+    ],
+    "WLFI-USDT": [
+      "WLFI",
+      1.0,
+      1.0
+    ],
+    "WLD-USDT": [
+      "WLD",
+      1.0,
+      1.0
+    ],
+    "FIL-USDT": [
+      "FIL",
+      1.0,
+      1.0
+    ],
+    "BREV-USDT": [
+      "BREV",
+      1.0,
+      1.0
+    ],
+    "KMNO-USDT": [
+      "KMNO",
+      1.0,
+      1.0
+    ],
+    "ERA-USDT": [
+      "ERA",
+      1.0,
+      1.0
+    ],
+    "UNI-USDT": [
+      "UNI",
+      1.0,
       1.0
     ],
     "PUMP-USDT": [
       "PUMP",
+      1.0,
       1.0
     ],
-    "DOS-USDT": [
-      "DOS",
+    "CELO-USDT": [
+      "CELO",
+      1.0,
       1.0
     ],
-    "APT-USDT": [
-      "APT",
-      1.0
-    ],
-    "BIO-USDT": [
-      "BIO",
-      1.0
-    ],
-    "ATOM-USDT": [
-      "ATOM",
-      1.0
-    ]
-  },
-  "htx_sym_map": {
-    "WLD-USDT": [
-      "WLD",
+    "AERO-USDT": [
+      "AERO",
+      1.0,
       1.0
     ],
     "NEAR-USDT": [
       "NEAR",
+      1.0,
+      1.0
+    ],
+    "ICP-USDT": [
+      "ICP",
+      1.0,
+      1.0
+    ],
+    "BAT-USDT": [
+      "BAT",
+      1.0,
+      1.0
+    ],
+    "PROM-USDT": [
+      "PROM",
+      1.0,
+      1.0
+    ],
+    "MINA-USDT": [
+      "MINA",
+      1.0,
+      1.0
+    ],
+    "MORPHO-USDT": [
+      "MORPHO",
+      1.0,
+      1.0
+    ],
+    "PONS-USDT": [
+      "PONS",
+      1.0,
+      1.0
+    ],
+    "XRP-USDT": [
+      "XRP",
+      1.0,
+      1.0
+    ],
+    "NEO-USDT": [
+      "NEO",
+      1.0,
+      1.0
+    ],
+    "SENT-USDT": [
+      "SENT",
+      1.0,
+      1.0
+    ],
+    "RAY-USDT": [
+      "RAY",
+      1.0,
+      1.0
+    ],
+    "ZRO-USDT": [
+      "ZRO",
+      1.0,
+      1.0
+    ],
+    "PIEVERSE-USDT": [
+      "PIEVERSE",
+      1.0,
+      1.0
+    ],
+    "SUI-USDT": [
+      "SUI",
+      1.0,
+      1.0
+    ],
+    "OPG-USDT": [
+      "OPG",
+      1.0,
+      1.0
+    ],
+    "WCT-USDT": [
+      "WCT",
+      1.0,
+      1.0
+    ],
+    "JTO-USDT": [
+      "JTO",
+      1.0,
+      1.0
+    ],
+    "SEI-USDT": [
+      "SEI",
+      1.0,
+      1.0
+    ],
+    "WAL-USDT": [
+      "WAL",
+      1.0,
+      1.0
+    ],
+    "LINK-USDT": [
+      "LINK",
+      1.0,
+      1.0
+    ],
+    "SPK-USDT": [
+      "SPK",
+      1.0,
+      1.0
+    ],
+    "ETC-USDT": [
+      "ETC",
+      1.0,
+      1.0
+    ],
+    "PENDLE-USDT": [
+      "PENDLE",
+      1.0,
+      1.0
+    ],
+    "TREE-USDT": [
+      "TREE",
+      1.0,
+      1.0
+    ],
+    "CYBER-USDT": [
+      "CYBER",
+      1.0,
+      1.0
+    ],
+    "GTC-USDT": [
+      "GTC",
+      1.0,
+      1.0
+    ],
+    "APT-USDT": [
+      "APT",
+      1.0,
+      1.0
+    ],
+    "ENS-USDT": [
+      "ENS",
+      1.0,
+      1.0
+    ],
+    "DOT-USDT": [
+      "DOT",
+      1.0,
+      1.0
+    ],
+    "VANA-USDT": [
+      "VANA",
+      1.0,
+      1.0
+    ],
+    "LINEA-USDT": [
+      "LINEA",
+      1.0,
+      1.0
+    ],
+    "FLOCK-USDT": [
+      "FLOCK",
+      1.0,
+      1.0
+    ],
+    "TAIKO-USDT": [
+      "TAIKO",
+      1.0,
+      1.0
+    ],
+    "GMT-USDT": [
+      "GMT",
+      1.0,
+      1.0
+    ],
+    "ZKC-USDT": [
+      "ZKC",
+      1.0,
+      1.0
+    ],
+    "ZKP-USDT": [
+      "ZKP",
+      1.0,
+      1.0
+    ],
+    "MEGA-USDT": [
+      "MEGA",
+      1.0,
+      1.0
+    ],
+    "BCH-USDT": [
+      "BCH",
+      1.0,
+      1.0
+    ],
+    "CAP-USDT": [
+      "CAP",
+      1.0,
+      1.0
+    ],
+    "TIA-USDT": [
+      "TIA",
+      1.0,
+      1.0
+    ],
+    "AAVE-USDT": [
+      "AAVE",
+      1.0,
+      1.0
+    ],
+    "AXL-USDT": [
+      "AXL",
+      1.0,
+      1.0
+    ],
+    "ATH-USDT": [
+      "ATH",
+      1.0,
+      1.0
+    ],
+    "ESP-USDT": [
+      "ESP",
+      1.0,
+      1.0
+    ],
+    "F-USDT": [
+      "F",
+      1.0,
+      1.0
+    ],
+    "IOST-USDT": [
+      "IOST",
+      1.0,
+      1.0
+    ],
+    "ZBT-USDT": [
+      "ZBT",
+      1.0,
+      1.0
+    ],
+    "BEAM-USDT": [
+      "BEAM",
+      1.0,
+      1.0
+    ],
+    "FF-USDT": [
+      "FF",
+      1.0,
+      1.0
+    ],
+    "VIRTUAL-USDT": [
+      "VIRTUAL",
+      1.0,
       1.0
     ]
   },
-  "pionex_sym_map": {
-    "VVV_USDT_PERP": [
-      "VVV",
-      1.0
-    ],
-    "LIT_USDT_PERP": [
+  "htx_sym_map": {
+    "LIT-USDT": [
       "LIT",
+      1.0,
       1.0
     ],
-    "ICP_USDT_PERP": [
-      "ICP",
+    "TAO-USDT": [
+      "TAO",
+      1.0,
+      0.001
+    ],
+    "WLD-USDT": [
+      "WLD",
+      1.0,
       1.0
     ],
+    "FIL-USDT": [
+      "FIL",
+      1.0,
+      0.1
+    ],
+    "UNI-USDT": [
+      "UNI",
+      1.0,
+      1.0
+    ],
+    "PUMP-USDT": [
+      "PUMP",
+      1.0,
+      100.0
+    ],
+    "NEAR-USDT": [
+      "NEAR",
+      1.0,
+      1.0
+    ],
+    "PONS-USDT": [
+      "PONS",
+      1.0,
+      10.0
+    ],
+    "SUI-USDT": [
+      "SUI",
+      1.0,
+      1.0
+    ],
+    "WAL-USDT": [
+      "WAL",
+      1.0,
+      10.0
+    ],
+    "LINK-USDT": [
+      "LINK",
+      1.0,
+      0.1
+    ],
+    "TIA-USDT": [
+      "TIA",
+      1.0,
+      0.1
+    ]
+  },
+  "pionex_sym_map": {
     "ETHFI_USDT_PERP": [
       "ETHFI",
+      1.0,
       1.0
     ],
-    "RAY_USDT_PERP": [
-      "RAY",
-      1.0
-    ],
-    "AXL_USDT_PERP": [
-      "AXL",
-      1.0
-    ],
-    "WLD_USDT_PERP": [
-      "WLD",
-      1.0
-    ],
-    "ELSA_USDT_PERP": [
-      "ELSA",
+    "AXS_USDT_PERP": [
+      "AXS",
+      1.0,
       1.0
     ],
     "SPX_USDT_PERP": [
       "SPX",
+      1.0,
       1.0
     ],
-    "ZRO_USDT_PERP": [
-      "ZRO",
+    "LIT_USDT_PERP": [
+      "LIT",
+      1.0,
+      1.0
+    ],
+    "TAO_USDT_PERP": [
+      "TAO",
+      1.0,
+      1.0
+    ],
+    "SAND_USDT_PERP": [
+      "SAND",
+      1.0,
+      1.0
+    ],
+    "ELSA_USDT_PERP": [
+      "ELSA",
+      1.0,
+      1.0
+    ],
+    "VET_USDT_PERP": [
+      "VET",
+      1.0,
+      1.0
+    ],
+    "WLD_USDT_PERP": [
+      "WLD",
+      1.0,
+      1.0
+    ],
+    "FIL_USDT_PERP": [
+      "FIL",
+      1.0,
+      1.0
+    ],
+    "UNI_USDT_PERP": [
+      "UNI",
+      1.0,
+      1.0
+    ],
+    "PUMP_USDT_PERP": [
+      "PUMP",
+      1.0,
+      1.0
+    ],
+    "AERO_USDT_PERP": [
+      "AERO",
+      1.0,
       1.0
     ],
     "NEAR_USDT_PERP": [
       "NEAR",
+      1.0,
       1.0
     ],
-    "IO_USDT_PERP": [
-      "IO",
-      1.0
-    ],
-    "INJ_USDT_PERP": [
-      "INJ",
-      1.0
-    ],
-    "SKR_USDT_PERP": [
-      "SKR",
+    "ICP_USDT_PERP": [
+      "ICP",
+      1.0,
       1.0
     ],
     "BAT_USDT_PERP": [
       "BAT",
+      1.0,
+      1.0
+    ],
+    "PONS_USDT_PERP": [
+      "PONS",
+      1.0,
+      1.0
+    ],
+    "TRUMP_USDT_PERP": [
+      "TRUMP",
+      1.0,
+      1.0
+    ],
+    "XRP_USDT_PERP": [
+      "XRP",
+      1.0,
+      1.0
+    ],
+    "SENT_USDT_PERP": [
+      "SENT",
+      1.0,
+      1.0
+    ],
+    "RAY_USDT_PERP": [
+      "RAY",
+      1.0,
+      1.0
+    ],
+    "ZRO_USDT_PERP": [
+      "ZRO",
+      1.0,
+      1.0
+    ],
+    "SUI_USDT_PERP": [
+      "SUI",
+      1.0,
+      1.0
+    ],
+    "JTO_USDT_PERP": [
+      "JTO",
+      1.0,
+      1.0
+    ],
+    "SEI_USDT_PERP": [
+      "SEI",
+      1.0,
+      1.0
+    ],
+    "WAL_USDT_PERP": [
+      "WAL",
+      1.0,
+      1.0
+    ],
+    "LINK_USDT_PERP": [
+      "LINK",
+      1.0,
+      1.0
+    ],
+    "ETC_USDT_PERP": [
+      "ETC",
+      1.0,
+      1.0
+    ],
+    "PENDLE_USDT_PERP": [
+      "PENDLE",
+      1.0,
       1.0
     ],
     "APT_USDT_PERP": [
       "APT",
+      1.0,
+      1.0
+    ],
+    "DOT_USDT_PERP": [
+      "DOT",
+      1.0,
+      1.0
+    ],
+    "BCH_USDT_PERP": [
+      "BCH",
+      1.0,
+      1.0
+    ],
+    "TIA_USDT_PERP": [
+      "TIA",
+      1.0,
+      1.0
+    ],
+    "AAVE_USDT_PERP": [
+      "AAVE",
+      1.0,
+      1.0
+    ],
+    "RENDER_USDT_PERP": [
+      "RENDER",
+      1.0,
+      1.0
+    ],
+    "VIRTUAL_USDT_PERP": [
+      "VIRTUAL",
+      1.0,
       1.0
     ]
   }
@@ -10990,7 +14144,6 @@ __all__ = [
     "PionexStream",
     "StreamManager",
 ]
-
 ```
 
 ## venues/base.py
@@ -11225,14 +14378,28 @@ class BaseCEXStream(BaseVenueStream):
     def __init__(
         self,
         exchange: str,
-        symbols: List[str] | Dict[str, Tuple[str, float]],
+        symbols: List[str] | Dict[str, Any],
         callback: Callable[[OrderBookDepth5], None],
         stream_name: Optional[str] = None,
+        contract_sizes: Optional[Dict[str, float]] = None,
     ):
+        self._contract_sizes: Dict[str, float] = {
+            k.upper(): float(v) for k, v in (contract_sizes or {}).items()
+        }
         if isinstance(symbols, dict):
-            self._sym_map: Dict[str, Tuple[str, float]] = dict(symbols)
+            self._sym_map: Dict[str, Tuple[str, float]] = {}
+            for k, v in symbols.items():
+                k_u = str(k).upper()
+                if isinstance(v, (list, tuple)):
+                    coin = str(v[0])
+                    mult = float(v[1]) if len(v) > 1 else 1.0
+                    self._sym_map[k_u] = (coin, mult)
+                    if len(v) >= 3 and k_u not in self._contract_sizes:
+                        self._contract_sizes[k_u] = float(v[2])
+                else:
+                    self._sym_map[k_u] = parse_symbol_and_mult(k_u)
             raw_list = list(symbols.keys())
-            coins = sorted({c for c, _ in symbols.values()})
+            coins = sorted({c for c, _ in self._sym_map.values()})
         else:
             raw_list = [str(s).upper() for s in symbols]
             self._sym_map = {s: parse_symbol_and_mult(s) for s in raw_list}
@@ -11251,11 +14418,21 @@ class BaseCEXStream(BaseVenueStream):
             return self._sym_map[raw_u]
         return parse_symbol_and_mult(raw_u)
 
+    def _get_contract_size(self, raw_sym: str) -> float:
+        raw_u = raw_sym.upper()
+        return self._contract_sizes.get(raw_u, 1.0)
+
     @staticmethod
     def _base_coin(s: str) -> str:
         return normalize_symbol(s)
 
-    def _extract_levels(self, raw_side: Any, limit: int = 5, mult: float = 1.0) -> List[Tuple[float, float]]:
+    def _extract_levels(
+        self,
+        raw_side: Any,
+        limit: int = 5,
+        mult: float = 1.0,
+        contract_size: float = 1.0,
+    ) -> List[Tuple[float, float]]:
         out: List[Tuple[float, float]] = []
         inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
         for row in raw_side or ():
@@ -11280,7 +14457,9 @@ class BaseCEXStream(BaseVenueStream):
                 else:
                     continue
                 if p > 0.0 and q > 0.0:
-                    out.append((p * inv_mult, q * mult))
+                    real_p = p * inv_mult
+                    real_q = q * contract_size * mult
+                    out.append((real_p, real_q))
             except (TypeError, ValueError, IndexError):
                 continue
         return out
@@ -11384,7 +14563,6 @@ class BaseCEXStream(BaseVenueStream):
                 delay = 30.0 if ("403" in err_str or "11001" in err_str or "getaddrinfo" in err_str) else 3.0
                 log.warning(f"[{self.name}] WS disconnected: {e}. Reconnecting in {delay}s...")
                 await asyncio.sleep(delay)
-
 ```
 
 ## venues/binance.py
@@ -11655,7 +14833,6 @@ class BinanceFuturesStream(BaseVenueStream):
             except asyncio.CancelledError:
                 pass
         self.connected = False
-
 ```
 
 ## venues/bingx.py
@@ -11673,7 +14850,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
 from models import OrderBookDepth5
-from venues.base import BaseCEXStream, create_http_session, normalize_symbol, log
+from venues.base import BaseCEXStream, create_http_session, normalize_symbol, parse_symbol_and_mult, log
 
 
 class BingXRestClient:
@@ -11685,7 +14862,7 @@ class BingXRestClient:
         self.session = session or create_http_session()
 
     def fetch_linear_perpetuals(self) -> Dict[str, Tuple[str, float]]:
-        """Returns symbol (e.g. 'BTC-USDT') -> (canonical_coin 'BTC', mult 1.0)."""
+        """Returns symbol (e.g. 'BTC-USDT', '1000PEPE-USDT') -> (canonical_coin 'BTC', mult 1.0 or 1000.0)."""
         url = f"{self.BASE_URL}/v2/quote/contracts"
         out: Dict[str, Tuple[str, float]] = {}
         try:
@@ -11695,8 +14872,8 @@ class BingXRestClient:
                     sym = item.get("symbol", "").upper()
                     if not sym.endswith("-USDT"):
                         continue
-                    base_coin = normalize_symbol(item.get("asset", "") or sym)
-                    out[sym] = (base_coin, 1.0)
+                    base_coin, mult = parse_symbol_and_mult(item.get("asset", "") or sym)
+                    out[sym] = (base_coin, mult)
         except Exception as e:
             log.error(f"[bingx_rest] Failed to fetch contracts: {e}")
         return out
@@ -11747,22 +14924,32 @@ class BingXStream(BaseCEXStream):
 
     def __init__(
         self,
-        symbols: List[str],
+        symbols: List[str] | Dict[str, Any],
         callback: Callable[[OrderBookDepth5], None],
         stream_name: Optional[str] = None,
+        contract_sizes: Optional[Dict[str, float]] = None,
     ):
-        super().__init__("bingx", symbols, callback, stream_name=stream_name)
+        super().__init__("bingx", symbols, callback, stream_name=stream_name, contract_sizes=contract_sizes)
+
+    def _to_raw_symbol(self, s: str) -> str:
+        s_u = s.upper()
+        if s_u.endswith("-USDT"):
+            return s_u
+        for raw, (coin, _) in self._sym_map.items():
+            if coin.upper() == s_u:
+                return raw
+        return f"{s_u}-USDT"
 
     async def _send_client_ping(self, ws: Any) -> None:
         await ws.send("ping")
 
     async def _send_subscriptions(self, ws: Any) -> None:
         for s in self.symbols:
-            coin = self._base_coin(s)
+            raw_sym = self._to_raw_symbol(s)
             sub = {
-                "id": f"sub_{coin}",
+                "id": f"sub_{raw_sym}",
                 "reqType": "sub",
-                "dataType": f"{coin}-USDT@depth20",
+                "dataType": f"{raw_sym}@depth20",
             }
             await ws.send(json.dumps(sub))
             await asyncio.sleep(0.02)
@@ -11775,11 +14962,12 @@ class BingXStream(BaseCEXStream):
             datatype = data.get("dataType", "")
             if "@depth" not in datatype:
                 return
-            sym_raw = datatype.split("@")[0]
-            sym = self._base_coin(sym_raw)
+            sym_raw = datatype.split("@")[0].upper()
+            sym, mult = self._resolve_coin_and_mult(sym_raw)
+            contract_size = self._get_contract_size(sym_raw)
             b_data = data.get("data", {})
-            bids = self._extract_levels(b_data.get("bids"), 5)
-            asks = self._extract_levels(b_data.get("asks"), 5)
+            bids = self._extract_levels(b_data.get("bids"), 5, mult=mult, contract_size=contract_size)
+            asks = self._extract_levels(b_data.get("asks"), 5, mult=mult, contract_size=contract_size)
             if sym and bids and asks:
                 self._note_symbol(sym)
                 self.callback(OrderBookDepth5(
@@ -11793,7 +14981,6 @@ class BingXStream(BaseCEXStream):
                 ))
         except Exception:
             pass
-
 ```
 
 ## venues/bybit.py
@@ -12089,7 +15276,6 @@ class BybitPerpStream(BaseVenueStream):
             except asyncio.CancelledError:
                 pass
         self.connected = False
-
 ```
 
 ## venues/gateio.py
@@ -12107,7 +15293,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
 from models import OrderBookDepth5
-from venues.base import BaseCEXStream, create_http_session, normalize_symbol, log
+from venues.base import BaseCEXStream, create_http_session, normalize_symbol, parse_symbol_and_mult, log
 
 
 class GateioRestClient:
@@ -12116,25 +15302,44 @@ class GateioRestClient:
     BASE_URL = "https://fx-api.gateio.ws/api/v4/futures/usdt"
 
     def __init__(self, session: Optional[requests.Session] = None):
-        self.session = session or create_http_session()
+        # Always use dedicated session so popping User-Agent does not mutate other venues' sessions
+        self.session = create_http_session()
         # Gate.io API WAF rejects fake browser User-Agents with 403; default requests UA works
         self.session.headers.pop("User-Agent", None)
 
     def fetch_linear_perpetuals(self) -> Dict[str, Tuple[str, float]]:
-        """Returns contract (e.g. 'BTC_USDT') -> (canonical_coin 'BTC', mult 1.0)."""
+        """Returns contract (e.g. 'BTC_USDT', '1000BONK_USDT') -> (canonical_coin 'BTC', mult 1.0 or 1000.0)."""
         url = f"{self.BASE_URL}/contracts"
         out: Dict[str, Tuple[str, float]] = {}
         try:
             r = self.session.get(url, timeout=15)
             if r.status_code == 200:
                 for item in r.json():
-                    contract = item.get("name", "")
+                    contract = item.get("name", "").upper()
                     if not contract.endswith("_USDT"):
                         continue
-                    base_coin = normalize_symbol(contract)
-                    out[contract] = (base_coin, 1.0)
+                    base_coin, mult = parse_symbol_and_mult(contract)
+                    quanto = float(item.get("quanto_multiplier", 1.0) or 1.0)
+                    out[contract] = (base_coin, mult, quanto)
         except Exception as e:
             log.error(f"[gateio_rest] Failed to fetch contracts: {e}")
+        return out
+
+    def fetch_contract_sizes(self) -> Dict[str, float]:
+        """Returns contract (e.g. 'BTC_USDT') -> quanto_multiplier (e.g. 0.0001)."""
+        url = f"{self.BASE_URL}/contracts"
+        out: Dict[str, float] = {}
+        try:
+            r = self.session.get(url, timeout=15)
+            if r.status_code == 200:
+                for item in r.json():
+                    contract = item.get("name", "").upper()
+                    if not contract.endswith("_USDT"):
+                        continue
+                    quanto = float(item.get("quanto_multiplier", 1.0) or 1.0)
+                    out[contract] = quanto
+        except Exception as e:
+            log.error(f"[gateio_rest] Failed to fetch contract sizes: {e}")
         return out
 
     def fetch_tickers_24h(self) -> Dict[str, Dict[str, Any]]:
@@ -12186,17 +15391,35 @@ class GateioStream(BaseCEXStream):
         symbols,
         callback: Callable[[OrderBookDepth5], None],
         stream_name: Optional[str] = None,
+        contract_sizes: Optional[Dict[str, float]] = None,
     ):
-        super().__init__("gateio", symbols, callback, stream_name=stream_name)
+        super().__init__("gateio", symbols, callback, stream_name=stream_name, contract_sizes=contract_sizes)
         self._books: Dict[str, Dict[str, Dict[float, float]]] = {}
+
+    def _to_raw_symbol(self, s: str) -> str:
+        s_u = s.upper()
+        if s_u.endswith("_USDT"):
+            return s_u
+        for raw, (coin, _) in self._sym_map.items():
+            if coin.upper() == s_u:
+                return raw
+        return f"{s_u}_USDT"
 
     async def _send_client_ping(self, ws: Any) -> None:
         await ws.send(json.dumps({"time": int(time.time()), "channel": "futures.ping"}))
 
     async def _send_subscriptions(self, ws: Any) -> None:
         self._books.clear()
+        if not self._contract_sizes:
+            try:
+                sizes = await asyncio.to_thread(GateioRestClient().fetch_contract_sizes)
+                if sizes:
+                    self._contract_sizes.update(sizes)
+            except Exception as e:
+                log.warning(f"[gateio] Failed to auto-fetch contract sizes: {e}")
+
         for s in self.symbols:
-            pair = s if s.endswith("_USDT") else f"{self._base_coin(s)}_USDT"
+            pair = self._to_raw_symbol(s)
             sub = {
                 "time": int(time.time()),
                 "channel": "futures.order_book_update",
@@ -12219,6 +15442,7 @@ class GateioStream(BaseCEXStream):
             if not contract:
                 return
             sym, mult = self._resolve_coin_and_mult(contract)
+            contract_size = self._get_contract_size(contract)
 
             event = data.get("event")
             if contract not in self._books or event == "all":
@@ -12229,14 +15453,16 @@ class GateioStream(BaseCEXStream):
             asks_dict = book["asks"]
 
             for row in result.get("b", []):
-                p, q = float(row.get("p", 0.0)), float(row.get("s", 0.0))
+                p, s = float(row.get("p", 0.0)), float(row.get("s", 0.0))
+                q = s * contract_size
                 if q <= 0.0 or p <= 0.0:
                     bids_dict.pop(p, None)
                 else:
                     bids_dict[p] = q
 
             for row in result.get("a", []):
-                p, q = float(row.get("p", 0.0)), float(row.get("s", 0.0))
+                p, s = float(row.get("p", 0.0)), float(row.get("s", 0.0))
+                q = s * contract_size
                 if q <= 0.0 or p <= 0.0:
                     asks_dict.pop(p, None)
                 else:
@@ -12263,7 +15489,7 @@ class GateioStream(BaseCEXStream):
                 top_asks = sorted_asks_raw[:5]
 
             if top_bids and top_asks:
-                ets = int(result.get("t", 0) or data.get("time", 0) * 1000)
+                ets = int(result.get("t") or data.get("time_ms") or ((data.get("time") or time.time()) * 1000))
                 self.callback(OrderBookDepth5(
                     exchange="gateio",
                     symbol=sym,
@@ -12275,7 +15501,6 @@ class GateioStream(BaseCEXStream):
                 ))
         except Exception as e:
             log.debug(f"[gateio] parse error: {e}")
-
 ```
 
 ## venues/htx.py
@@ -12316,9 +15541,27 @@ class HTXRestClient:
                     if not code.endswith("-USDT"):
                         continue
                     base_coin = normalize_symbol(item.get("symbol", "") or code)
-                    out[code] = (base_coin, 1.0)
+                    cs = float(item.get("contract_size", 1.0) or 1.0)
+                    out[code] = (base_coin, 1.0, cs)
         except Exception as e:
             log.error(f"[htx_rest] Failed to fetch contract info: {e}")
+        return out
+
+    def fetch_contract_sizes(self) -> Dict[str, float]:
+        """Returns contract_code (e.g. 'BTC-USDT') -> contract_size (float)."""
+        url = f"{self.BASE_URL}/linear-swap-api/v1/swap_contract_info"
+        out: Dict[str, float] = {}
+        try:
+            r = self.session.get(url, timeout=8)
+            if r.status_code == 200:
+                for item in r.json().get("data", []):
+                    code = item.get("contract_code", "").upper()
+                    if not code.endswith("-USDT"):
+                        continue
+                    cs = float(item.get("contract_size", 1.0) or 1.0)
+                    out[code] = cs
+        except Exception as e:
+            log.error(f"[htx_rest] Failed to fetch contract sizes: {e}")
         return out
 
     def fetch_tickers_24h(self) -> Dict[str, Dict[str, Any]]:
@@ -12367,11 +15610,12 @@ class HTXStream(BaseCEXStream):
 
     def __init__(
         self,
-        symbols: List[str],
+        symbols: List[str] | Dict[str, Any],
         callback: Callable[[OrderBookDepth5], None],
         stream_name: Optional[str] = None,
+        contract_sizes: Optional[Dict[str, float]] = None,
     ):
-        super().__init__("htx", symbols, callback, stream_name=stream_name)
+        super().__init__("htx", symbols, callback, stream_name=stream_name, contract_sizes=contract_sizes)
 
     async def _handle_server_ping(self, ws: Any, raw_msg: str) -> bool:
         try:
@@ -12384,9 +15628,16 @@ class HTXStream(BaseCEXStream):
         return False
 
     async def _send_subscriptions(self, ws: Any) -> None:
+        if not self._contract_sizes:
+            try:
+                sizes = await asyncio.to_thread(HTXRestClient().fetch_contract_sizes)
+                if sizes:
+                    self._contract_sizes.update(sizes)
+            except Exception as e:
+                log.warning(f"[htx] Failed to auto-fetch contract sizes: {e}")
+
         for s in self.symbols:
-            coin = self._base_coin(s)
-            code = f"{coin}-USDT"
+            code = s if "-" in s else f"{self._base_coin(s)}-USDT"
             sub = {
                 "sub": f"market.{code}.depth.step0",
                 "id": f"sub_{code}",
@@ -12402,11 +15653,12 @@ class HTXStream(BaseCEXStream):
             ch = data.get("ch", "")
             if not ch.startswith("market.") or ".depth." not in ch:
                 return
-            code = ch.split(".")[1]
-            sym = self._base_coin(code)
+            code = ch.split(".")[1].upper()
+            sym, mult = self._resolve_coin_and_mult(code)
+            contract_size = self._get_contract_size(code)
             tick = data.get("tick", {})
-            bids = self._extract_levels(tick.get("bids"), 5)
-            asks = self._extract_levels(tick.get("asks"), 5)
+            bids = self._extract_levels(tick.get("bids"), 5, mult=mult, contract_size=contract_size)
+            asks = self._extract_levels(tick.get("asks"), 5, mult=mult, contract_size=contract_size)
             if bids and asks:
                 self._note_symbol(sym)
                 ets = int(data.get("ts", 0) or tick.get("ts", 0))
@@ -12421,7 +15673,6 @@ class HTXStream(BaseCEXStream):
                 ))
         except Exception:
             pass
-
 ```
 
 ## venues/kucoin.py
@@ -12467,9 +15718,28 @@ class KucoinRestClient:
                     if base == "XBT":
                         base = "BTC"
                     base_coin = normalize_symbol(base)
-                    out[sym] = (base_coin, 1.0)
+                    c_size = float(item.get("multiplier", 1.0) or 1.0)
+                    out[sym] = (base_coin, 1.0, c_size)
         except Exception as e:
             log.error(f"[kucoin_rest] Failed to fetch contracts: {e}")
+        return out
+
+    def fetch_contract_sizes(self) -> Dict[str, float]:
+        """Returns symbol (e.g. 'XBTUSDTM') -> multiplier (e.g. 0.001)."""
+        url = f"{self.BASE_URL}/contracts/active"
+        out: Dict[str, float] = {}
+        try:
+            r = self.session.get(url, timeout=8)
+            if r.status_code == 200:
+                for item in r.json().get("data", []):
+                    settle = item.get("settleCurrency", "").upper()
+                    if settle != "USDT":
+                        continue
+                    sym = item.get("symbol", "").upper()
+                    mult = float(item.get("multiplier", 1.0) or 1.0)
+                    out[sym] = mult
+        except Exception as e:
+            log.error(f"[kucoin_rest] Failed to fetch contract sizes: {e}")
         return out
 
     def fetch_tickers_24h(self) -> Dict[str, Dict[str, Any]]:
@@ -12519,10 +15789,18 @@ class KucoinStream(BaseVenueStream):
     TOPIC = "/contractMarket/level2Depth5:{sym}"
     PING_FALLBACK_SEC = 15.0
 
-    def __init__(self, symbols: List[str], callback: Callable[[OrderBookDepth5], None]):
-        super().__init__("kucoin", symbols, callback)
+    def __init__(
+        self,
+        symbols: List[str] | Dict[str, Any],
+        callback: Callable[[OrderBookDepth5], None],
+        contract_sizes: Optional[Dict[str, float]] = None,
+    ):
+        sym_list = list(symbols.keys()) if isinstance(symbols, dict) else list(symbols)
+        super().__init__("kucoin", sym_list, callback)
         self.subscribed = list(self.symbols)
         self._ours_to_venue: Dict[str, str] = {}
+        self._venue_to_ours: Dict[str, str] = {}
+        self._contract_sizes: Dict[str, float] = {k.upper(): float(v) for k, v in (contract_sizes or {}).items()}
         self._ping_sec = self.PING_FALLBACK_SEC
 
     def _resolve_symbols(self) -> Dict[str, str]:
@@ -12532,6 +15810,8 @@ class KucoinStream(BaseVenueStream):
             if r.status_code == 200:
                 for c in r.json().get("data", []):
                     sym = c.get("symbol", "").upper()
+                    mult = float(c.get("multiplier", 1.0) or 1.0)
+                    self._contract_sizes[sym] = mult
                     base = c.get("baseCurrency", "").upper()
                     if base == "XBT":
                         base = "BTC"
@@ -12539,6 +15819,7 @@ class KucoinStream(BaseVenueStream):
                     for s in self.symbols:
                         if normalize_symbol(s) == base_norm:
                             self._ours_to_venue[s] = sym
+                            self._venue_to_ours[sym] = normalize_symbol(s)
         except Exception as e:
             log.warning(f"[kucoin] Failed to resolve contract symbols: {e}")
         return self._ours_to_venue
@@ -12632,13 +15913,15 @@ class KucoinStream(BaseVenueStream):
             topic = data.get("topic", "")
             if not topic.startswith("/contractMarket/level2Depth5:"):
                 return
-            sym_raw = topic.split(":", 1)[1]
-            sym = normalize_symbol(sym_raw.replace("XBT", "BTC"))
+            sym_raw = topic.split(":", 1)[1].upper()
+            clean_raw = sym_raw[:-1] if sym_raw.endswith("M") else sym_raw
+            sym = self._venue_to_ours.get(sym_raw) or normalize_symbol(clean_raw.replace("XBT", "BTC"))
+            contract_size = self._contract_sizes.get(sym_raw, 1.0)
             payload = data.get("data", {})
             bids_raw = payload.get("bids", [])[:5]
             asks_raw = payload.get("asks", [])[:5]
-            bids = [(float(p), float(q)) for p, q in bids_raw if float(p) > 0 and float(q) > 0]
-            asks = [(float(p), float(q)) for p, q in asks_raw if float(p) > 0 and float(q) > 0]
+            bids = [(float(p), float(q) * contract_size) for p, q in bids_raw if float(p) > 0 and float(q) > 0]
+            asks = [(float(p), float(q) * contract_size) for p, q in asks_raw if float(p) > 0 and float(q) > 0]
             if bids and asks:
                 self._note_symbol(sym)
                 ets = int(data.get("data", {}).get("timestamp", 0) or time.time() * 1000)
@@ -12653,7 +15936,6 @@ class KucoinStream(BaseVenueStream):
                 ))
         except Exception:
             pass
-
 ```
 
 ## venues/manager.py
@@ -12733,7 +16015,10 @@ class StreamManager:
 
             v_sym_map = raw_doc.get(f"{v_name}_sym_map", {})
             if v_sym_map:
-                norm_map = {k: (v[0], float(v[1])) for k, v in v_sym_map.items()}
+                norm_map = {
+                    k: (v[0], float(v[1]), float(v[2])) if len(v) >= 3 else (v[0], float(v[1]))
+                    for k, v in v_sym_map.items()
+                }
                 try:
                     self.streams[v_name] = cls(norm_map, callback)
                     log.info(f"[stream_manager] Registered follower feed for {v_name.upper()} ({len(norm_map)} contracts)")
@@ -12789,7 +16074,6 @@ class StreamManager:
                 info["usdt_krw_rate"] = round(s.usdt_krw_rate, 2) if s.rate_ready else 0.0
             status[name] = info
         return status
-
 ```
 
 ## venues/mexc.py
@@ -12830,9 +16114,27 @@ class MEXCRestClient:
                     if not sym.endswith("_USDT") and not sym.endswith("USDT"):
                         continue
                     base_coin = normalize_symbol(item.get("baseCoin", "") or sym)
-                    out[sym] = (base_coin, 1.0)
+                    cs = float(item.get("contractSize", 1.0) or 1.0)
+                    out[sym] = (base_coin, 1.0, cs)
         except Exception as e:
             log.error(f"[mexc_rest] Failed to fetch contract details: {e}")
+        return out
+
+    def fetch_contract_sizes(self) -> Dict[str, float]:
+        """Returns symbol (e.g. 'BTC_USDT') -> contractSize (float)."""
+        url = f"{self.BASE_URL}/detail"
+        out: Dict[str, float] = {}
+        try:
+            r = self.session.get(url, timeout=8)
+            if r.status_code == 200:
+                for item in r.json().get("data", []):
+                    sym = item.get("symbol", "").upper()
+                    if not sym.endswith("_USDT") and not sym.endswith("USDT"):
+                        continue
+                    cs = float(item.get("contractSize", 1.0) or 1.0)
+                    out[sym] = cs
+        except Exception as e:
+            log.error(f"[mexc_rest] Failed to fetch contract sizes: {e}")
         return out
 
     def fetch_tickers_24h(self) -> Dict[str, Dict[str, Any]]:
@@ -12886,18 +16188,27 @@ class MEXCStream(BaseCEXStream):
 
     def __init__(
         self,
-        symbols: List[str],
+        symbols: List[str] | Dict[str, Any],
         callback: Callable[[OrderBookDepth5], None],
         stream_name: Optional[str] = None,
+        contract_sizes: Optional[Dict[str, float]] = None,
     ):
-        super().__init__("mexc", symbols, callback, stream_name=stream_name)
+        super().__init__("mexc", symbols, callback, stream_name=stream_name, contract_sizes=contract_sizes)
 
     async def _send_client_ping(self, ws: Any) -> None:
         await ws.send('"Ping"')
 
     async def _send_subscriptions(self, ws: Any) -> None:
+        if not self._contract_sizes:
+            try:
+                sizes = await asyncio.to_thread(MEXCRestClient().fetch_contract_sizes)
+                if sizes:
+                    self._contract_sizes.update(sizes)
+            except Exception as e:
+                log.warning(f"[mexc] Failed to auto-fetch contract sizes: {e}")
+
         for s in self.symbols:
-            pair = f"{self._base_coin(s)}_USDT"
+            pair = s if "_" in s else f"{self._base_coin(s)}_USDT"
             sub = {
                 "method": "sub.depth.full",
                 "param": {"symbol": pair, "limit": 20},
@@ -12914,12 +16225,13 @@ class MEXCStream(BaseCEXStream):
             if "depth" not in channel:
                 return
             d = data.get("data", {})
-            raw_sym = data.get("symbol", "")
+            raw_sym = (data.get("symbol", "") or "").upper()
             if not raw_sym:
                 return
-            sym = self._base_coin(raw_sym)
-            bids = self._extract_levels(d.get("bids"), 5)
-            asks = self._extract_levels(d.get("asks"), 5)
+            sym, mult = self._resolve_coin_and_mult(raw_sym)
+            contract_size = self._get_contract_size(raw_sym)
+            bids = self._extract_levels(d.get("bids"), 5, mult=mult, contract_size=contract_size)
+            asks = self._extract_levels(d.get("asks"), 5, mult=mult, contract_size=contract_size)
             if bids and asks:
                 self._note_symbol(sym)
                 ets = int(d.get("cts", 0) or data.get("ts", 0))
@@ -12934,7 +16246,6 @@ class MEXCStream(BaseCEXStream):
                 ))
         except Exception:
             pass
-
 ```
 
 ## venues/okx.py
@@ -12976,9 +16287,28 @@ class OKXRestClient:
                         continue
                     inst_id = item.get("instId", "").upper()
                     base_coin = normalize_symbol(item.get("ctValCcy", "") or inst_id)
-                    out[inst_id] = (base_coin, 1.0)
+                    ct_val = float(item.get("ctVal", 1.0) or 1.0)
+                    out[inst_id] = (base_coin, 1.0, ct_val)
         except Exception as e:
             log.error(f"[okx_rest] Failed to fetch instruments: {e}")
+        return out
+
+    def fetch_contract_sizes(self) -> Dict[str, float]:
+        """Returns instId (e.g. 'BTC-USDT-SWAP') -> ctVal (e.g. 0.01)."""
+        url = f"{self.BASE_URL}/public/instruments?instType=SWAP"
+        out: Dict[str, float] = {}
+        try:
+            r = self.session.get(url, timeout=8)
+            if r.status_code == 200:
+                for item in r.json().get("data", []):
+                    settle = item.get("settleCcy", "").upper()
+                    if settle != "USDT":
+                        continue
+                    inst_id = item.get("instId", "").upper()
+                    ct_val = float(item.get("ctVal", 1.0) or 1.0)
+                    out[inst_id] = ct_val
+        except Exception as e:
+            log.error(f"[okx_rest] Failed to fetch contract sizes: {e}")
         return out
 
     def fetch_tickers_24h(self) -> Dict[str, Dict[str, Any]]:
@@ -13027,19 +16357,28 @@ class OKXStream(BaseCEXStream):
 
     def __init__(
         self,
-        symbols: List[str],
+        symbols: List[str] | Dict[str, Any],
         callback: Callable[[OrderBookDepth5], None],
         stream_name: Optional[str] = None,
+        contract_sizes: Optional[Dict[str, float]] = None,
     ):
-        super().__init__("okx", symbols, callback, stream_name=stream_name)
+        super().__init__("okx", symbols, callback, stream_name=stream_name, contract_sizes=contract_sizes)
 
     async def _send_client_ping(self, ws: Any) -> None:
         await ws.send("ping")
 
     async def _send_subscriptions(self, ws: Any) -> None:
+        if not self._contract_sizes:
+            try:
+                sizes = await asyncio.to_thread(OKXRestClient().fetch_contract_sizes)
+                if sizes:
+                    self._contract_sizes.update(sizes)
+            except Exception as e:
+                log.warning(f"[okx] Failed to auto-fetch contract sizes: {e}")
+
         for i in range(0, len(self.symbols), 50):
             args = [
-                {"channel": "books5", "instId": f"{self._base_coin(s)}-USDT-SWAP"}
+                {"channel": "books5", "instId": s if "-SWAP" in s else f"{self._base_coin(s)}-USDT-SWAP"}
                 for s in self.symbols[i : i + 50]
             ]
             await ws.send(json.dumps({"op": "subscribe", "args": args}))
@@ -13055,12 +16394,13 @@ class OKXStream(BaseCEXStream):
                 return
             raw_data = data.get("data")
             book_data = raw_data[0] if isinstance(raw_data, list) and raw_data else (raw_data if isinstance(raw_data, dict) else {})
-            inst_id = arg.get("instId", "")
+            inst_id = arg.get("instId", "").upper()
             if not inst_id:
                 return
-            sym = self._base_coin(inst_id)
-            bids = self._extract_levels(book_data.get("bids") or book_data.get("b"), 5)
-            asks = self._extract_levels(book_data.get("asks") or book_data.get("a"), 5)
+            sym, mult = self._resolve_coin_and_mult(inst_id)
+            contract_size = self._get_contract_size(inst_id)
+            bids = self._extract_levels(book_data.get("bids") or book_data.get("b"), 5, mult=mult, contract_size=contract_size)
+            asks = self._extract_levels(book_data.get("asks") or book_data.get("a"), 5, mult=mult, contract_size=contract_size)
             if bids and asks:
                 self._note_symbol(sym)
                 ets = int(book_data.get("ts", 0) or data.get("ts", 0))
@@ -13075,7 +16415,6 @@ class OKXStream(BaseCEXStream):
                 ))
         except Exception:
             pass
-
 ```
 
 ## venues/pionex.py
@@ -13093,7 +16432,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
 from models import OrderBookDepth5
-from venues.base import BaseCEXStream, create_http_session, normalize_symbol, log
+from venues.base import BaseCEXStream, create_http_session, normalize_symbol, parse_symbol_and_mult, log
 
 
 class PionexRestClient:
@@ -13105,7 +16444,7 @@ class PionexRestClient:
         self.session = session or create_http_session()
 
     def fetch_linear_perpetuals(self) -> Dict[str, Tuple[str, float]]:
-        """Returns symbol (e.g. 'BTC_USDT_PERP') -> (canonical_coin 'BTC', mult 1.0)."""
+        """Returns symbol (e.g. 'BTC_USDT_PERP', '1000PEPE_USDT_PERP') -> (canonical_coin 'BTC', mult 1.0 or 1000.0)."""
         url = f"{self.BASE_URL}/common/symbols?type=PERP"
         out: Dict[str, Tuple[str, float]] = {}
         try:
@@ -13115,8 +16454,8 @@ class PionexRestClient:
                     sym = s.get("symbol", "").upper()
                     if not sym.endswith("_PERP") or "USDT" not in sym:
                         continue
-                    base_coin = normalize_symbol(s.get("baseCoin", "") or sym)
-                    out[sym] = (base_coin, 1.0)
+                    base_coin, mult = parse_symbol_and_mult(s.get("baseCoin", "") or sym)
+                    out[sym] = (base_coin, mult)
         except Exception as e:
             log.error(f"[pionex_rest] Failed to fetch symbols: {e}")
         return out
@@ -13168,11 +16507,21 @@ class PionexStream(BaseCEXStream):
 
     def __init__(
         self,
-        symbols: List[str],
+        symbols: List[str] | Dict[str, Any],
         callback: Callable[[OrderBookDepth5], None],
         stream_name: Optional[str] = None,
+        contract_sizes: Optional[Dict[str, float]] = None,
     ):
-        super().__init__("pionex", symbols, callback, stream_name=stream_name)
+        super().__init__("pionex", symbols, callback, stream_name=stream_name, contract_sizes=contract_sizes)
+
+    def _to_raw_symbol(self, s: str) -> str:
+        s_u = s.upper()
+        if s_u.endswith("_PERP"):
+            return s_u
+        for raw, (coin, _) in self._sym_map.items():
+            if coin.upper() == s_u:
+                return raw
+        return f"{s_u}_USDT_PERP"
 
     async def _send_client_ping(self, ws: Any) -> None:
         now_ms = int(time.time() * 1000)
@@ -13190,8 +16539,7 @@ class PionexStream(BaseCEXStream):
 
     async def _send_subscriptions(self, ws: Any) -> None:
         for s in self.symbols:
-            coin = self._base_coin(s)
-            sym = f"{coin}_USDT_PERP"
+            sym = self._to_raw_symbol(s)
             sub = {
                 "op": "SUBSCRIBE",
                 "topic": "DEPTH",
@@ -13210,12 +16558,13 @@ class PionexStream(BaseCEXStream):
             if topic != "DEPTH":
                 return
             d = data.get("data", {})
-            raw_sym = data.get("symbol", "")
+            raw_sym = (data.get("symbol", "") or "").upper()
             if not raw_sym:
                 return
-            sym = self._base_coin(raw_sym)
-            bids = self._extract_levels(d.get("bids"), 5)
-            asks = self._extract_levels(d.get("asks"), 5)
+            sym, mult = self._resolve_coin_and_mult(raw_sym)
+            contract_size = self._get_contract_size(raw_sym)
+            bids = self._extract_levels(d.get("bids"), 5, mult=mult, contract_size=contract_size)
+            asks = self._extract_levels(d.get("asks"), 5, mult=mult, contract_size=contract_size)
             if bids and asks:
                 self._note_symbol(sym)
                 ets = int(data.get("timestamp", 0) or time.time() * 1000)
@@ -13230,7 +16579,6 @@ class PionexStream(BaseCEXStream):
                 ))
         except Exception:
             pass
-
 ```
 
 ## venues/upbit.py
@@ -13348,11 +16696,11 @@ class UpbitRestClient:
     def fetch_klines_1m(
         self,
         market: str,
-        count: int = 1440,
+        count: int = 200,
     ) -> Dict[int, Tuple[float, float]]:
         """
-        Fetches up to `count` 1-minute candles (default 1440 = 24h).
-        Paginates Upbit /v1/candles/minutes/1 in chunks of 200 candles using 'to' parameter.
+        Fetches up to `count` 1-minute candles (default 200 = ~3.3h).
+        Paginates Upbit /v1/candles/minutes/1 in chunks of 200 candles using 'to' parameter if count > 200.
         Returns dict: minute_ts_sec -> (close_krw, volume_krw).
         """
         out: Dict[int, Tuple[float, float]] = {}
@@ -13617,7 +16965,6 @@ class UpbitSpotStream(BaseVenueStream):
             except asyncio.CancelledError:
                 pass
         self.connected = False
-
 ```
 
 ## web/__init__.py
@@ -13630,7 +16977,6 @@ from web.server import APIServer
 from web.reports_manager import list_available_reports, get_report_content
 
 __all__ = ["APIServer", "list_available_reports", "get_report_content"]
-
 ```
 
 ## web/reports_manager.py
@@ -13751,7 +17097,6 @@ def get_report_content(report_id: str) -> Optional[str]:
         except Exception:
             return None
     return None
-
 ```
 
 ## web/server.py
@@ -14124,7 +17469,6 @@ class APIServer:
             self._server.shutdown()
             self._server.server_close()
         log.info("[api_server] Web API Server stopped cleanly.")
-
 ```
 
 ## web/views.py
@@ -14840,6 +18184,4 @@ def _render_battle_tags(pool_snapshot: Dict[str, Any]) -> str:
         </div>
         """)
     return "".join(tags)
-
 ```
-

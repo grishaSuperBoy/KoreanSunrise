@@ -83,7 +83,7 @@ class PairState:
         # slow down baseline adaptation by 20x so the baseline doesn't chase the pump.
         cur_sig = self.sigma(now)
         is_spike = self.is_warmed_up and abs(deviation) > (self.spike_sigma * cur_sig)
-        eff_tau = BASELINE_TAU * 20.0 if is_spike else BASELINE_TAU
+        eff_tau = 10.0 if not self.is_warmed_up else (BASELINE_TAU * 20.0 if is_spike else BASELINE_TAU)
 
         a = 1.0 - math.exp(-dt / eff_tau) if eff_tau > 0 else 0.001
         self.baseline_bps += a * deviation
@@ -203,7 +203,22 @@ class KoreanEngine:
     def maybe_reload_thresholds(self, now: float) -> None:
         if now - self._last_thresh_check >= 30.0:
             self._last_thresh_check = now
-            self.reload_thresholds()
+            try:
+                self.reload_thresholds()
+            except Exception as e:
+                log.warning(f"[engine] Error reloading thresholds: {e}")
+
+            if self.pool_state is not None and hasattr(self.pool_state, "reload"):
+                try:
+                    self.pool_state.reload()
+                except Exception as e:
+                    log.warning(f"[engine] Error reloading pool_state: {e}")
+
+            if self.profile_manager is not None and hasattr(self.profile_manager, "reload"):
+                try:
+                    self.profile_manager.reload()
+                except Exception as e:
+                    log.warning(f"[engine] Error reloading profile_manager: {e}")
 
     def get_pair_threshold_config(self, coin: str, follower_ex: str) -> Dict[str, Any]:
         pk = f"{coin.upper()}:upbit-{follower_ex.lower()}"
@@ -222,6 +237,7 @@ class KoreanEngine:
 
     def on_book_update(self, snap: OrderBookDepth5) -> None:
         now = time.time()
+        self.maybe_reload_thresholds(now)
         ex = snap.exchange.lower()
         coin = snap.symbol.upper()
         key = (ex, coin)
@@ -242,7 +258,8 @@ class KoreanEngine:
                 st = self._get_or_create_pair_state(coin, ex)
                 if upbit_snap.mid_price > 0 and snap.mid_price > 0:
                     raw_diff_bps = (upbit_snap.mid_price - snap.mid_price) / snap.mid_price * 1e4
-                    st.learn(raw_diff_bps, now)
+                    if st.open_signal is None:
+                        st.learn(raw_diff_bps, now)
 
             self._track_follower_move(coin, ex, snap, now)
 
@@ -367,7 +384,8 @@ class KoreanEngine:
                     now=now,
                 )
 
-            st.learn(raw_diff_bps, now)
+            if st.open_signal is None:
+                st.learn(raw_diff_bps, now)
 
     def _check_entry(
         self,
@@ -571,10 +589,10 @@ class KoreanEngine:
 
             # Closure evaluation:
             hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
-            if f_mid_move >= (sig.net_exec_edge_bps * 0.8):
+            if f_exec_move >= (sig.net_exec_edge_bps * 0.8):
                 self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
             elif rem_edge <= 0.0:
-                if f_mid_move >= (sig.net_exec_edge_bps * 0.35) and f_mid_move > 0:
+                if cur_net_pnl > 0.0:
                     self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
                 else:
                     self._close_signal(sig, now, "reversed", f_mid_move, f_exec_move)
@@ -608,11 +626,14 @@ class KoreanEngine:
 
         pair_key = (sig.coin, sig.follower_exchange)
         st = self._pairs.get(pair_key)
-        if st and st.open_signal == sig:
+        if st and st.open_signal is not None and getattr(st.open_signal, "id", None) == sig.id:
             st.open_signal = None
 
-        if sig.coin in self._active_signals and sig in self._active_signals[sig.coin]:
-            self._active_signals[sig.coin].remove(sig)
+        if sig.coin in self._active_signals:
+            if sig in self._active_signals[sig.coin]:
+                self._active_signals[sig.coin].remove(sig)
+            if not self._active_signals[sig.coin]:
+                self._active_signals.pop(sig.coin, None)
 
     def sweep_timeouts(self, now: float) -> None:
         """

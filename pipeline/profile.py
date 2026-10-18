@@ -90,15 +90,29 @@ class TradingProfileManager:
         self.profile_file = profile_file
         self._lock = threading.RLock()
         self._profile: Dict[str, Any] = {}
-        self.reload()
+        self._file_mtime: float = 0.0
+        self.reload(force=True)
 
-    def reload(self) -> None:
+    def reload(self, force: bool = False) -> None:
         with self._lock:
+            if os.path.exists(self.profile_file):
+                try:
+                    mtime = os.path.getmtime(self.profile_file)
+                    if not force and mtime == self._file_mtime:
+                        return
+                    self._file_mtime = mtime
+                except OSError:
+                    pass
             data = _read_json(self.profile_file)
             if not data:
                 log.info(f"[profile] Initializing default trading profile at {self.profile_file}")
                 data = json.loads(json.dumps(DEFAULT_PROFILE))
                 _write_json_atomic(self.profile_file, data)
+                if os.path.exists(self.profile_file):
+                    try:
+                        self._file_mtime = os.path.getmtime(self.profile_file)
+                    except OSError:
+                        pass
             self._profile = data
 
     def get_profile(self) -> Dict[str, Any]:
@@ -116,6 +130,11 @@ class TradingProfileManager:
 
             _merge(self._profile, updates)
             _write_json_atomic(self.profile_file, self._profile)
+            if os.path.exists(self.profile_file):
+                try:
+                    self._file_mtime = os.path.getmtime(self.profile_file)
+                except OSError:
+                    pass
             return self.get_profile()
 
     def set_venue_capital(self, venue: str, capital_usd: float) -> None:
@@ -124,12 +143,22 @@ class TradingProfileManager:
             caps = self._profile.setdefault("capital", {}).setdefault("per_venue_usd", {})
             caps[venue] = max(0.0, float(capital_usd))
             _write_json_atomic(self.profile_file, self._profile)
+            if os.path.exists(self.profile_file):
+                try:
+                    self._file_mtime = os.path.getmtime(self.profile_file)
+                except OSError:
+                    pass
             log.info(f"[profile] Updated capital for {venue}: ${capital_usd:.2f}")
 
     def set_max_slots(self, slots: int) -> None:
         with self._lock:
             self._profile["max_active_slots"] = max(1, int(slots))
             _write_json_atomic(self.profile_file, self._profile)
+            if os.path.exists(self.profile_file):
+                try:
+                    self._file_mtime = os.path.getmtime(self.profile_file)
+                except OSError:
+                    pass
             log.info(f"[profile] Updated max_active_slots: {slots}")
 
     def is_venue_active(self, venue: str) -> bool:

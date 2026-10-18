@@ -34,9 +34,28 @@ class OKXRestClient:
                         continue
                     inst_id = item.get("instId", "").upper()
                     base_coin = normalize_symbol(item.get("ctValCcy", "") or inst_id)
-                    out[inst_id] = (base_coin, 1.0)
+                    ct_val = float(item.get("ctVal", 1.0) or 1.0)
+                    out[inst_id] = (base_coin, 1.0, ct_val)
         except Exception as e:
             log.error(f"[okx_rest] Failed to fetch instruments: {e}")
+        return out
+
+    def fetch_contract_sizes(self) -> Dict[str, float]:
+        """Returns instId (e.g. 'BTC-USDT-SWAP') -> ctVal (e.g. 0.01)."""
+        url = f"{self.BASE_URL}/public/instruments?instType=SWAP"
+        out: Dict[str, float] = {}
+        try:
+            r = self.session.get(url, timeout=8)
+            if r.status_code == 200:
+                for item in r.json().get("data", []):
+                    settle = item.get("settleCcy", "").upper()
+                    if settle != "USDT":
+                        continue
+                    inst_id = item.get("instId", "").upper()
+                    ct_val = float(item.get("ctVal", 1.0) or 1.0)
+                    out[inst_id] = ct_val
+        except Exception as e:
+            log.error(f"[okx_rest] Failed to fetch contract sizes: {e}")
         return out
 
     def fetch_tickers_24h(self) -> Dict[str, Dict[str, Any]]:
@@ -85,19 +104,28 @@ class OKXStream(BaseCEXStream):
 
     def __init__(
         self,
-        symbols: List[str],
+        symbols: List[str] | Dict[str, Any],
         callback: Callable[[OrderBookDepth5], None],
         stream_name: Optional[str] = None,
+        contract_sizes: Optional[Dict[str, float]] = None,
     ):
-        super().__init__("okx", symbols, callback, stream_name=stream_name)
+        super().__init__("okx", symbols, callback, stream_name=stream_name, contract_sizes=contract_sizes)
 
     async def _send_client_ping(self, ws: Any) -> None:
         await ws.send("ping")
 
     async def _send_subscriptions(self, ws: Any) -> None:
+        if not self._contract_sizes:
+            try:
+                sizes = await asyncio.to_thread(OKXRestClient().fetch_contract_sizes)
+                if sizes:
+                    self._contract_sizes.update(sizes)
+            except Exception as e:
+                log.warning(f"[okx] Failed to auto-fetch contract sizes: {e}")
+
         for i in range(0, len(self.symbols), 50):
             args = [
-                {"channel": "books5", "instId": f"{self._base_coin(s)}-USDT-SWAP"}
+                {"channel": "books5", "instId": s if "-SWAP" in s else f"{self._base_coin(s)}-USDT-SWAP"}
                 for s in self.symbols[i : i + 50]
             ]
             await ws.send(json.dumps({"op": "subscribe", "args": args}))
@@ -113,12 +141,13 @@ class OKXStream(BaseCEXStream):
                 return
             raw_data = data.get("data")
             book_data = raw_data[0] if isinstance(raw_data, list) and raw_data else (raw_data if isinstance(raw_data, dict) else {})
-            inst_id = arg.get("instId", "")
+            inst_id = arg.get("instId", "").upper()
             if not inst_id:
                 return
-            sym = self._base_coin(inst_id)
-            bids = self._extract_levels(book_data.get("bids") or book_data.get("b"), 5)
-            asks = self._extract_levels(book_data.get("asks") or book_data.get("a"), 5)
+            sym, mult = self._resolve_coin_and_mult(inst_id)
+            contract_size = self._get_contract_size(inst_id)
+            bids = self._extract_levels(book_data.get("bids") or book_data.get("b"), 5, mult=mult, contract_size=contract_size)
+            asks = self._extract_levels(book_data.get("asks") or book_data.get("a"), 5, mult=mult, contract_size=contract_size)
             if bids and asks:
                 self._note_symbol(sym)
                 ets = int(book_data.get("ts", 0) or data.get("ts", 0))

@@ -167,6 +167,14 @@ def generate_daily_report(
 
                     _add_to_bucket(pnl_scenarios["all_signals"])
 
+                    # Microstructure physical validity check (consistent with evaluator.py)
+                    drain_ratio = float(d.get("drain_ratio", 0.0))
+                    swept_usd = float(d.get("leader_swept_usd", 0.0))
+                    f_top3_ask = float(d.get("follower_top3_ask_usd", 0.0))
+                    cross_ratio = (swept_usd / f_top3_ask) if f_top3_ask > 0 else 0.0
+                    if drain_ratio < 0.40 and cross_ratio < 0.50:
+                        continue
+
                     pk = f"{coin}:upbit-{f_ex}"
                     req_edge = calibrated_thresholds.get(pk, 20.0)
                     if gross_edge_bps >= req_edge:

@@ -76,11 +76,11 @@ def run_pipeline(
     if skip_screening:
         logger.info("[PHASE 1/4] Universe Screening: SKIPPED (--skip-screening)")
     else:
-        logger.info("[PHASE 1/4] Universe Screening: Fetching 1440 1m candles across Upbit & 9 followers...")
+        logger.info("[PHASE 1/4] Universe Screening: Fetching 200 1m candles across Upbit & 9 followers...")
         cmd_scr = [
             sys.executable,
             os.path.join(PROJECT_ROOT, "tools", "screen_universe.py"),
-            "--kline-limit", "1440",
+            "--kline-limit", "200",
             "--workers", "8",
         ]
         if not dry_run:

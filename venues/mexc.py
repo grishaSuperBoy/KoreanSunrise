@@ -33,9 +33,27 @@ class MEXCRestClient:
                     if not sym.endswith("_USDT") and not sym.endswith("USDT"):
                         continue
                     base_coin = normalize_symbol(item.get("baseCoin", "") or sym)
-                    out[sym] = (base_coin, 1.0)
+                    cs = float(item.get("contractSize", 1.0) or 1.0)
+                    out[sym] = (base_coin, 1.0, cs)
         except Exception as e:
             log.error(f"[mexc_rest] Failed to fetch contract details: {e}")
+        return out
+
+    def fetch_contract_sizes(self) -> Dict[str, float]:
+        """Returns symbol (e.g. 'BTC_USDT') -> contractSize (float)."""
+        url = f"{self.BASE_URL}/detail"
+        out: Dict[str, float] = {}
+        try:
+            r = self.session.get(url, timeout=8)
+            if r.status_code == 200:
+                for item in r.json().get("data", []):
+                    sym = item.get("symbol", "").upper()
+                    if not sym.endswith("_USDT") and not sym.endswith("USDT"):
+                        continue
+                    cs = float(item.get("contractSize", 1.0) or 1.0)
+                    out[sym] = cs
+        except Exception as e:
+            log.error(f"[mexc_rest] Failed to fetch contract sizes: {e}")
         return out
 
     def fetch_tickers_24h(self) -> Dict[str, Dict[str, Any]]:
@@ -89,18 +107,27 @@ class MEXCStream(BaseCEXStream):
 
     def __init__(
         self,
-        symbols: List[str],
+        symbols: List[str] | Dict[str, Any],
         callback: Callable[[OrderBookDepth5], None],
         stream_name: Optional[str] = None,
+        contract_sizes: Optional[Dict[str, float]] = None,
     ):
-        super().__init__("mexc", symbols, callback, stream_name=stream_name)
+        super().__init__("mexc", symbols, callback, stream_name=stream_name, contract_sizes=contract_sizes)
 
     async def _send_client_ping(self, ws: Any) -> None:
         await ws.send('"Ping"')
 
     async def _send_subscriptions(self, ws: Any) -> None:
+        if not self._contract_sizes:
+            try:
+                sizes = await asyncio.to_thread(MEXCRestClient().fetch_contract_sizes)
+                if sizes:
+                    self._contract_sizes.update(sizes)
+            except Exception as e:
+                log.warning(f"[mexc] Failed to auto-fetch contract sizes: {e}")
+
         for s in self.symbols:
-            pair = f"{self._base_coin(s)}_USDT"
+            pair = s if "_" in s else f"{self._base_coin(s)}_USDT"
             sub = {
                 "method": "sub.depth.full",
                 "param": {"symbol": pair, "limit": 20},
@@ -117,12 +144,13 @@ class MEXCStream(BaseCEXStream):
             if "depth" not in channel:
                 return
             d = data.get("data", {})
-            raw_sym = data.get("symbol", "")
+            raw_sym = (data.get("symbol", "") or "").upper()
             if not raw_sym:
                 return
-            sym = self._base_coin(raw_sym)
-            bids = self._extract_levels(d.get("bids"), 5)
-            asks = self._extract_levels(d.get("asks"), 5)
+            sym, mult = self._resolve_coin_and_mult(raw_sym)
+            contract_size = self._get_contract_size(raw_sym)
+            bids = self._extract_levels(d.get("bids"), 5, mult=mult, contract_size=contract_size)
+            asks = self._extract_levels(d.get("asks"), 5, mult=mult, contract_size=contract_size)
             if bids and asks:
                 self._note_symbol(sym)
                 ets = int(d.get("cts", 0) or data.get("ts", 0))

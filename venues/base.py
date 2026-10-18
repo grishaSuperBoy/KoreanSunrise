@@ -227,14 +227,28 @@ class BaseCEXStream(BaseVenueStream):
     def __init__(
         self,
         exchange: str,
-        symbols: List[str] | Dict[str, Tuple[str, float]],
+        symbols: List[str] | Dict[str, Any],
         callback: Callable[[OrderBookDepth5], None],
         stream_name: Optional[str] = None,
+        contract_sizes: Optional[Dict[str, float]] = None,
     ):
+        self._contract_sizes: Dict[str, float] = {
+            k.upper(): float(v) for k, v in (contract_sizes or {}).items()
+        }
         if isinstance(symbols, dict):
-            self._sym_map: Dict[str, Tuple[str, float]] = dict(symbols)
+            self._sym_map: Dict[str, Tuple[str, float]] = {}
+            for k, v in symbols.items():
+                k_u = str(k).upper()
+                if isinstance(v, (list, tuple)):
+                    coin = str(v[0])
+                    mult = float(v[1]) if len(v) > 1 else 1.0
+                    self._sym_map[k_u] = (coin, mult)
+                    if len(v) >= 3 and k_u not in self._contract_sizes:
+                        self._contract_sizes[k_u] = float(v[2])
+                else:
+                    self._sym_map[k_u] = parse_symbol_and_mult(k_u)
             raw_list = list(symbols.keys())
-            coins = sorted({c for c, _ in symbols.values()})
+            coins = sorted({c for c, _ in self._sym_map.values()})
         else:
             raw_list = [str(s).upper() for s in symbols]
             self._sym_map = {s: parse_symbol_and_mult(s) for s in raw_list}
@@ -253,11 +267,21 @@ class BaseCEXStream(BaseVenueStream):
             return self._sym_map[raw_u]
         return parse_symbol_and_mult(raw_u)
 
+    def _get_contract_size(self, raw_sym: str) -> float:
+        raw_u = raw_sym.upper()
+        return self._contract_sizes.get(raw_u, 1.0)
+
     @staticmethod
     def _base_coin(s: str) -> str:
         return normalize_symbol(s)
 
-    def _extract_levels(self, raw_side: Any, limit: int = 5, mult: float = 1.0) -> List[Tuple[float, float]]:
+    def _extract_levels(
+        self,
+        raw_side: Any,
+        limit: int = 5,
+        mult: float = 1.0,
+        contract_size: float = 1.0,
+    ) -> List[Tuple[float, float]]:
         out: List[Tuple[float, float]] = []
         inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
         for row in raw_side or ():
@@ -282,7 +306,9 @@ class BaseCEXStream(BaseVenueStream):
                 else:
                     continue
                 if p > 0.0 and q > 0.0:
-                    out.append((p * inv_mult, q * mult))
+                    real_p = p * inv_mult
+                    real_q = q * contract_size * mult
+                    out.append((real_p, real_q))
             except (TypeError, ValueError, IndexError):
                 continue
         return out

@@ -38,9 +38,28 @@ class KucoinRestClient:
                     if base == "XBT":
                         base = "BTC"
                     base_coin = normalize_symbol(base)
-                    out[sym] = (base_coin, 1.0)
+                    c_size = float(item.get("multiplier", 1.0) or 1.0)
+                    out[sym] = (base_coin, 1.0, c_size)
         except Exception as e:
             log.error(f"[kucoin_rest] Failed to fetch contracts: {e}")
+        return out
+
+    def fetch_contract_sizes(self) -> Dict[str, float]:
+        """Returns symbol (e.g. 'XBTUSDTM') -> multiplier (e.g. 0.001)."""
+        url = f"{self.BASE_URL}/contracts/active"
+        out: Dict[str, float] = {}
+        try:
+            r = self.session.get(url, timeout=8)
+            if r.status_code == 200:
+                for item in r.json().get("data", []):
+                    settle = item.get("settleCurrency", "").upper()
+                    if settle != "USDT":
+                        continue
+                    sym = item.get("symbol", "").upper()
+                    mult = float(item.get("multiplier", 1.0) or 1.0)
+                    out[sym] = mult
+        except Exception as e:
+            log.error(f"[kucoin_rest] Failed to fetch contract sizes: {e}")
         return out
 
     def fetch_tickers_24h(self) -> Dict[str, Dict[str, Any]]:
@@ -90,10 +109,18 @@ class KucoinStream(BaseVenueStream):
     TOPIC = "/contractMarket/level2Depth5:{sym}"
     PING_FALLBACK_SEC = 15.0
 
-    def __init__(self, symbols: List[str], callback: Callable[[OrderBookDepth5], None]):
-        super().__init__("kucoin", symbols, callback)
+    def __init__(
+        self,
+        symbols: List[str] | Dict[str, Any],
+        callback: Callable[[OrderBookDepth5], None],
+        contract_sizes: Optional[Dict[str, float]] = None,
+    ):
+        sym_list = list(symbols.keys()) if isinstance(symbols, dict) else list(symbols)
+        super().__init__("kucoin", sym_list, callback)
         self.subscribed = list(self.symbols)
         self._ours_to_venue: Dict[str, str] = {}
+        self._venue_to_ours: Dict[str, str] = {}
+        self._contract_sizes: Dict[str, float] = {k.upper(): float(v) for k, v in (contract_sizes or {}).items()}
         self._ping_sec = self.PING_FALLBACK_SEC
 
     def _resolve_symbols(self) -> Dict[str, str]:
@@ -103,6 +130,8 @@ class KucoinStream(BaseVenueStream):
             if r.status_code == 200:
                 for c in r.json().get("data", []):
                     sym = c.get("symbol", "").upper()
+                    mult = float(c.get("multiplier", 1.0) or 1.0)
+                    self._contract_sizes[sym] = mult
                     base = c.get("baseCurrency", "").upper()
                     if base == "XBT":
                         base = "BTC"
@@ -110,6 +139,7 @@ class KucoinStream(BaseVenueStream):
                     for s in self.symbols:
                         if normalize_symbol(s) == base_norm:
                             self._ours_to_venue[s] = sym
+                            self._venue_to_ours[sym] = normalize_symbol(s)
         except Exception as e:
             log.warning(f"[kucoin] Failed to resolve contract symbols: {e}")
         return self._ours_to_venue
@@ -203,13 +233,15 @@ class KucoinStream(BaseVenueStream):
             topic = data.get("topic", "")
             if not topic.startswith("/contractMarket/level2Depth5:"):
                 return
-            sym_raw = topic.split(":", 1)[1]
-            sym = normalize_symbol(sym_raw.replace("XBT", "BTC"))
+            sym_raw = topic.split(":", 1)[1].upper()
+            clean_raw = sym_raw[:-1] if sym_raw.endswith("M") else sym_raw
+            sym = self._venue_to_ours.get(sym_raw) or normalize_symbol(clean_raw.replace("XBT", "BTC"))
+            contract_size = self._contract_sizes.get(sym_raw, 1.0)
             payload = data.get("data", {})
             bids_raw = payload.get("bids", [])[:5]
             asks_raw = payload.get("asks", [])[:5]
-            bids = [(float(p), float(q)) for p, q in bids_raw if float(p) > 0 and float(q) > 0]
-            asks = [(float(p), float(q)) for p, q in asks_raw if float(p) > 0 and float(q) > 0]
+            bids = [(float(p), float(q) * contract_size) for p, q in bids_raw if float(p) > 0 and float(q) > 0]
+            asks = [(float(p), float(q) * contract_size) for p, q in asks_raw if float(p) > 0 and float(q) > 0]
             if bids and asks:
                 self._note_symbol(sym)
                 ets = int(data.get("data", {}).get("timestamp", 0) or time.time() * 1000)

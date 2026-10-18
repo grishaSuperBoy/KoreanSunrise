@@ -160,6 +160,14 @@ def calibrate(
                             or (float(d.get("net_exec_edge_bps", 0.0)) + roundtrip_fee_bps * 0.5)
                         )
 
+                        # Microstructure physical validity check (consistent with evaluator.py)
+                        drain_ratio = float(d.get("drain_ratio", 0.0))
+                        swept_usd = float(d.get("leader_swept_usd", 0.0))
+                        f_top3_ask = float(d.get("follower_top3_ask_usd", 0.0))
+                        cross_ratio = (swept_usd / f_top3_ask) if f_top3_ask > 0 else 0.0
+                        if drain_ratio < 0.40 and cross_ratio < 0.50:
+                            continue
+
                         pair_key = f"{coin}:upbit-{follower_ex}"
                         valid_events += 1
 
@@ -171,7 +179,7 @@ def calibrate(
                         if dz is not None and float(dz) > 0:
                             pair_metrics[pair_key]["dev_zs"].append(float(dz))
 
-                        gross = pos_size * (gross_edge / 10000.0)
+                        gross = pos_size * ((net_pnl + roundtrip_fee_bps) / 10000.0)
                         net = pos_size * (net_pnl / 10000.0)
 
                         sw = pair_sweeps[pair_key]

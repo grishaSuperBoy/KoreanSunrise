@@ -39,7 +39,7 @@ DEFAULT_MAX_PRICE_DIFF_PCT = 15.0       # Max 15% price diff (eliminates namesak
 DEFAULT_MIN_CORR = 0.65                 # Min correlation of minute log-returns
 DEFAULT_MIN_BOTH_TRADE = 0.15           # Min 15% of minutes traded on both sides
 DEFAULT_MIN_DEV_BPS = 8.0               # Min 8.0 bps P90 spread volatility
-DEFAULT_KLINE_LIMIT = 1440             # 1440 1-minute candles (24 hours = 1 day)
+DEFAULT_KLINE_LIMIT = 200               # 200 1-minute candles (~3.3h, uniform across all 10 CEXs without rate-limit pagination)
 
 CLIENT_FACTORIES: Dict[str, Any] = {
     "binance": BinanceRestClient,
@@ -126,12 +126,15 @@ class UniverseScreener:
         up_ticks = self.upbit.fetch_tickers_24h(list(up_mkts.values()), usdt_krw_rate)
         log.info(f"[Stage 1/2] Upbit 24h tickers fetched: {len(up_ticks)}")
 
-        # Build reverse base map for each venue: canonical_base -> (raw_sym, mult)
-        venue_base_maps: Dict[str, Dict[str, Tuple[str, float]]] = {}
+        # Build reverse base map for each venue: canonical_base -> (raw_sym, mult, c_size)
+        venue_base_maps: Dict[str, Dict[str, Tuple[str, float, float]]] = {}
         for v, perps in venue_perps.items():
-            b_map: Dict[str, Tuple[str, float]] = {}
-            for raw, (base, mult) in perps.items():
-                b_map[base] = (raw, mult)
+            b_map: Dict[str, Tuple[str, float, float]] = {}
+            for raw, val in perps.items():
+                base = val[0]
+                mult = float(val[1]) if len(val) > 1 else 1.0
+                c_size = float(val[2]) if len(val) > 2 else 1.0
+                b_map[base] = (raw, mult, c_size)
             venue_base_maps[v] = b_map
 
         # Stage 1 Matching and Fast Volume + Namesake Price Sanity Filter
@@ -154,7 +157,7 @@ class UniverseScreener:
                 rejected_volume += 1
                 continue
 
-            matched_venues_meta: Dict[str, Tuple[str, float, float, float]] = {}
+            matched_venues_meta: Dict[str, Tuple[str, float, float, float, float]] = {}
 
             for v in self.target_venues:
                 b_map = venue_base_maps.get(v, {})
@@ -165,7 +168,7 @@ class UniverseScreener:
                 if not matched:
                     continue
 
-                raw_sym, mult = matched
+                raw_sym, mult, c_size = matched
                 t_info = venue_ticks.get(v, {}).get(raw_sym)
                 if not t_info:
                     continue
@@ -178,7 +181,7 @@ class UniverseScreener:
 
                 diff_pct = abs(up_px - px_v) / max(up_px, px_v) * 100.0
                 if diff_pct <= self.max_price_diff_pct:
-                    matched_venues_meta[v] = (raw_sym, mult, px_v, vol_v)
+                    matched_venues_meta[v] = (raw_sym, mult, px_v, vol_v, c_size)
                 else:
                     rejected_namesakes += 1
                     log.debug(f"[sanity] Rejected namesake {coin} on {v} (diff {diff_pct:.1f}%)")
@@ -210,7 +213,7 @@ class UniverseScreener:
             confirmed_venues: Dict[str, Dict[str, Any]] = {}
             best_res: Optional[Dict[str, Any]] = None
 
-            for v, (raw_sym, mult, _, _) in item["matched_venues"].items():
+            for v, (raw_sym, mult, _, _, c_size) in item["matched_venues"].items():
                 client = self.clients.get(v)
                 if not client:
                     continue
@@ -230,6 +233,7 @@ class UniverseScreener:
                     confirmed_venues[v] = {
                         "raw_sym": raw_sym,
                         "mult": mult,
+                        "c_size": c_size,
                         "metrics": res,
                     }
                     if best_res is None or res["corr"] > best_res["corr"]:
@@ -289,7 +293,7 @@ class UniverseScreener:
         upbit_krw_to_coin: Dict[str, str] = {c["market"]: c["coin"] for c in vetted_coins}
 
         # Build sym_map per venue
-        sym_maps: Dict[str, Dict[str, Tuple[str, float]]] = {v: {} for v in self.target_venues}
+        sym_maps: Dict[str, Dict[str, Tuple[str, float, float]]] = {v: {} for v in self.target_venues}
         pairs_meta: Dict[str, Any] = {}
 
         for c in vetted_coins:
@@ -302,7 +306,8 @@ class UniverseScreener:
                 if dt:
                     raw_sym = dt["raw_sym"]
                     mult = dt["mult"]
-                    sym_maps[v][raw_sym] = (coin, mult)
+                    c_size = dt.get("c_size", 1.0)
+                    sym_maps[v][raw_sym] = (coin, mult, c_size)
 
             pairs_meta[coin] = {
                 "coin": coin,

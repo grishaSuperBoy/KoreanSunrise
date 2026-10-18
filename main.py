@@ -100,25 +100,21 @@ class KoreanSunriseService:
                 self.universe = None
 
         if self.universe is None or not self.universe.coins:
-            log.info("=== Discovering overlapping Upbit KRW alts & Binance/Bybit Perps ===")
-            self.universe = await asyncio.to_thread(C.discover_universe)
-            try:
-                doc = {
-                    "_meta": {
-                        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "updated_ts": round(time.time(), 3),
-                        "coins_count": len(self.universe.coins),
-                    },
-                    "coins": self.universe.coins,
-                    "upbit_krw_to_coin": self.universe.upbit_krw_to_coin,
-                    "binance_sym_map": self.universe.binance_sym_map,
-                    "bybit_sym_map": self.universe.bybit_sym_map,
-                }
-                with open(univ_file + ".tmp", "w", encoding="utf-8") as f:
-                    json.dump(doc, f, indent=2, ensure_ascii=False)
-                os.replace(univ_file + ".tmp", univ_file)
-            except Exception as e:
-                log.warning(f"Could not persist universe_live.json: {e}")
+            log.info("=== universe_live.json not found or empty: Running multi-venue UniverseScreener ===")
+            from screening.screener import UniverseScreener
+            screener = UniverseScreener(output_file=univ_file)
+            doc = await asyncio.to_thread(screener.run)
+            coins = doc.get("coins", [])
+            upbit_krw_to_coin = doc.get("upbit_krw_to_coin", {})
+            binance_sym_map = {k: tuple(v) for k, v in doc.get("binance_sym_map", {}).items()}
+            bybit_sym_map = {k: tuple(v) for k, v in doc.get("bybit_sym_map", {}).items()}
+            self.universe = C.MatchedUniverse(
+                coins=coins,
+                upbit_krw_to_coin=upbit_krw_to_coin,
+                binance_sym_map=binance_sym_map,
+                bybit_sym_map=bybit_sym_map,
+            )
+            self.universe._raw_doc = doc
 
         self.pool_state.reload()
 
@@ -140,7 +136,7 @@ class KoreanSunriseService:
             while not self._shutdown_event.is_set():
                 now = time.time()
                 self.engine.sweep_timeouts(now)
-                self.writer.maybe_flush(now)
+                await asyncio.to_thread(self.writer.maybe_flush, now)
 
                 if now - last_heartbeat >= 15.0:
                     self._log_heartbeat()
@@ -190,7 +186,7 @@ class KoreanSunriseService:
             await self.stream_manager.stop_all()
         if self.api_server is not None:
             self.api_server.stop()
-        self.writer.flush()
+        await asyncio.to_thread(self.writer.flush)
         log.info("Korean Sunrise stopped cleanly.")
 
 

@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
 from models import OrderBookDepth5
-from venues.base import BaseCEXStream, create_http_session, normalize_symbol, log
+from venues.base import BaseCEXStream, create_http_session, normalize_symbol, parse_symbol_and_mult, log
 
 
 class BingXRestClient:
@@ -22,7 +22,7 @@ class BingXRestClient:
         self.session = session or create_http_session()
 
     def fetch_linear_perpetuals(self) -> Dict[str, Tuple[str, float]]:
-        """Returns symbol (e.g. 'BTC-USDT') -> (canonical_coin 'BTC', mult 1.0)."""
+        """Returns symbol (e.g. 'BTC-USDT', '1000PEPE-USDT') -> (canonical_coin 'BTC', mult 1.0 or 1000.0)."""
         url = f"{self.BASE_URL}/v2/quote/contracts"
         out: Dict[str, Tuple[str, float]] = {}
         try:
@@ -32,8 +32,8 @@ class BingXRestClient:
                     sym = item.get("symbol", "").upper()
                     if not sym.endswith("-USDT"):
                         continue
-                    base_coin = normalize_symbol(item.get("asset", "") or sym)
-                    out[sym] = (base_coin, 1.0)
+                    base_coin, mult = parse_symbol_and_mult(item.get("asset", "") or sym)
+                    out[sym] = (base_coin, mult)
         except Exception as e:
             log.error(f"[bingx_rest] Failed to fetch contracts: {e}")
         return out
@@ -84,22 +84,32 @@ class BingXStream(BaseCEXStream):
 
     def __init__(
         self,
-        symbols: List[str],
+        symbols: List[str] | Dict[str, Any],
         callback: Callable[[OrderBookDepth5], None],
         stream_name: Optional[str] = None,
+        contract_sizes: Optional[Dict[str, float]] = None,
     ):
-        super().__init__("bingx", symbols, callback, stream_name=stream_name)
+        super().__init__("bingx", symbols, callback, stream_name=stream_name, contract_sizes=contract_sizes)
+
+    def _to_raw_symbol(self, s: str) -> str:
+        s_u = s.upper()
+        if s_u.endswith("-USDT"):
+            return s_u
+        for raw, (coin, _) in self._sym_map.items():
+            if coin.upper() == s_u:
+                return raw
+        return f"{s_u}-USDT"
 
     async def _send_client_ping(self, ws: Any) -> None:
         await ws.send("ping")
 
     async def _send_subscriptions(self, ws: Any) -> None:
         for s in self.symbols:
-            coin = self._base_coin(s)
+            raw_sym = self._to_raw_symbol(s)
             sub = {
-                "id": f"sub_{coin}",
+                "id": f"sub_{raw_sym}",
                 "reqType": "sub",
-                "dataType": f"{coin}-USDT@depth20",
+                "dataType": f"{raw_sym}@depth20",
             }
             await ws.send(json.dumps(sub))
             await asyncio.sleep(0.02)
@@ -112,11 +122,12 @@ class BingXStream(BaseCEXStream):
             datatype = data.get("dataType", "")
             if "@depth" not in datatype:
                 return
-            sym_raw = datatype.split("@")[0]
-            sym = self._base_coin(sym_raw)
+            sym_raw = datatype.split("@")[0].upper()
+            sym, mult = self._resolve_coin_and_mult(sym_raw)
+            contract_size = self._get_contract_size(sym_raw)
             b_data = data.get("data", {})
-            bids = self._extract_levels(b_data.get("bids"), 5)
-            asks = self._extract_levels(b_data.get("asks"), 5)
+            bids = self._extract_levels(b_data.get("bids"), 5, mult=mult, contract_size=contract_size)
+            asks = self._extract_levels(b_data.get("asks"), 5, mult=mult, contract_size=contract_size)
             if sym and bids and asks:
                 self._note_symbol(sym)
                 self.callback(OrderBookDepth5(

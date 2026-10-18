@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
 from models import OrderBookDepth5
-from venues.base import BaseCEXStream, create_http_session, normalize_symbol, log
+from venues.base import BaseCEXStream, create_http_session, normalize_symbol, parse_symbol_and_mult, log
 
 
 class PionexRestClient:
@@ -22,7 +22,7 @@ class PionexRestClient:
         self.session = session or create_http_session()
 
     def fetch_linear_perpetuals(self) -> Dict[str, Tuple[str, float]]:
-        """Returns symbol (e.g. 'BTC_USDT_PERP') -> (canonical_coin 'BTC', mult 1.0)."""
+        """Returns symbol (e.g. 'BTC_USDT_PERP', '1000PEPE_USDT_PERP') -> (canonical_coin 'BTC', mult 1.0 or 1000.0)."""
         url = f"{self.BASE_URL}/common/symbols?type=PERP"
         out: Dict[str, Tuple[str, float]] = {}
         try:
@@ -32,8 +32,8 @@ class PionexRestClient:
                     sym = s.get("symbol", "").upper()
                     if not sym.endswith("_PERP") or "USDT" not in sym:
                         continue
-                    base_coin = normalize_symbol(s.get("baseCoin", "") or sym)
-                    out[sym] = (base_coin, 1.0)
+                    base_coin, mult = parse_symbol_and_mult(s.get("baseCoin", "") or sym)
+                    out[sym] = (base_coin, mult)
         except Exception as e:
             log.error(f"[pionex_rest] Failed to fetch symbols: {e}")
         return out
@@ -85,11 +85,21 @@ class PionexStream(BaseCEXStream):
 
     def __init__(
         self,
-        symbols: List[str],
+        symbols: List[str] | Dict[str, Any],
         callback: Callable[[OrderBookDepth5], None],
         stream_name: Optional[str] = None,
+        contract_sizes: Optional[Dict[str, float]] = None,
     ):
-        super().__init__("pionex", symbols, callback, stream_name=stream_name)
+        super().__init__("pionex", symbols, callback, stream_name=stream_name, contract_sizes=contract_sizes)
+
+    def _to_raw_symbol(self, s: str) -> str:
+        s_u = s.upper()
+        if s_u.endswith("_PERP"):
+            return s_u
+        for raw, (coin, _) in self._sym_map.items():
+            if coin.upper() == s_u:
+                return raw
+        return f"{s_u}_USDT_PERP"
 
     async def _send_client_ping(self, ws: Any) -> None:
         now_ms = int(time.time() * 1000)
@@ -107,8 +117,7 @@ class PionexStream(BaseCEXStream):
 
     async def _send_subscriptions(self, ws: Any) -> None:
         for s in self.symbols:
-            coin = self._base_coin(s)
-            sym = f"{coin}_USDT_PERP"
+            sym = self._to_raw_symbol(s)
             sub = {
                 "op": "SUBSCRIBE",
                 "topic": "DEPTH",
@@ -127,12 +136,13 @@ class PionexStream(BaseCEXStream):
             if topic != "DEPTH":
                 return
             d = data.get("data", {})
-            raw_sym = data.get("symbol", "")
+            raw_sym = (data.get("symbol", "") or "").upper()
             if not raw_sym:
                 return
-            sym = self._base_coin(raw_sym)
-            bids = self._extract_levels(d.get("bids"), 5)
-            asks = self._extract_levels(d.get("asks"), 5)
+            sym, mult = self._resolve_coin_and_mult(raw_sym)
+            contract_size = self._get_contract_size(raw_sym)
+            bids = self._extract_levels(d.get("bids"), 5, mult=mult, contract_size=contract_size)
+            asks = self._extract_levels(d.get("asks"), 5, mult=mult, contract_size=contract_size)
             if bids and asks:
                 self._note_symbol(sym)
                 ets = int(data.get("timestamp", 0) or time.time() * 1000)

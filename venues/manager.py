@@ -72,7 +72,10 @@ class StreamManager:
 
             v_sym_map = raw_doc.get(f"{v_name}_sym_map", {})
             if v_sym_map:
-                norm_map = {k: (v[0], float(v[1])) for k, v in v_sym_map.items()}
+                norm_map = {
+                    k: (v[0], float(v[1]), float(v[2])) if len(v) >= 3 else (v[0], float(v[1]))
+                    for k, v in v_sym_map.items()
+                }
                 try:
                     self.streams[v_name] = cls(norm_map, callback)
                     log.info(f"[stream_manager] Registered follower feed for {v_name.upper()} ({len(norm_map)} contracts)")

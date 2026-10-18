@@ -33,9 +33,27 @@ class HTXRestClient:
                     if not code.endswith("-USDT"):
                         continue
                     base_coin = normalize_symbol(item.get("symbol", "") or code)
-                    out[code] = (base_coin, 1.0)
+                    cs = float(item.get("contract_size", 1.0) or 1.0)
+                    out[code] = (base_coin, 1.0, cs)
         except Exception as e:
             log.error(f"[htx_rest] Failed to fetch contract info: {e}")
+        return out
+
+    def fetch_contract_sizes(self) -> Dict[str, float]:
+        """Returns contract_code (e.g. 'BTC-USDT') -> contract_size (float)."""
+        url = f"{self.BASE_URL}/linear-swap-api/v1/swap_contract_info"
+        out: Dict[str, float] = {}
+        try:
+            r = self.session.get(url, timeout=8)
+            if r.status_code == 200:
+                for item in r.json().get("data", []):
+                    code = item.get("contract_code", "").upper()
+                    if not code.endswith("-USDT"):
+                        continue
+                    cs = float(item.get("contract_size", 1.0) or 1.0)
+                    out[code] = cs
+        except Exception as e:
+            log.error(f"[htx_rest] Failed to fetch contract sizes: {e}")
         return out
 
     def fetch_tickers_24h(self) -> Dict[str, Dict[str, Any]]:
@@ -84,11 +102,12 @@ class HTXStream(BaseCEXStream):
 
     def __init__(
         self,
-        symbols: List[str],
+        symbols: List[str] | Dict[str, Any],
         callback: Callable[[OrderBookDepth5], None],
         stream_name: Optional[str] = None,
+        contract_sizes: Optional[Dict[str, float]] = None,
     ):
-        super().__init__("htx", symbols, callback, stream_name=stream_name)
+        super().__init__("htx", symbols, callback, stream_name=stream_name, contract_sizes=contract_sizes)
 
     async def _handle_server_ping(self, ws: Any, raw_msg: str) -> bool:
         try:
@@ -101,9 +120,16 @@ class HTXStream(BaseCEXStream):
         return False
 
     async def _send_subscriptions(self, ws: Any) -> None:
+        if not self._contract_sizes:
+            try:
+                sizes = await asyncio.to_thread(HTXRestClient().fetch_contract_sizes)
+                if sizes:
+                    self._contract_sizes.update(sizes)
+            except Exception as e:
+                log.warning(f"[htx] Failed to auto-fetch contract sizes: {e}")
+
         for s in self.symbols:
-            coin = self._base_coin(s)
-            code = f"{coin}-USDT"
+            code = s if "-" in s else f"{self._base_coin(s)}-USDT"
             sub = {
                 "sub": f"market.{code}.depth.step0",
                 "id": f"sub_{code}",
@@ -119,11 +145,12 @@ class HTXStream(BaseCEXStream):
             ch = data.get("ch", "")
             if not ch.startswith("market.") or ".depth." not in ch:
                 return
-            code = ch.split(".")[1]
-            sym = self._base_coin(code)
+            code = ch.split(".")[1].upper()
+            sym, mult = self._resolve_coin_and_mult(code)
+            contract_size = self._get_contract_size(code)
             tick = data.get("tick", {})
-            bids = self._extract_levels(tick.get("bids"), 5)
-            asks = self._extract_levels(tick.get("asks"), 5)
+            bids = self._extract_levels(tick.get("bids"), 5, mult=mult, contract_size=contract_size)
+            asks = self._extract_levels(tick.get("asks"), 5, mult=mult, contract_size=contract_size)
             if bids and asks:
                 self._note_symbol(sym)
                 ets = int(data.get("ts", 0) or tick.get("ts", 0))

@@ -164,15 +164,28 @@ class PoolStateManager:
         self._overrides: Dict[str, Any] = {}
         self._universe_raw: Dict[str, Any] = {}
         self._last_reload: float = 0.0
+        self._mtimes: Dict[str, float] = {}
 
-    def reload(self) -> None:
+    def reload(self, force: bool = False) -> None:
         """Reloads all JSON configuration files and merges state atomically."""
         with self._lock:
+            current_mtimes = {}
+            for path in (self._universe_file, self._battle_pool_file, self._overrides_file):
+                if os.path.exists(path):
+                    try:
+                        current_mtimes[path] = os.path.getmtime(path)
+                    except OSError:
+                        pass
+            if not force and current_mtimes and current_mtimes == self._mtimes:
+                return
+
+            self._coins = {}
             self._overrides = _read_json(self._overrides_file, default={})
             self._load_incubator()
             self._load_battle_pool()
             self._apply_overrides()
             self._last_reload = time.time()
+            self._mtimes = current_mtimes
             log.info(
                 f"[pool_state] Reloaded: {self._count_basket('incubator')} incubator, "
                 f"{self._count_basket('battle')} battle "
@@ -252,6 +265,11 @@ class PoolStateManager:
             overrides["paused_coins"] = paused
             _write_json_atomic(self._overrides_file, overrides)
             self._overrides = overrides
+            if os.path.exists(self._overrides_file):
+                try:
+                    self._mtimes[self._overrides_file] = os.path.getmtime(self._overrides_file)
+                except OSError:
+                    pass
             log.info(f"[pool_state] Paused coin: {coin} (reason={reason})")
             return True
 
@@ -269,6 +287,11 @@ class PoolStateManager:
             overrides["paused_coins"] = paused
             _write_json_atomic(self._overrides_file, overrides)
             self._overrides = overrides
+            if os.path.exists(self._overrides_file):
+                try:
+                    self._mtimes[self._overrides_file] = os.path.getmtime(self._overrides_file)
+                except OSError:
+                    pass
             log.info(f"[pool_state] Resumed coin: {coin}")
             return True
 
@@ -316,13 +339,19 @@ class PoolStateManager:
             return True
 
     def demote_to_incubator(self, coin: str, reason: str = "manual_demote") -> bool:
-        """Demotes a single coin from Battle back to Incubator."""
+        """Demotes a single coin from Battle back to Incubator, resetting battle metrics."""
         with self._lock:
             coin = coin.upper()
             entry = self._coins.get(coin)
             if not entry:
                 return False
             entry.basket = "incubator"
+            entry.mean_net_pnl_bps = 0.0
+            entry.median_net_pnl_bps = 0.0
+            entry.win_rate_pct = 0.0
+            entry.profit_factor = 0.0
+            entry.promoted_at = 0.0
+            entry.event_count = 0
             self._persist_battle_pool()
             log.info(f"[pool_state] Demoted {coin} to Incubator (reason={reason})")
             return True
@@ -333,6 +362,12 @@ class PoolStateManager:
         quantitative performance. Demotes degraded coins back to Incubator.
         """
         with self._lock:
+            self._overrides = _read_json(self._overrides_file, default={})
+            if os.path.exists(self._overrides_file):
+                try:
+                    self._mtimes[self._overrides_file] = os.path.getmtime(self._overrides_file)
+                except OSError:
+                    pass
             overrides = self._overrides
             qualified_coins: Set[str] = set()
 
@@ -355,16 +390,19 @@ class PoolStateManager:
                 entry.event_count = int(stat.get("event_count", 0))
                 entry.promoted_at = time.time()
 
-                if coin not in overrides.get("paused_coins", {}):
-                    entry.enabled = True
-                    entry.pause_reason = None
-
             # Demote battle coins that failed qualification this cycle
             for coin, entry in self._coins.items():
                 if entry.basket == "battle" and coin not in qualified_coins:
                     entry.basket = "incubator"
+                    entry.mean_net_pnl_bps = 0.0
+                    entry.median_net_pnl_bps = 0.0
+                    entry.win_rate_pct = 0.0
+                    entry.profit_factor = 0.0
+                    entry.promoted_at = 0.0
+                    entry.event_count = 0
                     log.info(f"[pool_state] Demoted {coin} from Battle -> Incubator (failed criteria)")
 
+            self._apply_overrides()
             self._persist_battle_pool()
             log.info(
                 f"[pool_state] Updated Battle pool: {len(qualified_coins)} coins qualified. "
@@ -435,7 +473,7 @@ class PoolStateManager:
                 entry.enabled = False
                 info = paused[coin]
                 entry.pause_reason = info.get("reason", "manual") if isinstance(info, dict) else str(info)
-            elif entry.pause_reason == "manual":
+            else:
                 entry.enabled = True
                 entry.pause_reason = None
 
@@ -454,6 +492,11 @@ class PoolStateManager:
             },
         }
         _write_json_atomic(self._battle_pool_file, doc)
+        if os.path.exists(self._battle_pool_file):
+            try:
+                self._mtimes[self._battle_pool_file] = os.path.getmtime(self._battle_pool_file)
+            except OSError:
+                pass
 
     def _count_basket(self, basket: str) -> int:
         return sum(1 for e in self._coins.values() if e.basket == basket)

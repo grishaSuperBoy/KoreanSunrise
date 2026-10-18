@@ -110,11 +110,11 @@ class UpbitRestClient:
     def fetch_klines_1m(
         self,
         market: str,
-        count: int = 1440,
+        count: int = 200,
     ) -> Dict[int, Tuple[float, float]]:
         """
-        Fetches up to `count` 1-minute candles (default 1440 = 24h).
-        Paginates Upbit /v1/candles/minutes/1 in chunks of 200 candles using 'to' parameter.
+        Fetches up to `count` 1-minute candles (default 200 = ~3.3h).
+        Paginates Upbit /v1/candles/minutes/1 in chunks of 200 candles using 'to' parameter if count > 200.
         Returns dict: minute_ts_sec -> (close_krw, volume_krw).
         """
         out: Dict[int, Tuple[float, float]] = {}

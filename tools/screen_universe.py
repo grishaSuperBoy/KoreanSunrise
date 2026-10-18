@@ -32,7 +32,7 @@ def main() -> None:
     parser.add_argument("--min-corr", type=float, default=0.65, help="Min 1m log-returns correlation (default: 0.65)")
     parser.add_argument("--min-both-trade", type=float, default=0.15, help="Min fraction of active trading minutes (default: 0.15)")
     parser.add_argument("--min-dev-bps", type=float, default=8.0, help="Min P90 basis deviation in bps (default: 8.0 bps)")
-    parser.add_argument("--kline-limit", type=int, default=1440, help="Number of 1m candles to evaluate (default: 1440 = 24h)")
+    parser.add_argument("--kline-limit", type=int, default=200, help="Number of 1m candles to evaluate (default: 200 = ~3.3h)")
     parser.add_argument("--workers", type=int, default=8, help="Parallel worker threads (default: 8)")
     args = parser.parse_args()
 
