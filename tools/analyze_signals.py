@@ -1,5 +1,5 @@
 """
-analyze_signals.py - Offline analyzer & coin filter for Korean Sunrise signals.
+tools/analyze_signals.py - Offline analyzer & coin filter for Korean Sunrise signals.
 Reads all compressed .jsonl.gz files from data/signals/ and prints actionable reports.
 """
 from __future__ import annotations
@@ -13,8 +13,12 @@ import statistics
 import sys
 from typing import Any, Dict, List
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(HERE)
+DEFAULT_DATA_ROOT = os.path.join(PROJECT_ROOT, "data")
 
-def load_signals(data_root: str = "data") -> List[Dict[str, Any]]:
+
+def load_signals(data_root: str = DEFAULT_DATA_ROOT) -> List[Dict[str, Any]]:
     pattern = os.path.join(data_root, "signals", "**", "*.jsonl.gz")
     files = sorted(glob.glob(pattern, recursive=True))
     signals: List[Dict[str, Any]] = []
@@ -58,7 +62,10 @@ def interpolate_markout(path: List[List[float]], target_dt: float) -> tuple[floa
 
 
 def main() -> None:
-    data_root = os.getenv("DATA_ROOT", "data")
+    data_root = os.getenv("DATA_ROOT", DEFAULT_DATA_ROOT)
+    if not os.path.isabs(data_root):
+        data_root = os.path.join(PROJECT_ROOT, data_root)
+
     signals = load_signals(data_root)
     if not signals:
         print(f"No signals found in '{data_root}/signals/'. Run main.py first to collect data.")

@@ -29,6 +29,7 @@ from venues.kucoin import KucoinRestClient, KucoinStream
 from venues.bingx import BingXRestClient, BingXStream
 from venues.htx import HTXRestClient, HTXStream
 from venues.pionex import PionexRestClient, PionexStream
+from venues.manager import StreamManager
 
 __all__ = [
     "BaseVenueStream",
@@ -55,4 +56,5 @@ __all__ = [
     "HTXStream",
     "PionexRestClient",
     "PionexStream",
+    "StreamManager",
 ]

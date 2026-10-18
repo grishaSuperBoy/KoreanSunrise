@@ -164,7 +164,15 @@ def main() -> None:
     if gzip_errors == 0 and total_corrupted == 0 and total_nan_inf == 0:
         print("  [SUCCESS] All data archives passed strict CRC & Schema validation!")
     else:
-        print("  [WARNING] Defective data detected. Check data_quality.log for details.")
+        log_dir = os.path.join(PROJECT_ROOT, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, "data_quality.log")
+        with open(log_file, "a", encoding="utf-8") as lf:
+            lf.write(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Audited {len(files)} files: "
+                f"{gzip_errors} gzip err, {total_corrupted} corrupted rows, {total_nan_inf} NaN/Inf\n"
+            )
+        print("  [WARNING] Defective data detected. Check logs/data_quality.log for details.")
     print("=" * 80)
 
 

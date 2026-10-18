@@ -16,11 +16,25 @@ import config as C
 from korean_engine import KoreanEngine
 from pipeline.pool_state import PoolStateManager
 from pipeline.profile import TradingProfileManager
-from stream_manager import StreamManager
+from venues import StreamManager
 from web import APIServer
 
 LOG_FMT = "%(asctime)s | %(levelname)-7s | %(name)-14s | %(message)s"
-logging.basicConfig(level=getattr(logging, C.LOG_LEVEL.upper(), logging.INFO), format=LOG_FMT)
+LOG_DIR = os.path.join(C.PROJECT_ROOT, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "korean_sunrise.log")
+
+_handlers: list[logging.Handler] = [logging.StreamHandler()]
+try:
+    _handlers.append(logging.FileHandler(LOG_FILE, encoding="utf-8"))
+except Exception:
+    pass
+
+logging.basicConfig(
+    level=getattr(logging, C.LOG_LEVEL.upper(), logging.INFO),
+    format=LOG_FMT,
+    handlers=_handlers,
+)
 log = logging.getLogger("main")
 
 

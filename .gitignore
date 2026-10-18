@@ -11,4 +11,6 @@ data/
 .idea/
 .vscode/
 test_data/
-logs/
+logs/*.log
+logs/*.gz
+!logs/.gitkeep

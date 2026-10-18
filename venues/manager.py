@@ -1,5 +1,5 @@
 """
-stream_manager.py — Dynamic WebSocket stream coordinator for Korean Sunrise.
+venues/manager.py — Dynamic WebSocket stream coordinator for Korean Sunrise.
 Manages Upbit spot leader feed and all active perpetual follower feeds:
 Binance, Bybit, OKX, Gate.io, MEXC, KuCoin, BingX, HTX, Pionex.
 """
@@ -22,7 +22,7 @@ from venues.okx import OKXStream
 from venues.pionex import PionexStream
 from venues.upbit import UpbitSpotStream
 
-log = logging.getLogger("stream_manager")
+log = logging.getLogger("venues.manager")
 
 
 class StreamManager:
@@ -103,6 +103,13 @@ class StreamManager:
                 await stream.stop()
             except Exception as e:
                 log.error(f"[stream_manager] Error stopping {name} feed: {e}")
+
+    def get_usdt_krw_rate(self) -> float:
+        """Returns the real-time USDT/KRW conversion rate from Upbit feed."""
+        upbit_stream = self.streams.get("upbit")
+        if isinstance(upbit_stream, UpbitSpotStream) and upbit_stream.rate_ready:
+            return round(upbit_stream.usdt_krw_rate, 2)
+        return 0.0
 
     def get_status(self) -> Dict[str, Dict[str, Any]]:
         status: Dict[str, Dict[str, Any]] = {}

@@ -38,23 +38,84 @@
 
 ```
 KoreanSunrise/
-├── models.py            # Типы данных (OrderBookDepth5, SunriseSignal)
-├── stream_base.py       # Базовая логика WebSocket (реконнекты, watchdog, jitter)
-├── stream_upbit.py      # Upbit WebSocket (живая конвертация KRW->USDT, фильтр прыжков курса 2%)
-├── stream_binance.py    # Binance Futures WebSocket (depth5@100ms)
-├── stream_bybit.py      # Bybit Linear Perps WebSocket (orderbook.50)
-├── stream_manager.py    # Менеджер параллельных стримов
-├── korean_engine.py     # Ядро детекции Lead-Lag, фильтрации и расчета эджа
-├── batch_writer.py      # Атомарный компрессор сигналов на диск (gzip jsonl)
-├── config.py            # Конфигурация пула монет и порогов
-└── main.py              # Точка входа сервиса
+├── main.py                  # Главная точка входа сервиса
+├── config.py                # Конфигурация, авто-дискавери и окружение
+├── korean_engine.py         # Ядро детекции Lead-Lag, фильтрации и расчета эджа
+├── batch_writer.py          # Атомарный компрессор сигналов на диск (gzip jsonl)
+├── models.py                # Типы данных (OrderBookDepth5, SunriseSignal)
+├── matrix_thresholds.json   # Калиброванные динамические пороги входа
+├── universe_live.json       # Активный инкубационный пул монет
+├── trading_profile.json     # Профиль риск-менеджмента и лимиты
+├── runtime_overrides.json   # Операторские паузы и ручные оверрайды
+│
+├── venues/                  # Модульные адаптеры 10 бирж и координатор стримов
+│   ├── base.py              # Базовые классы BaseVenueStream, BaseCEXStream
+│   ├── upbit.py             # Spot Leader: Upbit KRW
+│   ├── binance.py           # Follower: Binance Futures (USDT-M)
+│   ├── bybit.py             # Follower: Bybit Linear Perpetuals
+│   ├── okx.py               # Follower: OKX USDT Swaps
+│   ├── gateio.py            # Follower: Gate.io USDT Futures
+│   ├── mexc.py              # Follower: MEXC USDT Contract
+│   ├── kucoin.py            # Follower: KuCoin USDT Futures
+│   ├── bingx.py             # Follower: BingX Swap
+│   ├── htx.py               # Follower: HTX / Huobi Linear Swap
+│   ├── pionex.py            # Follower: Pionex Futures
+│   └── manager.py           # StreamManager: координатор параллельных потоков
+│
+├── pipeline/                # Оценка эффективности и управление пулом
+│   ├── evaluator.py         # Анализ сигналов, расчет PnL/Winrate/Score
+│   ├── pool_state.py        # Управление пулом (Graduation / Probation / Delisting)
+│   └── profile.py           # Управление профилями капитала и риск-параметров
+│
+├── screening/               # Скрининг и отбор монет
+│   ├── metrics.py           # Расчет OBI, спредов, волатильности и ликвидности
+│   └── screener.py          # Полносуточная пагинация (1440 свечей) по 10 биржам
+│
+├── tools/                   # Набор CLI инструментов аналитики и обслуживания
+│   ├── run_daily_pipeline.py    # Мастер-оркестратор ежедневного жизненного цикла
+│   ├── screen_universe.py       # Скрининг инкубатора с 24-часовой пагинацией
+│   ├── calibrate_thresholds.py  # Авто-калибровка порогов спреда (matrix_thresholds)
+│   ├── full_daily_report.py     # Генератор квантовых отчетов (Markdown + JSON)
+│   ├── analyze_signals.py       # Пост-трейд аналитика и кривые маркаута
+│   ├── manage_pool.py           # CLI управление пулом монет (pause/resume/graduate)
+│   ├── audit_venues.py          # Аудит задержек и ликвидности 10 бирж
+│   └── validate_data.py         # Валидатор целостности архивов и схем
+│
+├── web/                     # Web UI мониторинга и REST API
+│   ├── server.py            # Асинхронный веб-сервер (порт 8089)
+│   ├── views.py             # HTML5/CSS3 дашборд с авторизацией
+│   └── reports_manager.py   # Менеджер исторических отчетов
+│
+├── scripts/                 # Скрипты деплоя и системной автоматизации
+│   ├── korean-sunrise.service   # Systemd unit для сервиса
+│   ├── daily-pipeline.service   # Systemd unit для ночного пайплайна
+│   ├── daily-pipeline.timer     # Systemd таймер (03:00 UTC)
+│   └── cron_daily.sh            # Cron bash скрипт запуска
+│
+├── reports/                 # Хранилище сгенерированных отчетов
+│   └── daily/               # Ежедневные JSON и Markdown отчеты
+│
+├── docs/                    # Документация и аналитические заметки
+│   └── explanations.md      # Заметки по микроструктуре и боевому исполнению
+│
+└── logs/                    # Логи сервисов (авто-ротация и изоляция)
+    └── .gitkeep
 ```
 
 ---
 
-## 4. Запуск
+## 4. Запуск и использование
 
 ```bash
+# Установка зависимостей
 pip install -r requirements.txt
+
+# Запуск основного сервиса сбора и детекции (с Web UI на :8089)
 python main.py
+
+# Запуск полного ежедневного пайплайна (скрининг -> калибровка -> отчет)
+python tools/run_daily_pipeline.py
+
+# Анализ собранных сигналов и построение кривых маркаута
+python tools/analyze_signals.py
 ```
