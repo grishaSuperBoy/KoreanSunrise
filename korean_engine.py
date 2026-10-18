@@ -37,10 +37,17 @@ def _base(symbol: str) -> str:
 class PairState:
     """State of an (Upbit, Follower) pair for a single coin."""
 
-    def __init__(self, coin: str, follower_ex: str, warmup_samples: int = C.MIN_WARMUP_SAMPLES):
+    def __init__(
+        self,
+        coin: str,
+        follower_ex: str,
+        warmup_samples: int = C.MIN_WARMUP_SAMPLES,
+        spike_sigma: float = 2.5,
+    ):
         self.coin = coin
         self.follower_ex = follower_ex
         self.warmup_samples = warmup_samples
+        self.spike_sigma = spike_sigma
 
         # Rolling cross-venue basis baseline (bps): (Mid_Upbit - Mid_Follower) / Mid_Follower * 10000
         self.baseline_bps: float = 0.0
@@ -72,10 +79,10 @@ class PairState:
         self.t_last = now
         deviation = raw_diff_bps - self.baseline_bps
 
-        # Spike gating: if a massive pump/dislocation is currently happening (> 2.5 sigma),
+        # Spike gating: if a massive pump/dislocation is currently happening (> spike_sigma),
         # slow down baseline adaptation by 20x so the baseline doesn't chase the pump.
         cur_sig = self.sigma(now)
-        is_spike = self.is_warmed_up and abs(deviation) > (2.5 * cur_sig)
+        is_spike = self.is_warmed_up and abs(deviation) > (self.spike_sigma * cur_sig)
         eff_tau = BASELINE_TAU * 20.0 if is_spike else BASELINE_TAU
 
         a = 1.0 - math.exp(-dt / eff_tau) if eff_tau > 0 else 0.001
@@ -85,7 +92,7 @@ class PairState:
         if now - self.dev_ts >= DEV_SAMPLE_DT:
             self.dev_ts = now
             if is_spike:
-                clamped_dev = math.copysign(min(abs(deviation), 4.0 * cur_sig), deviation)
+                clamped_dev = math.copysign(min(abs(deviation), (self.spike_sigma + 1.5) * cur_sig), deviation)
                 self.dev_window.append(clamped_dev)
             else:
                 self.dev_window.append(deviation)
@@ -126,6 +133,7 @@ class KoreanEngine:
         max_hold_sec: float = C.MAX_SIGNAL_HOLD_SEC,
         pool_state: Any = None,
         profile_manager: Any = None,
+        thresholds_file: Optional[str] = None,
     ):
         self.emit = emit_callback
         self.drain_threshold = drain_threshold
@@ -168,23 +176,49 @@ class KoreanEngine:
         }
 
         # Pair-specific calibrated execution thresholds
-        self.thresholds_file = os.path.join(C.PROJECT_ROOT, "matrix_thresholds.json")
+        self.thresholds_file = thresholds_file or os.path.join(C.PROJECT_ROOT, "matrix_thresholds.json")
         self._thresholds: Dict[str, Any] = {}
-        self.reload_thresholds()
+        self._last_thresh_check: float = 0.0
+        self._thresh_mtime: float = 0.0
+        self.reload_thresholds(force=True)
 
-    def reload_thresholds(self) -> None:
+    def reload_thresholds(self, force: bool = False) -> None:
         try:
             if os.path.exists(self.thresholds_file):
+                mtime = os.path.getmtime(self.thresholds_file)
+                if not force and mtime == self._thresh_mtime:
+                    return
                 with open(self.thresholds_file, "r", encoding="utf-8") as f:
                     doc = json.load(f)
                     self._thresholds = doc.get("thresholds", {})
+                self._thresh_mtime = mtime
                 log.info(f"[engine] Loaded {len(self._thresholds)} calibrated pair thresholds.")
+                # Update existing PairState instances with latest spike_sigma
+                for (coin, f_ex), st in self._pairs.items():
+                    cfg = self.get_pair_threshold_config(coin, f_ex)
+                    st.spike_sigma = float(cfg.get("spike_sigma", 2.5))
         except Exception as e:
             log.warning(f"[engine] Failed to load {self.thresholds_file}: {e}")
+
+    def maybe_reload_thresholds(self, now: float) -> None:
+        if now - self._last_thresh_check >= 30.0:
+            self._last_thresh_check = now
+            self.reload_thresholds()
 
     def get_pair_threshold_config(self, coin: str, follower_ex: str) -> Dict[str, Any]:
         pk = f"{coin.upper()}:upbit-{follower_ex.lower()}"
         return self._thresholds.get(pk, {})
+
+    def _get_or_create_pair_state(self, coin: str, follower_ex: str) -> PairState:
+        pair_key = (coin, follower_ex)
+        st = self._pairs.get(pair_key)
+        if st is None:
+            cfg = self.get_pair_threshold_config(coin, follower_ex)
+            sp_sig = float(cfg.get("spike_sigma", 2.5))
+            st = self._pairs[pair_key] = PairState(
+                coin, follower_ex, self.warmup_samples, spike_sigma=sp_sig
+            )
+        return st
 
     def on_book_update(self, snap: OrderBookDepth5) -> None:
         now = time.time()
@@ -205,10 +239,7 @@ class KoreanEngine:
             self.counters["ticks_followers"] += 1
             upbit_snap = self._books.get(("upbit", coin))
             if upbit_snap is not None and (now - self._recv_ts.get(("upbit", coin), 0.0)) <= 2.0:
-                pair_key = (coin, ex)
-                st = self._pairs.get(pair_key)
-                if st is None:
-                    st = self._pairs[pair_key] = PairState(coin, ex, self.warmup_samples)
+                st = self._get_or_create_pair_state(coin, ex)
                 if upbit_snap.mid_price > 0 and snap.mid_price > 0:
                     raw_diff_bps = (upbit_snap.mid_price - snap.mid_price) / snap.mid_price * 1e4
                     st.learn(raw_diff_bps, now)
@@ -310,10 +341,7 @@ class KoreanEngine:
             if f_snap is None or (now - f_recv) > 2.0:
                 continue
 
-            pair_key = (coin, follower_ex)
-            st = self._pairs.get(pair_key)
-            if st is None:
-                st = self._pairs[pair_key] = PairState(coin, follower_ex, self.warmup_samples)
+            st = self._get_or_create_pair_state(coin, follower_ex)
 
             upbit_mid = upbit_snap.mid_price
             f_mid = f_snap.mid_price
@@ -373,21 +401,25 @@ class KoreanEngine:
             return
 
         dev_z = dislocation_bps / max(sigma, 1.5)
-        if dev_z < 1.8:
-            return
-
-        f_ask_diff_bps = (upbit_mid - f_ask) / f_ask * 1e4
-        gross_exec_edge_bps = f_ask_diff_bps - st.baseline_bps
-        net_edge = gross_exec_edge_bps - self.taker_fee_bps
 
         # Check pair-specific calibrated threshold
         pair_cfg = self.get_pair_threshold_config(coin, follower_ex)
         if not pair_cfg.get("enabled", True):
             return  # Pruned pair due to negative EV or high adverse flow
 
+        min_dev_z = float(pair_cfg.get("min_dev_z", 1.8))
+        if dev_z < min_dev_z:
+            return
+
+        f_ask_diff_bps = (upbit_mid - f_ask) / f_ask * 1e4
+        gross_exec_edge_bps = f_ask_diff_bps - st.baseline_bps
+        net_edge = gross_exec_edge_bps - self.taker_fee_bps
+
         req_edge = float(pair_cfg.get("min_spread_bps", self.min_edge_bps))
         if net_edge < req_edge:
             return
+
+        pair_hold_sec = float(pair_cfg.get("max_hold_sec", self.max_hold_sec))
 
         if f_snap.spread_bps >= gross_exec_edge_bps * 0.8:
             return
@@ -456,6 +488,7 @@ class KoreanEngine:
             suggested_size_usd=round(suggested_size_usd, 2),
             basket=basket,
             is_actionable=is_actionable,
+            max_hold_sec=pair_hold_sec,
             mfe_exec_pnl_bps=init_net_pnl_bps,
             mae_exec_pnl_bps=init_net_pnl_bps,
             mfe_mid_move_bps=0.0,
@@ -537,6 +570,7 @@ class KoreanEngine:
                 ])
 
             # Closure evaluation:
+            hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
             if f_mid_move >= (sig.net_exec_edge_bps * 0.8):
                 self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
             elif rem_edge <= 0.0:
@@ -544,7 +578,7 @@ class KoreanEngine:
                     self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
                 else:
                     self._close_signal(sig, now, "reversed", f_mid_move, f_exec_move)
-            elif dt >= self.max_hold_sec:
+            elif dt >= hold_sec:
                 self._close_signal(sig, now, "timeout", f_mid_move, f_exec_move)
 
     def _close_signal(
@@ -585,9 +619,11 @@ class KoreanEngine:
         Sweeps and closes any active signals that exceeded max_hold_sec even if no new ticks arrived.
         Prevents open signals from lingering on illiquid or inactive coins.
         """
+        self.maybe_reload_thresholds(now)
         for coin, signals in list(self._active_signals.items()):
             for sig in list(signals):
-                if not sig.closed and (now - sig.open_ts) >= self.max_hold_sec:
+                hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
+                if not sig.closed and (now - sig.open_ts) >= hold_sec:
                     f_snap = self._books.get((sig.follower_exchange, coin))
                     if f_snap:
                         f_mid_move = (f_snap.mid_price - sig.follower_mid) / sig.follower_mid * 1e4

@@ -564,10 +564,17 @@ def _base(symbol: str) -> str:
 class PairState:
     """State of an (Upbit, Follower) pair for a single coin."""
 
-    def __init__(self, coin: str, follower_ex: str, warmup_samples: int = C.MIN_WARMUP_SAMPLES):
+    def __init__(
+        self,
+        coin: str,
+        follower_ex: str,
+        warmup_samples: int = C.MIN_WARMUP_SAMPLES,
+        spike_sigma: float = 2.5,
+    ):
         self.coin = coin
         self.follower_ex = follower_ex
         self.warmup_samples = warmup_samples
+        self.spike_sigma = spike_sigma
 
         # Rolling cross-venue basis baseline (bps): (Mid_Upbit - Mid_Follower) / Mid_Follower * 10000
         self.baseline_bps: float = 0.0
@@ -599,10 +606,10 @@ class PairState:
         self.t_last = now
         deviation = raw_diff_bps - self.baseline_bps
 
-        # Spike gating: if a massive pump/dislocation is currently happening (> 2.5 sigma),
+        # Spike gating: if a massive pump/dislocation is currently happening (> spike_sigma),
         # slow down baseline adaptation by 20x so the baseline doesn't chase the pump.
         cur_sig = self.sigma(now)
-        is_spike = self.is_warmed_up and abs(deviation) > (2.5 * cur_sig)
+        is_spike = self.is_warmed_up and abs(deviation) > (self.spike_sigma * cur_sig)
         eff_tau = BASELINE_TAU * 20.0 if is_spike else BASELINE_TAU
 
         a = 1.0 - math.exp(-dt / eff_tau) if eff_tau > 0 else 0.001
@@ -612,7 +619,7 @@ class PairState:
         if now - self.dev_ts >= DEV_SAMPLE_DT:
             self.dev_ts = now
             if is_spike:
-                clamped_dev = math.copysign(min(abs(deviation), 4.0 * cur_sig), deviation)
+                clamped_dev = math.copysign(min(abs(deviation), (self.spike_sigma + 1.5) * cur_sig), deviation)
                 self.dev_window.append(clamped_dev)
             else:
                 self.dev_window.append(deviation)
@@ -653,6 +660,7 @@ class KoreanEngine:
         max_hold_sec: float = C.MAX_SIGNAL_HOLD_SEC,
         pool_state: Any = None,
         profile_manager: Any = None,
+        thresholds_file: Optional[str] = None,
     ):
         self.emit = emit_callback
         self.drain_threshold = drain_threshold
@@ -695,23 +703,49 @@ class KoreanEngine:
         }
 
         # Pair-specific calibrated execution thresholds
-        self.thresholds_file = os.path.join(C.PROJECT_ROOT, "matrix_thresholds.json")
+        self.thresholds_file = thresholds_file or os.path.join(C.PROJECT_ROOT, "matrix_thresholds.json")
         self._thresholds: Dict[str, Any] = {}
-        self.reload_thresholds()
+        self._last_thresh_check: float = 0.0
+        self._thresh_mtime: float = 0.0
+        self.reload_thresholds(force=True)
 
-    def reload_thresholds(self) -> None:
+    def reload_thresholds(self, force: bool = False) -> None:
         try:
             if os.path.exists(self.thresholds_file):
+                mtime = os.path.getmtime(self.thresholds_file)
+                if not force and mtime == self._thresh_mtime:
+                    return
                 with open(self.thresholds_file, "r", encoding="utf-8") as f:
                     doc = json.load(f)
                     self._thresholds = doc.get("thresholds", {})
+                self._thresh_mtime = mtime
                 log.info(f"[engine] Loaded {len(self._thresholds)} calibrated pair thresholds.")
+                # Update existing PairState instances with latest spike_sigma
+                for (coin, f_ex), st in self._pairs.items():
+                    cfg = self.get_pair_threshold_config(coin, f_ex)
+                    st.spike_sigma = float(cfg.get("spike_sigma", 2.5))
         except Exception as e:
             log.warning(f"[engine] Failed to load {self.thresholds_file}: {e}")
+
+    def maybe_reload_thresholds(self, now: float) -> None:
+        if now - self._last_thresh_check >= 30.0:
+            self._last_thresh_check = now
+            self.reload_thresholds()
 
     def get_pair_threshold_config(self, coin: str, follower_ex: str) -> Dict[str, Any]:
         pk = f"{coin.upper()}:upbit-{follower_ex.lower()}"
         return self._thresholds.get(pk, {})
+
+    def _get_or_create_pair_state(self, coin: str, follower_ex: str) -> PairState:
+        pair_key = (coin, follower_ex)
+        st = self._pairs.get(pair_key)
+        if st is None:
+            cfg = self.get_pair_threshold_config(coin, follower_ex)
+            sp_sig = float(cfg.get("spike_sigma", 2.5))
+            st = self._pairs[pair_key] = PairState(
+                coin, follower_ex, self.warmup_samples, spike_sigma=sp_sig
+            )
+        return st
 
     def on_book_update(self, snap: OrderBookDepth5) -> None:
         now = time.time()
@@ -732,10 +766,7 @@ class KoreanEngine:
             self.counters["ticks_followers"] += 1
             upbit_snap = self._books.get(("upbit", coin))
             if upbit_snap is not None and (now - self._recv_ts.get(("upbit", coin), 0.0)) <= 2.0:
-                pair_key = (coin, ex)
-                st = self._pairs.get(pair_key)
-                if st is None:
-                    st = self._pairs[pair_key] = PairState(coin, ex, self.warmup_samples)
+                st = self._get_or_create_pair_state(coin, ex)
                 if upbit_snap.mid_price > 0 and snap.mid_price > 0:
                     raw_diff_bps = (upbit_snap.mid_price - snap.mid_price) / snap.mid_price * 1e4
                     st.learn(raw_diff_bps, now)
@@ -837,10 +868,7 @@ class KoreanEngine:
             if f_snap is None or (now - f_recv) > 2.0:
                 continue
 
-            pair_key = (coin, follower_ex)
-            st = self._pairs.get(pair_key)
-            if st is None:
-                st = self._pairs[pair_key] = PairState(coin, follower_ex, self.warmup_samples)
+            st = self._get_or_create_pair_state(coin, follower_ex)
 
             upbit_mid = upbit_snap.mid_price
             f_mid = f_snap.mid_price
@@ -900,21 +928,25 @@ class KoreanEngine:
             return
 
         dev_z = dislocation_bps / max(sigma, 1.5)
-        if dev_z < 1.8:
-            return
-
-        f_ask_diff_bps = (upbit_mid - f_ask) / f_ask * 1e4
-        gross_exec_edge_bps = f_ask_diff_bps - st.baseline_bps
-        net_edge = gross_exec_edge_bps - self.taker_fee_bps
 
         # Check pair-specific calibrated threshold
         pair_cfg = self.get_pair_threshold_config(coin, follower_ex)
         if not pair_cfg.get("enabled", True):
             return  # Pruned pair due to negative EV or high adverse flow
 
+        min_dev_z = float(pair_cfg.get("min_dev_z", 1.8))
+        if dev_z < min_dev_z:
+            return
+
+        f_ask_diff_bps = (upbit_mid - f_ask) / f_ask * 1e4
+        gross_exec_edge_bps = f_ask_diff_bps - st.baseline_bps
+        net_edge = gross_exec_edge_bps - self.taker_fee_bps
+
         req_edge = float(pair_cfg.get("min_spread_bps", self.min_edge_bps))
         if net_edge < req_edge:
             return
+
+        pair_hold_sec = float(pair_cfg.get("max_hold_sec", self.max_hold_sec))
 
         if f_snap.spread_bps >= gross_exec_edge_bps * 0.8:
             return
@@ -983,6 +1015,7 @@ class KoreanEngine:
             suggested_size_usd=round(suggested_size_usd, 2),
             basket=basket,
             is_actionable=is_actionable,
+            max_hold_sec=pair_hold_sec,
             mfe_exec_pnl_bps=init_net_pnl_bps,
             mae_exec_pnl_bps=init_net_pnl_bps,
             mfe_mid_move_bps=0.0,
@@ -1064,6 +1097,7 @@ class KoreanEngine:
                 ])
 
             # Closure evaluation:
+            hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
             if f_mid_move >= (sig.net_exec_edge_bps * 0.8):
                 self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
             elif rem_edge <= 0.0:
@@ -1071,7 +1105,7 @@ class KoreanEngine:
                     self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
                 else:
                     self._close_signal(sig, now, "reversed", f_mid_move, f_exec_move)
-            elif dt >= self.max_hold_sec:
+            elif dt >= hold_sec:
                 self._close_signal(sig, now, "timeout", f_mid_move, f_exec_move)
 
     def _close_signal(
@@ -1112,9 +1146,11 @@ class KoreanEngine:
         Sweeps and closes any active signals that exceeded max_hold_sec even if no new ticks arrived.
         Prevents open signals from lingering on illiquid or inactive coins.
         """
+        self.maybe_reload_thresholds(now)
         for coin, signals in list(self._active_signals.items()):
             for sig in list(signals):
-                if not sig.closed and (now - sig.open_ts) >= self.max_hold_sec:
+                hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
+                if not sig.closed and (now - sig.open_ts) >= hold_sec:
                     f_snap = self._books.get((sig.follower_exchange, coin))
                     if f_snap:
                         f_mid_move = (f_snap.mid_price - sig.follower_mid) / sig.follower_mid * 1e4
@@ -1364,7 +1400,7 @@ if __name__ == "__main__":
 ```json
 {
   "metadata": {
-    "generated_at": "2026-10-18T14:09:54.010303+00:00",
+    "generated_at": "2026-10-18T15:16:52.640214+00:00",
     "days_analyzed": 7.0,
     "order_size_usd": 10.0,
     "roundtrip_fee_bps": 10.0,
@@ -1382,6 +1418,9 @@ if __name__ == "__main__":
   "thresholds": {
     "VVV:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1390,6 +1429,9 @@ if __name__ == "__main__":
     },
     "VVV:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1398,6 +1440,9 @@ if __name__ == "__main__":
     },
     "VVV:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1406,6 +1451,9 @@ if __name__ == "__main__":
     },
     "VVV:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1414,6 +1462,9 @@ if __name__ == "__main__":
     },
     "VVV:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1422,6 +1473,9 @@ if __name__ == "__main__":
     },
     "VVV:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1430,6 +1484,9 @@ if __name__ == "__main__":
     },
     "VVV:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1438,6 +1495,9 @@ if __name__ == "__main__":
     },
     "VVV:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1446,6 +1506,9 @@ if __name__ == "__main__":
     },
     "LIT:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1454,6 +1517,9 @@ if __name__ == "__main__":
     },
     "LIT:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1462,6 +1528,9 @@ if __name__ == "__main__":
     },
     "LIT:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1470,6 +1539,9 @@ if __name__ == "__main__":
     },
     "LIT:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1478,6 +1550,9 @@ if __name__ == "__main__":
     },
     "LIT:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1486,6 +1561,9 @@ if __name__ == "__main__":
     },
     "LIT:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1494,6 +1572,9 @@ if __name__ == "__main__":
     },
     "LIT:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1502,6 +1583,9 @@ if __name__ == "__main__":
     },
     "ICP:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1510,6 +1594,9 @@ if __name__ == "__main__":
     },
     "ICP:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1518,6 +1605,9 @@ if __name__ == "__main__":
     },
     "ICP:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1526,6 +1616,9 @@ if __name__ == "__main__":
     },
     "ICP:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1534,6 +1627,9 @@ if __name__ == "__main__":
     },
     "ICP:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1542,6 +1638,9 @@ if __name__ == "__main__":
     },
     "ICP:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1550,6 +1649,9 @@ if __name__ == "__main__":
     },
     "ICP:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1558,6 +1660,9 @@ if __name__ == "__main__":
     },
     "ICP:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1566,6 +1671,9 @@ if __name__ == "__main__":
     },
     "ETHFI:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1574,6 +1682,9 @@ if __name__ == "__main__":
     },
     "ETHFI:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1582,6 +1693,9 @@ if __name__ == "__main__":
     },
     "ETHFI:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1590,6 +1704,9 @@ if __name__ == "__main__":
     },
     "ETHFI:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1598,6 +1715,9 @@ if __name__ == "__main__":
     },
     "ETHFI:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1606,6 +1726,9 @@ if __name__ == "__main__":
     },
     "ETHFI:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1614,6 +1737,9 @@ if __name__ == "__main__":
     },
     "ETHFI:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1622,6 +1748,9 @@ if __name__ == "__main__":
     },
     "RAY:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1630,6 +1759,9 @@ if __name__ == "__main__":
     },
     "RAY:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1638,6 +1770,9 @@ if __name__ == "__main__":
     },
     "RAY:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1646,6 +1781,9 @@ if __name__ == "__main__":
     },
     "RAY:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1654,6 +1792,9 @@ if __name__ == "__main__":
     },
     "RAY:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1662,6 +1803,9 @@ if __name__ == "__main__":
     },
     "RAY:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1670,6 +1814,9 @@ if __name__ == "__main__":
     },
     "PROM:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1678,6 +1825,9 @@ if __name__ == "__main__":
     },
     "PROM:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1686,6 +1836,9 @@ if __name__ == "__main__":
     },
     "PROM:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1694,6 +1847,9 @@ if __name__ == "__main__":
     },
     "PROM:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1702,6 +1858,9 @@ if __name__ == "__main__":
     },
     "PROM:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1710,6 +1869,9 @@ if __name__ == "__main__":
     },
     "AXL:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1718,6 +1880,9 @@ if __name__ == "__main__":
     },
     "AXL:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1726,6 +1891,9 @@ if __name__ == "__main__":
     },
     "AXL:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1734,6 +1902,9 @@ if __name__ == "__main__":
     },
     "AXL:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1742,6 +1913,9 @@ if __name__ == "__main__":
     },
     "AXL:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1750,6 +1924,9 @@ if __name__ == "__main__":
     },
     "TRUMP:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1758,6 +1935,9 @@ if __name__ == "__main__":
     },
     "TRUMP:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1766,6 +1946,9 @@ if __name__ == "__main__":
     },
     "TRUMP:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1774,6 +1957,9 @@ if __name__ == "__main__":
     },
     "WLD:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1782,6 +1968,9 @@ if __name__ == "__main__":
     },
     "WLD:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1790,6 +1979,9 @@ if __name__ == "__main__":
     },
     "WLD:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1798,6 +1990,9 @@ if __name__ == "__main__":
     },
     "WLD:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1806,6 +2001,9 @@ if __name__ == "__main__":
     },
     "WLD:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1814,6 +2012,9 @@ if __name__ == "__main__":
     },
     "WLD:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1822,6 +2023,9 @@ if __name__ == "__main__":
     },
     "WLD:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1830,6 +2034,9 @@ if __name__ == "__main__":
     },
     "WLD:upbit-htx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1838,6 +2045,9 @@ if __name__ == "__main__":
     },
     "WLD:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1846,6 +2056,9 @@ if __name__ == "__main__":
     },
     "ELSA:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1854,6 +2067,9 @@ if __name__ == "__main__":
     },
     "ELSA:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1862,6 +2078,9 @@ if __name__ == "__main__":
     },
     "ELSA:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1870,6 +2089,9 @@ if __name__ == "__main__":
     },
     "ELSA:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1878,6 +2100,9 @@ if __name__ == "__main__":
     },
     "ELSA:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1886,6 +2111,9 @@ if __name__ == "__main__":
     },
     "ELSA:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1894,6 +2122,9 @@ if __name__ == "__main__":
     },
     "SPX:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1902,6 +2133,9 @@ if __name__ == "__main__":
     },
     "SPX:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1910,6 +2144,9 @@ if __name__ == "__main__":
     },
     "SPX:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1918,6 +2155,9 @@ if __name__ == "__main__":
     },
     "SPX:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1926,6 +2166,9 @@ if __name__ == "__main__":
     },
     "SPX:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1934,6 +2177,9 @@ if __name__ == "__main__":
     },
     "SPX:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1942,6 +2188,9 @@ if __name__ == "__main__":
     },
     "SPX:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1950,6 +2199,9 @@ if __name__ == "__main__":
     },
     "SPX:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1958,6 +2210,9 @@ if __name__ == "__main__":
     },
     "SOMI:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1966,6 +2221,9 @@ if __name__ == "__main__":
     },
     "SOMI:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1974,6 +2232,9 @@ if __name__ == "__main__":
     },
     "SOMI:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1982,6 +2243,9 @@ if __name__ == "__main__":
     },
     "SOMI:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1990,6 +2254,9 @@ if __name__ == "__main__":
     },
     "GRT:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1998,6 +2265,9 @@ if __name__ == "__main__":
     },
     "GRT:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2006,6 +2276,9 @@ if __name__ == "__main__":
     },
     "GRT:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2014,6 +2287,9 @@ if __name__ == "__main__":
     },
     "GRT:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2022,6 +2298,9 @@ if __name__ == "__main__":
     },
     "EUL:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2030,6 +2309,9 @@ if __name__ == "__main__":
     },
     "ZRO:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2038,6 +2320,9 @@ if __name__ == "__main__":
     },
     "ZRO:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2046,6 +2331,9 @@ if __name__ == "__main__":
     },
     "ZRO:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2054,6 +2342,9 @@ if __name__ == "__main__":
     },
     "ZRO:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2062,6 +2353,9 @@ if __name__ == "__main__":
     },
     "ZRO:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2070,6 +2364,9 @@ if __name__ == "__main__":
     },
     "ZRO:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2078,6 +2375,9 @@ if __name__ == "__main__":
     },
     "ZRO:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2086,6 +2386,9 @@ if __name__ == "__main__":
     },
     "ZRO:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2094,6 +2397,9 @@ if __name__ == "__main__":
     },
     "ZORA:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2102,6 +2408,9 @@ if __name__ == "__main__":
     },
     "ZORA:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2110,6 +2419,9 @@ if __name__ == "__main__":
     },
     "ZORA:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2118,6 +2430,9 @@ if __name__ == "__main__":
     },
     "ZORA:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2126,6 +2441,9 @@ if __name__ == "__main__":
     },
     "ZORA:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2134,6 +2452,9 @@ if __name__ == "__main__":
     },
     "ZORA:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2142,6 +2463,9 @@ if __name__ == "__main__":
     },
     "CAP:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2150,6 +2474,9 @@ if __name__ == "__main__":
     },
     "CAP:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2158,6 +2485,9 @@ if __name__ == "__main__":
     },
     "CAP:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2166,6 +2496,9 @@ if __name__ == "__main__":
     },
     "CAP:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2174,6 +2507,9 @@ if __name__ == "__main__":
     },
     "CAP:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2182,6 +2518,9 @@ if __name__ == "__main__":
     },
     "CAP:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2190,6 +2529,9 @@ if __name__ == "__main__":
     },
     "CAP:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2198,6 +2540,9 @@ if __name__ == "__main__":
     },
     "PIEVERSE:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2206,6 +2551,9 @@ if __name__ == "__main__":
     },
     "PIEVERSE:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2214,6 +2562,9 @@ if __name__ == "__main__":
     },
     "PIEVERSE:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2222,6 +2573,9 @@ if __name__ == "__main__":
     },
     "PIEVERSE:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2230,6 +2584,9 @@ if __name__ == "__main__":
     },
     "PIEVERSE:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2238,6 +2595,9 @@ if __name__ == "__main__":
     },
     "PIEVERSE:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2246,6 +2606,9 @@ if __name__ == "__main__":
     },
     "PIEVERSE:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2254,6 +2617,9 @@ if __name__ == "__main__":
     },
     "WCT:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2262,6 +2628,9 @@ if __name__ == "__main__":
     },
     "WCT:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2270,6 +2639,9 @@ if __name__ == "__main__":
     },
     "WCT:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2278,6 +2650,9 @@ if __name__ == "__main__":
     },
     "WCT:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2286,6 +2661,9 @@ if __name__ == "__main__":
     },
     "WCT:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2294,6 +2672,9 @@ if __name__ == "__main__":
     },
     "PROS:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2302,6 +2683,9 @@ if __name__ == "__main__":
     },
     "PROS:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2310,6 +2694,9 @@ if __name__ == "__main__":
     },
     "ENSO:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2318,6 +2705,9 @@ if __name__ == "__main__":
     },
     "ENSO:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2326,6 +2716,9 @@ if __name__ == "__main__":
     },
     "ENSO:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2334,6 +2727,9 @@ if __name__ == "__main__":
     },
     "ENSO:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2342,6 +2738,9 @@ if __name__ == "__main__":
     },
     "ENSO:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2350,6 +2749,9 @@ if __name__ == "__main__":
     },
     "BREV:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2358,6 +2760,9 @@ if __name__ == "__main__":
     },
     "BREV:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2366,6 +2771,9 @@ if __name__ == "__main__":
     },
     "BREV:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2374,6 +2782,9 @@ if __name__ == "__main__":
     },
     "BREV:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2382,6 +2793,9 @@ if __name__ == "__main__":
     },
     "BREV:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2390,6 +2804,9 @@ if __name__ == "__main__":
     },
     "ESP:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2398,6 +2815,9 @@ if __name__ == "__main__":
     },
     "ESP:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2406,6 +2826,9 @@ if __name__ == "__main__":
     },
     "NEAR:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2414,6 +2837,9 @@ if __name__ == "__main__":
     },
     "NEAR:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2422,6 +2848,9 @@ if __name__ == "__main__":
     },
     "NEAR:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2430,6 +2859,9 @@ if __name__ == "__main__":
     },
     "NEAR:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2438,6 +2870,9 @@ if __name__ == "__main__":
     },
     "NEAR:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2446,6 +2881,9 @@ if __name__ == "__main__":
     },
     "NEAR:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2454,6 +2892,9 @@ if __name__ == "__main__":
     },
     "NEAR:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2462,6 +2903,9 @@ if __name__ == "__main__":
     },
     "NEAR:upbit-htx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2470,6 +2914,9 @@ if __name__ == "__main__":
     },
     "NEAR:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2478,6 +2925,9 @@ if __name__ == "__main__":
     },
     "VET:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2486,6 +2936,9 @@ if __name__ == "__main__":
     },
     "VET:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2494,6 +2947,9 @@ if __name__ == "__main__":
     },
     "VET:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2502,6 +2958,9 @@ if __name__ == "__main__":
     },
     "VET:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2510,6 +2969,9 @@ if __name__ == "__main__":
     },
     "VET:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2518,6 +2980,9 @@ if __name__ == "__main__":
     },
     "KMNO:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2526,6 +2991,9 @@ if __name__ == "__main__":
     },
     "KMNO:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2534,6 +3002,9 @@ if __name__ == "__main__":
     },
     "KMNO:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2542,6 +3013,9 @@ if __name__ == "__main__":
     },
     "KMNO:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2550,6 +3024,9 @@ if __name__ == "__main__":
     },
     "KMNO:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2558,6 +3035,9 @@ if __name__ == "__main__":
     },
     "GTC:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2566,6 +3046,9 @@ if __name__ == "__main__":
     },
     "GTC:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2574,6 +3057,9 @@ if __name__ == "__main__":
     },
     "B3:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2582,6 +3068,9 @@ if __name__ == "__main__":
     },
     "B3:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2590,6 +3079,9 @@ if __name__ == "__main__":
     },
     "CYBER:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2598,6 +3090,9 @@ if __name__ == "__main__":
     },
     "CYBER:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2606,6 +3101,9 @@ if __name__ == "__main__":
     },
     "CYBER:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2614,6 +3112,9 @@ if __name__ == "__main__":
     },
     "CYBER:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2622,6 +3123,9 @@ if __name__ == "__main__":
     },
     "HYPER:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2630,6 +3134,9 @@ if __name__ == "__main__":
     },
     "HYPER:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2638,6 +3145,9 @@ if __name__ == "__main__":
     },
     "HYPER:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2646,6 +3156,9 @@ if __name__ == "__main__":
     },
     "SENT:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2654,6 +3167,9 @@ if __name__ == "__main__":
     },
     "AWE:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2662,6 +3178,9 @@ if __name__ == "__main__":
     },
     "AWE:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2670,6 +3189,9 @@ if __name__ == "__main__":
     },
     "AWE:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2678,6 +3200,9 @@ if __name__ == "__main__":
     },
     "AWE:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2686,6 +3211,9 @@ if __name__ == "__main__":
     },
     "ZKC:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2694,6 +3222,9 @@ if __name__ == "__main__":
     },
     "ZKC:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2702,6 +3233,9 @@ if __name__ == "__main__":
     },
     "ZKC:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2710,6 +3244,9 @@ if __name__ == "__main__":
     },
     "ZKC:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2718,6 +3255,9 @@ if __name__ == "__main__":
     },
     "ZKP:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2726,6 +3266,9 @@ if __name__ == "__main__":
     },
     "ZKP:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2734,6 +3277,9 @@ if __name__ == "__main__":
     },
     "ZKP:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2742,6 +3288,9 @@ if __name__ == "__main__":
     },
     "ZKP:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2750,6 +3299,9 @@ if __name__ == "__main__":
     },
     "ZKP:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2758,6 +3310,9 @@ if __name__ == "__main__":
     },
     "ZKP:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2766,6 +3321,9 @@ if __name__ == "__main__":
     },
     "NEO:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2774,6 +3332,9 @@ if __name__ == "__main__":
     },
     "NEO:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2782,6 +3343,9 @@ if __name__ == "__main__":
     },
     "NEO:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2790,6 +3354,9 @@ if __name__ == "__main__":
     },
     "NEO:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2798,6 +3365,9 @@ if __name__ == "__main__":
     },
     "IO:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2806,6 +3376,9 @@ if __name__ == "__main__":
     },
     "IO:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2814,6 +3387,9 @@ if __name__ == "__main__":
     },
     "IO:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2822,6 +3398,9 @@ if __name__ == "__main__":
     },
     "INJ:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2830,6 +3409,9 @@ if __name__ == "__main__":
     },
     "INJ:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2838,6 +3420,9 @@ if __name__ == "__main__":
     },
     "INJ:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2846,6 +3431,9 @@ if __name__ == "__main__":
     },
     "INJ:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2854,6 +3442,9 @@ if __name__ == "__main__":
     },
     "INJ:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2862,6 +3453,9 @@ if __name__ == "__main__":
     },
     "INJ:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2870,6 +3464,9 @@ if __name__ == "__main__":
     },
     "SKR:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2878,6 +3475,9 @@ if __name__ == "__main__":
     },
     "SKR:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2886,6 +3486,9 @@ if __name__ == "__main__":
     },
     "SKR:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2894,6 +3497,9 @@ if __name__ == "__main__":
     },
     "SKR:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2902,6 +3508,9 @@ if __name__ == "__main__":
     },
     "CARV:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2910,6 +3519,9 @@ if __name__ == "__main__":
     },
     "CARV:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2918,6 +3530,9 @@ if __name__ == "__main__":
     },
     "CARV:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2926,6 +3541,9 @@ if __name__ == "__main__":
     },
     "CARV:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2934,6 +3552,9 @@ if __name__ == "__main__":
     },
     "ERA:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2942,6 +3563,9 @@ if __name__ == "__main__":
     },
     "ERA:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2950,6 +3574,9 @@ if __name__ == "__main__":
     },
     "ERA:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2958,6 +3585,9 @@ if __name__ == "__main__":
     },
     "ERA:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2966,6 +3596,9 @@ if __name__ == "__main__":
     },
     "ERA:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2974,6 +3607,9 @@ if __name__ == "__main__":
     },
     "SEI:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2982,6 +3618,9 @@ if __name__ == "__main__":
     },
     "SEI:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2990,6 +3629,9 @@ if __name__ == "__main__":
     },
     "SEI:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2998,6 +3640,9 @@ if __name__ == "__main__":
     },
     "SEI:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3006,6 +3651,9 @@ if __name__ == "__main__":
     },
     "SEI:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3014,6 +3662,9 @@ if __name__ == "__main__":
     },
     "SEI:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3022,6 +3673,9 @@ if __name__ == "__main__":
     },
     "ARX:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3030,6 +3684,9 @@ if __name__ == "__main__":
     },
     "MMT:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3038,6 +3695,9 @@ if __name__ == "__main__":
     },
     "MNT:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3046,6 +3706,9 @@ if __name__ == "__main__":
     },
     "MNT:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3054,6 +3717,9 @@ if __name__ == "__main__":
     },
     "PONS:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3062,6 +3728,9 @@ if __name__ == "__main__":
     },
     "PONS:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3070,6 +3739,9 @@ if __name__ == "__main__":
     },
     "PONS:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3078,6 +3750,9 @@ if __name__ == "__main__":
     },
     "API3:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3086,6 +3761,9 @@ if __name__ == "__main__":
     },
     "API3:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3094,6 +3772,9 @@ if __name__ == "__main__":
     },
     "ENS:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3102,6 +3783,9 @@ if __name__ == "__main__":
     },
     "ENS:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3110,6 +3794,9 @@ if __name__ == "__main__":
     },
     "ENS:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3118,6 +3805,9 @@ if __name__ == "__main__":
     },
     "ENS:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3126,6 +3816,9 @@ if __name__ == "__main__":
     },
     "IOTA:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3134,6 +3827,9 @@ if __name__ == "__main__":
     },
     "IOTA:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3142,6 +3838,9 @@ if __name__ == "__main__":
     },
     "O:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3150,6 +3849,9 @@ if __name__ == "__main__":
     },
     "O:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3158,6 +3860,9 @@ if __name__ == "__main__":
     },
     "O:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3166,6 +3871,9 @@ if __name__ == "__main__":
     },
     "O:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3174,6 +3882,9 @@ if __name__ == "__main__":
     },
     "O:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3182,6 +3893,9 @@ if __name__ == "__main__":
     },
     "BCH:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3190,6 +3904,9 @@ if __name__ == "__main__":
     },
     "BCH:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3198,6 +3915,9 @@ if __name__ == "__main__":
     },
     "BCH:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3206,6 +3926,9 @@ if __name__ == "__main__":
     },
     "BCH:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3214,6 +3937,9 @@ if __name__ == "__main__":
     },
     "BCH:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3222,6 +3948,9 @@ if __name__ == "__main__":
     },
     "BEAM:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3230,6 +3959,9 @@ if __name__ == "__main__":
     },
     "BAT:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3238,6 +3970,9 @@ if __name__ == "__main__":
     },
     "BAT:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3246,6 +3981,9 @@ if __name__ == "__main__":
     },
     "BAT:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3254,6 +3992,9 @@ if __name__ == "__main__":
     },
     "BAT:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3262,6 +4003,9 @@ if __name__ == "__main__":
     },
     "BAT:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3270,6 +4014,9 @@ if __name__ == "__main__":
     },
     "BAT:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3278,6 +4025,9 @@ if __name__ == "__main__":
     },
     "BAT:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3286,6 +4036,9 @@ if __name__ == "__main__":
     },
     "PUMP:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3294,6 +4047,9 @@ if __name__ == "__main__":
     },
     "PUMP:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3302,6 +4058,9 @@ if __name__ == "__main__":
     },
     "PUMP:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3310,6 +4069,9 @@ if __name__ == "__main__":
     },
     "DOS:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3318,6 +4080,9 @@ if __name__ == "__main__":
     },
     "DOS:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3326,6 +4091,9 @@ if __name__ == "__main__":
     },
     "DOS:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3334,6 +4102,9 @@ if __name__ == "__main__":
     },
     "RENDER:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3342,6 +4113,9 @@ if __name__ == "__main__":
     },
     "RENDER:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3350,6 +4124,9 @@ if __name__ == "__main__":
     },
     "APT:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3358,6 +4135,9 @@ if __name__ == "__main__":
     },
     "APT:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3366,6 +4146,9 @@ if __name__ == "__main__":
     },
     "APT:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3374,6 +4157,9 @@ if __name__ == "__main__":
     },
     "APT:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3382,6 +4168,9 @@ if __name__ == "__main__":
     },
     "APT:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3390,6 +4179,9 @@ if __name__ == "__main__":
     },
     "APT:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3398,6 +4190,9 @@ if __name__ == "__main__":
     },
     "APT:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3406,6 +4201,9 @@ if __name__ == "__main__":
     },
     "APT:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3414,6 +4212,9 @@ if __name__ == "__main__":
     },
     "2Z:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3422,6 +4223,9 @@ if __name__ == "__main__":
     },
     "F:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3430,6 +4234,9 @@ if __name__ == "__main__":
     },
     "BIO:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3438,6 +4245,9 @@ if __name__ == "__main__":
     },
     "BIO:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3446,6 +4256,9 @@ if __name__ == "__main__":
     },
     "BIO:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3454,6 +4267,9 @@ if __name__ == "__main__":
     },
     "BIO:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3462,6 +4278,9 @@ if __name__ == "__main__":
     },
     "NMR:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3470,6 +4289,9 @@ if __name__ == "__main__":
     },
     "MANA:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3478,6 +4300,9 @@ if __name__ == "__main__":
     },
     "VTHO:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3486,6 +4311,9 @@ if __name__ == "__main__":
     },
     "VTHO:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3494,6 +4322,9 @@ if __name__ == "__main__":
     },
     "MOODENG:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3502,6 +4333,9 @@ if __name__ == "__main__":
     },
     "ATOM:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3510,6 +4344,9 @@ if __name__ == "__main__":
     },
     "ATOM:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3518,6 +4355,9 @@ if __name__ == "__main__":
     },
     "ATOM:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3526,6 +4366,9 @@ if __name__ == "__main__":
     },
     "BIGTIME:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -3677,6 +4520,7 @@ class SunriseSignal:
     # Pool routing
     basket: str = "incubator"
     is_actionable: bool = False
+    max_hold_sec: float = 6.0
 
     # Outcome & Excursion tracking
     closed: bool = False
@@ -4248,6 +5092,61 @@ class PoolStateManager:
             _write_json_atomic(self._overrides_file, overrides)
             self._overrides = overrides
             log.info(f"[pool_state] Resumed coin: {coin}")
+            return True
+
+    def promote_coin_manual(
+        self,
+        coin: str,
+        mean_net_pnl_bps: float = 25.0,
+        top3_depth_usd: float = 500.0,
+        win_rate_pct: float = 85.0,
+        profit_factor: float = 2.0,
+    ) -> bool:
+        """Manually promotes a single coin to the Battle pool."""
+        with self._lock:
+            coin = coin.upper()
+            entry = self._coins.get(coin)
+            if entry is None:
+                entry = CoinEntry(coin=coin, venues=["binance", "bybit"])
+                self._coins[coin] = entry
+
+            entry.basket = "battle"
+            entry.enabled = True
+            entry.pause_reason = None
+            if entry.top3_depth_usd <= 0:
+                entry.top3_depth_usd = top3_depth_usd
+            if entry.mean_net_pnl_bps <= 0:
+                entry.mean_net_pnl_bps = mean_net_pnl_bps
+                entry.median_net_pnl_bps = mean_net_pnl_bps
+            if entry.win_rate_pct <= 0:
+                entry.win_rate_pct = win_rate_pct
+            if entry.profit_factor <= 0:
+                entry.profit_factor = profit_factor
+            entry.promoted_at = time.time()
+
+            # Remove from paused_coins if it was paused
+            overrides = _read_json(self._overrides_file, default={})
+            paused = overrides.get("paused_coins", {})
+            if coin in paused:
+                paused.pop(coin, None)
+                overrides["paused_coins"] = paused
+                _write_json_atomic(self._overrides_file, overrides)
+                self._overrides = overrides
+
+            self._persist_battle_pool()
+            log.info(f"[pool_state] Manually promoted {coin} to Battle pool")
+            return True
+
+    def demote_to_incubator(self, coin: str, reason: str = "manual_demote") -> bool:
+        """Demotes a single coin from Battle back to Incubator."""
+        with self._lock:
+            coin = coin.upper()
+            entry = self._coins.get(coin)
+            if not entry:
+                return False
+            entry.basket = "incubator"
+            self._persist_battle_pool()
+            log.info(f"[pool_state] Demoted {coin} to Incubator (reason={reason})")
             return True
 
     def promote_to_battle(self, qualifying_stats: List[Dict[str, Any]]) -> None:
@@ -5561,6 +6460,138 @@ class TestPipelineE2E(unittest.TestCase):
         self.assertTrue(engine.pool_state.is_battle_coin("SOL"))
         self.assertFalse(engine.pool_state.is_battle_coin("DOGE"))
 
+        # Test full tick-to-signal pipeline via BaseVenueStream._sanitise -> KoreanEngine
+        from venues.base import BaseVenueStream
+        emitted = []
+        engine.emit = lambda sig_dict: emitted.append(sig_dict)
+        engine.warmup_samples = 2
+
+        stream = BaseVenueStream("upbit", ["SOL"], engine.on_book_update)
+        now = 1792300000.0
+
+        # 1. Feed normal warmup ticks on Upbit and Binance
+        for i in range(12):
+            f_snap = OrderBookDepth5(
+                exchange="binance",
+                symbol="SOL",
+                raw_symbol="SOLUSDT",
+                ts=now + i,
+                exchange_ts=int((now + i) * 1000),
+                bids=[(100.00, 10.0), (99.95, 20.0), (99.90, 30.0)],
+                asks=[(100.05, 10.0), (100.10, 20.0), (100.15, 30.0)],
+            )
+            u_snap = OrderBookDepth5(
+                exchange="upbit",
+                symbol="SOL",
+                raw_symbol="KRW-SOL",
+                ts=now + i,
+                exchange_ts=int((now + i) * 1000),
+                bids=[(100.00, 10.0), (99.95, 20.0), (99.90, 30.0)],
+                asks=[(100.05, 10.0), (100.10, 20.0), (100.15, 30.0)],
+            )
+            stream._sanitise(f_snap)
+            stream._sanitise(u_snap)
+
+        self.assertEqual(stream.books_dropped, 0)
+        self.assertEqual(stream.levels_dropped, 0)
+        self.assertGreaterEqual(engine.counters["ticks_upbit"], 12)
+        self.assertGreaterEqual(engine.counters["ticks_followers"], 12)
+
+    def test_dynamic_thresholds_hold_sec_and_spike_gating(self):
+        # Create a mock matrix_thresholds.json with custom hold_sec and spike_sigma
+        thresh_file = os.path.join(self.test_dir, "matrix_thresholds.json")
+        matrix_data = {
+            "metadata": {"total_pairs_configured": 1},
+            "thresholds": {
+                "SOL:upbit-binance": {
+                    "min_spread_bps": 15.0,
+                    "max_hold_sec": 3.2,
+                    "spike_sigma": 3.5,
+                    "min_dev_z": 1.7,
+                    "expected_winrate": 0.85,
+                    "expected_net_bps": 25.0,
+                    "sample_trades": 10,
+                    "status": "aggressive_clean",
+                    "enabled": True,
+                }
+            }
+        }
+        with open(thresh_file, "w", encoding="utf-8") as f:
+            json.dump(matrix_data, f)
+
+        emitted = []
+        engine = KoreanEngine(
+            emit_callback=lambda sig_dict: emitted.append(sig_dict),
+            thresholds_file=thresh_file,
+            max_hold_sec=6.0,
+        )
+
+        # 1. Verify PairState gets pair-specific spike_sigma
+        st = engine._get_or_create_pair_state("SOL", "binance")
+        self.assertEqual(st.spike_sigma, 3.5)
+
+        # 2. Simulate warmup so st is warmed up
+        now = 1792300000.0
+        for i in range(35):
+            st.learn(10.0, now + i)
+        self.assertTrue(st.is_warmed_up)
+
+        # 3. Simulate Upbit pump event triggering signal
+        upbit_snap = OrderBookDepth5(
+            exchange="upbit",
+            symbol="SOL",
+            raw_symbol="KRW-SOL",
+            ts=now + 50,
+            exchange_ts=int((now + 50) * 1000),
+            bids=[(105.00, 10.0), (104.95, 20.0)],
+            asks=[(105.05, 10.0), (105.10, 20.0)],
+        )
+        f_snap = OrderBookDepth5(
+            exchange="binance",
+            symbol="SOL",
+            raw_symbol="SOLUSDT",
+            ts=now + 50,
+            exchange_ts=int((now + 50) * 1000),
+            bids=[(100.00, 10.0), (99.95, 20.0)],
+            asks=[(100.05, 1000.0), (100.10, 2000.0)],
+        )
+        engine._books[("upbit", "SOL")] = upbit_snap
+        engine._recv_ts[("upbit", "SOL")] = now + 50
+        engine._books[("binance", "SOL")] = f_snap
+        engine._recv_ts[("binance", "SOL")] = now + 50
+
+        engine._check_entry(
+            coin="SOL",
+            follower_ex="binance",
+            st=st,
+            upbit_snap=upbit_snap,
+            f_snap=f_snap,
+            f_book_age_ms=10.0,
+            norm_depth=1000.0,
+            norm_spread=5.0,
+            swept_usd=5000.0,
+            trigger_type="depth_drain",
+            drain_ratio=0.8,
+            blowout_ratio=3.0,
+            now=now + 50,
+        )
+
+        self.assertIsNotNone(st.open_signal)
+        sig = st.open_signal
+        # Personalized max_hold_sec assigned!
+        self.assertEqual(sig.max_hold_sec, 3.2)
+
+        # 4. Sweep timeouts before 3.2s -> signal stays open
+        engine.sweep_timeouts(now + 50 + 2.0)
+        self.assertFalse(sig.closed)
+
+        # 5. Sweep timeouts at 3.3s -> signal closed by timeout
+        engine.sweep_timeouts(now + 50 + 3.3)
+        self.assertTrue(sig.closed)
+        self.assertEqual(sig.close_reason, "timeout")
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(emitted[0]["max_hold_sec"], 3.2)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -5928,6 +6959,7 @@ import glob
 import gzip
 import json
 import os
+import statistics
 import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -5946,6 +6978,34 @@ BATTLE_FILE = os.path.join(PROJECT_ROOT, "live_trading_pool.json")
 
 SWEEP_THRESHOLDS = (10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 60.0)
 DEFAULT_GLOBAL_FALLBACK_BPS = 20.0
+DEFAULT_GLOBAL_HOLD_SEC = 6.0
+DEFAULT_SPIKE_SIGMA = 2.5
+DEFAULT_MIN_DEV_Z = 1.8
+
+
+def _calc_optimal_hold(t_peaks: List[float], default_val: float = DEFAULT_GLOBAL_HOLD_SEC) -> float:
+    """Calculates personalized holding horizon: median(T_peak) + 1.5*MAD (clamped [1.5s, 12.0s])."""
+    if not t_peaks:
+        return default_val
+    med = statistics.median(t_peaks)
+    abs_dev = [abs(x - med) for x in t_peaks]
+    mad = statistics.median(abs_dev) if abs_dev else 0.5
+    raw_hold = med + 1.5 * (1.4826 * mad)
+    return round(max(1.5, min(12.0, raw_hold)), 1)
+
+
+def _calc_spike_and_dev_z(dev_zs: List[float]) -> Tuple[float, float]:
+    """Calculates personalized spike gating threshold P90(dev_z) and entry dev_z."""
+    if len(dev_zs) < 5:
+        return DEFAULT_SPIKE_SIGMA, DEFAULT_MIN_DEV_Z
+    s_z = sorted(dev_zs)
+    idx90 = int(0.90 * len(s_z))
+    p90 = s_z[min(idx90, len(s_z) - 1)]
+    spike_sigma = round(max(2.0, min(4.5, p90)), 2)
+    idx25 = int(0.25 * len(s_z))
+    p25 = s_z[min(idx25, len(s_z) - 1)]
+    min_dev_z = round(max(1.5, min(2.5, p25)), 2)
+    return spike_sigma, min_dev_z
 
 
 def _collect_signal_files(days_back: float = 7.0) -> List[str]:
@@ -5998,6 +7058,9 @@ def calibrate(
             for t in SWEEP_THRESHOLDS
         }
     )
+    pair_metrics: Dict[str, Dict[str, List[float]]] = collections.defaultdict(
+        lambda: {"t_peaks": [], "dev_zs": []}
+    )
 
     total_rows = 0
     valid_events = 0
@@ -6025,10 +7088,21 @@ def calibrate(
                         if net_pnl is None:
                             continue
                         net_pnl = float(net_pnl)
-                        gross_edge = float(d.get("gross_exec_edge_bps") or 0.0)
+                        gross_edge = float(
+                            d.get("gross_exec_edge_bps")
+                            or (float(d.get("net_exec_edge_bps", 0.0)) + roundtrip_fee_bps * 0.5)
+                        )
 
                         pair_key = f"{coin}:upbit-{follower_ex}"
                         valid_events += 1
+
+                        # Collect metrics for individual hold & spike calibration
+                        t_pk = d.get("time_to_peak_sec")
+                        if t_pk is not None and float(t_pk) > 0 and net_pnl > 0:
+                            pair_metrics[pair_key]["t_peaks"].append(float(t_pk))
+                        dz = d.get("dev_z")
+                        if dz is not None and float(dz) > 0:
+                            pair_metrics[pair_key]["dev_zs"].append(float(dz))
 
                         gross = pos_size * (gross_edge / 10000.0)
                         net = pos_size * (net_pnl / 10000.0)
@@ -6082,6 +7156,9 @@ def calibrate(
                 pk = f"{c}:upbit-{v}"
                 matrix_output[pk] = {
                     "min_spread_bps": DEFAULT_GLOBAL_FALLBACK_BPS,
+                    "max_hold_sec": DEFAULT_GLOBAL_HOLD_SEC,
+                    "spike_sigma": DEFAULT_SPIKE_SIGMA,
+                    "min_dev_z": DEFAULT_MIN_DEV_Z,
                     "expected_winrate": 0.85,
                     "expected_net_bps": 22.0,
                     "sample_trades": 0,
@@ -6136,9 +7213,18 @@ def calibrate(
                     status = "default_baseline"
                     enabled = True
 
+            # Calculate optimal hold horizon & spike gating per pair
+            t_peaks = pair_metrics[pair_key]["t_peaks"]
+            dev_zs = pair_metrics[pair_key]["dev_zs"]
+            opt_hold = _calc_optimal_hold(t_peaks, default_val=DEFAULT_GLOBAL_HOLD_SEC)
+            spike_sigma, min_dev_z = _calc_spike_and_dev_z(dev_zs)
+
             classification_counts[status] += 1
             matrix_output[pair_key] = {
                 "min_spread_bps": round(best_t, 1),
+                "max_hold_sec": opt_hold,
+                "spike_sigma": spike_sigma,
+                "min_dev_z": min_dev_z,
                 "expected_winrate": round(best_wr, 3),
                 "expected_net_bps": round((best_net / pos_size) * 10000.0 / max(1, best_cnt), 1) if best_cnt else 0.0,
                 "sample_trades": best_cnt,
@@ -6168,19 +7254,20 @@ def calibrate(
         _write_json_atomic(out_file, doc)
 
     if not as_json:
-        print("\n" + "=" * 80)
-        print("  KOREAN SUNRISE: AUTOMATED SPREAD THRESHOLD CALIBRATION MATRIX")
-        print("=" * 80)
+        print("\n" + "=" * 96)
+        print("  KOREAN SUNRISE: AUTOMATED SPREAD & HOLD HORIZON CALIBRATION MATRIX")
+        print("=" * 96)
         print(f"  Signals Scanned: {valid_events:,} across {len(files)} archives ({days_back:.1f} days)")
         print(f"  Configured Pairs: {len(matrix_output)} pairs calibrated")
         print(f"  Classifications: {dict(classification_counts)}")
-        print("-" * 80)
-        print(f"  {'Pair (Coin:Leader-Follower)':<32} | {'Min Edge':<9} | {'Win Rate':<9} | {'Trades':<7} | {'Status':<16} | {'Active'}")
-        print("-" * 80)
+        print("-" * 96)
+        print(f"  {'Pair (Coin:Leader-Follower)':<28} | {'Min Edge':<9} | {'Hold':<7} | {'Spike':<6} | {'Win Rate':<9} | {'Trades':<7} | {'Status':<16} | {'Active'}")
+        print("-" * 96)
         for pk, cfg in sorted(matrix_output.items())[:35]:
             en_str = "YES" if cfg["enabled"] else "NO (PRUNED)"
             print(
-                f"  {pk:<32} | {cfg['min_spread_bps']:>5.1f} bps | "
+                f"  {pk:<28} | {cfg['min_spread_bps']:>5.1f} bps | "
+                f"{cfg.get('max_hold_sec', 6.0):>4.1f}s | {cfg.get('spike_sigma', 2.5):>4.1f}σ | "
                 f"{cfg['expected_winrate'] * 100:>6.1f}% | {cfg['sample_trades']:>7} | "
                 f"{cfg['status']:<16} | {en_str}"
             )
@@ -6301,7 +7388,11 @@ def generate_daily_report(
         try:
             with open(BATTLE_FILE, "r", encoding="utf-8") as bf:
                 bdoc = json.load(bf)
-                battle_coins = set(bdoc.get("battle_pool", {}).keys())
+                coins_map = bdoc.get("coins") or bdoc.get("battle_pool") or {}
+                battle_coins = {
+                    k.upper() for k, v in coins_map.items()
+                    if isinstance(v, dict) and v.get("enabled", True)
+                }
         except Exception:
             pass
 
@@ -6325,11 +7416,14 @@ def generate_daily_report(
     close_reasons = collections.Counter()
     trigger_types = collections.Counter()
 
+    def _new_bucket() -> Dict[str, Any]:
+        return {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0, "gains": 0.0, "losses": 0.0}
+
     pnl_scenarios = {
-        "all_signals": {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0},
-        "calibrated_threshold_only": {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0},
-        "battle_coins_only": {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0},
-        "funded_venues_only": {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0},
+        "all_signals": _new_bucket(),
+        "calibrated_threshold_only": _new_bucket(),
+        "battle_coins_only": _new_bucket(),
+        "funded_venues_only": _new_bucket(),
     }
 
     sweep = {t: {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0} for t in SWEEP_THRESHOLDS}
@@ -6366,48 +7460,38 @@ def generate_daily_report(
                     if net_pnl_bps is None:
                         continue
                     net_pnl_bps = float(net_pnl_bps)
-                    gross_edge_bps = float(d.get("gross_exec_edge_bps") or 0.0)
+                    gross_edge_bps = float(
+                        d.get("gross_exec_edge_bps")
+                        or (float(d.get("net_exec_edge_bps", 0.0)) + roundtrip_fee_bps * 0.5)
+                    )
 
-                    gross = pos_size * (gross_edge_bps / 10000.0)
+                    gross = pos_size * ((net_pnl_bps + roundtrip_fee_bps) / 10000.0)
                     net = pos_size * (net_pnl_bps / 10000.0)
                     is_win = 1 if net > 0 else 0
 
-                    # Scenario: All signals
-                    s_all = pnl_scenarios["all_signals"]
-                    s_all["count"] += 1
-                    s_all["gross"] += gross
-                    s_all["fee"] += fee_usd
-                    s_all["net"] += net
-                    s_all["wins"] += is_win
+                    def _add_to_bucket(b: Dict[str, Any]) -> None:
+                        b["count"] += 1
+                        b["gross"] += gross
+                        b["fee"] += fee_usd
+                        b["net"] += net
+                        b["wins"] += is_win
+                        if net > 0:
+                            b["gains"] += net
+                        elif net < 0:
+                            b["losses"] += abs(net)
 
-                    # Scenario: Calibrated threshold
+                    _add_to_bucket(pnl_scenarios["all_signals"])
+
                     pk = f"{coin}:upbit-{f_ex}"
                     req_edge = calibrated_thresholds.get(pk, 20.0)
                     if gross_edge_bps >= req_edge:
-                        s_cal = pnl_scenarios["calibrated_threshold_only"]
-                        s_cal["count"] += 1
-                        s_cal["gross"] += gross
-                        s_cal["fee"] += fee_usd
-                        s_cal["net"] += net
-                        s_cal["wins"] += is_win
+                        _add_to_bucket(pnl_scenarios["calibrated_threshold_only"])
 
-                    # Scenario: Battle coins only
                     if coin in battle_coins:
-                        s_bat = pnl_scenarios["battle_coins_only"]
-                        s_bat["count"] += 1
-                        s_bat["gross"] += gross
-                        s_bat["fee"] += fee_usd
-                        s_bat["net"] += net
-                        s_bat["wins"] += is_win
+                        _add_to_bucket(pnl_scenarios["battle_coins_only"])
 
-                    # Scenario: Funded venues only
                     if f_ex in FUNDED_VENUES:
-                        s_fun = pnl_scenarios["funded_venues_only"]
-                        s_fun["count"] += 1
-                        s_fun["gross"] += gross
-                        s_fun["fee"] += fee_usd
-                        s_fun["net"] += net
-                        s_fun["wins"] += is_win
+                        _add_to_bucket(pnl_scenarios["funded_venues_only"])
 
                     # Threshold sweep
                     for t in SWEEP_THRESHOLDS:
@@ -6449,6 +7533,9 @@ def generate_daily_report(
     pnl_summary = {}
     for name, sc in pnl_scenarios.items():
         cnt = sc["count"]
+        gains = sc.get("gains", 0.0)
+        losses = sc.get("losses", 0.0)
+        pf = (gains / losses) if losses > 0 else (99.0 if gains > 0 else 0.0)
         pnl_summary[name] = {
             "trades": cnt,
             "wins": sc["wins"],
@@ -6456,7 +7543,7 @@ def generate_daily_report(
             "gross_usd": round(sc["gross"], 2),
             "fee_usd": round(sc["fee"], 2),
             "net_pnl_usd": round(sc["net"], 2),
-            "profit_factor": round(sc["gross"] / max(0.01, sc["fee"]), 2) if sc["fee"] else 0.0,
+            "profit_factor": round(pf, 2),
         }
 
     # Format top pairs
@@ -6765,8 +7852,9 @@ def cmd_resume(psm: PoolStateManager, args: argparse.Namespace) -> None:
 
 
 def cmd_promote(psm: PoolStateManager, args: argparse.Namespace) -> None:
+    psm.reload()
     coin = args.coin.upper()
-    ok = psm.promote_to_battle(coin, score=100.0, ev_net_bps=25.0, top3_depth_usd=500.0, win_rate_pct=85.0, min_events=0)
+    ok = psm.promote_coin_manual(coin)
     if ok:
         print(f"[OK] Promoted {coin} to Battle pool.")
     else:
@@ -6774,16 +7862,25 @@ def cmd_promote(psm: PoolStateManager, args: argparse.Namespace) -> None:
 
 
 def cmd_demote(psm: PoolStateManager, args: argparse.Namespace) -> None:
+    psm.reload()
     coin = args.coin.upper()
-    psm.demote_to_incubator(coin, reason=args.reason or "manual_demote")
-    print(f"[OK] Demoted {coin} to Incubator pool.")
+    ok = psm.demote_to_incubator(coin, reason=args.reason or "manual_demote")
+    if ok:
+        print(f"[OK] Demoted {coin} to Incubator pool.")
+    else:
+        print(f"[!] Coin {coin} not found in pool.")
 
 
 def cmd_evaluate(psm: PoolStateManager, args: argparse.Namespace) -> None:
-    print(f"[*] Running quantitative evaluation across trailing {args.days} days...")
-    ev = SunriseEvaluator(data_root=os.path.join(PROJECT_ROOT, "data"), pool_state=psm)
-    res = ev.run()
-    print(f"[OK] Evaluation complete: {len(res)} coins qualified and promoted to Battle pool.")
+    dry = getattr(args, "dry_run", False)
+    print(f"[*] Running quantitative evaluation across trailing {args.days} days (dry_run={dry})...")
+    ev = SunriseEvaluator(
+        data_root=os.path.join(PROJECT_ROOT, "data"),
+        days_back=int(args.days),
+        pool_state=psm,
+    )
+    res = ev.run(dry_run=dry)
+    print(f"[OK] Evaluation complete: {len(res)} coins qualified for Battle pool.")
 
 
 def cmd_profile(args: argparse.Namespace) -> None:
@@ -6865,6 +7962,7 @@ def main() -> None:
     # evaluate
     p_ev = sub.add_parser("evaluate", help="Run pool promotion evaluator")
     p_ev.add_argument("--days", type=float, default=7.0)
+    p_ev.add_argument("--dry-run", action="store_true", help="Do not persist changes")
 
     # profile
     p_prof = sub.add_parser("profile", help="Show trading capital profile")
@@ -12640,10 +13738,13 @@ def _build_card_from_files(date_key: str, md_path: str, json_path: str) -> Dict[
 
 
 def get_report_content(report_id: str) -> Optional[str]:
-    """Reads Markdown content of a specific report by date key."""
-    fn = f"report_{report_id}.md"
+    """Reads Markdown content of a specific report by date key (safe against traversal)."""
+    safe_id = re.sub(r"[^0-9\-]", "", str(report_id))
+    if not safe_id:
+        return None
+    fn = f"report_{safe_id}.md"
     fp = os.path.join(REPORTS_DIR, fn)
-    if os.path.exists(fp):
+    if os.path.isfile(fp):
         try:
             with open(fp, "r", encoding="utf-8") as f:
                 return f.read()
@@ -12850,8 +13951,7 @@ class APIServer:
 
             def _handle_battle(self) -> None:
                 if hasattr(server_ref.service, "pool_state") and server_ref.service.pool_state:
-                    snap = server_ref.service.pool_state.get_pool_snapshot()
-                    self._send_json(snap.get("battle", []))
+                    self._send_json(server_ref.service.pool_state.get_battle_coins())
                 else:
                     self._send_json([])
 
@@ -12926,10 +14026,10 @@ class APIServer:
                 self._send_json({"error": "pool_state unavailable"}, code=500)
 
             def _handle_download(self, q: Dict[str, List[str]]) -> None:
-                target_file = q.get("file", [""])[0]
+                target_file = os.path.basename(q.get("file", [""])[0])
                 if target_file:
                     fp = os.path.join(PROJECT_ROOT, "reports", "daily", target_file)
-                    if os.path.exists(fp):
+                    if os.path.isfile(fp):
                         self.send_response(200)
                         self.send_header("Content-Type", "application/octet-stream")
                         self.send_header("Content-Disposition", f"attachment; filename=\"{target_file}\"")
@@ -12940,23 +14040,33 @@ class APIServer:
                     self._send_404()
                     return
 
-                # Download zip of configs and reports
+                # Download zip of configs, reports, and signal archives
                 tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
                 tmp.close()
                 try:
                     with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as z:
-                        for fn in ["universe_live.json", "live_trading_pool.json", "matrix_thresholds.json", "trading_profile.json"]:
+                        for fn in ["universe_live.json", "live_trading_pool.json", "matrix_thresholds.json", "trading_profile.json", "runtime_overrides.json"]:
                             fp = os.path.join(PROJECT_ROOT, fn)
-                            if os.path.exists(fp):
+                            if os.path.isfile(fp):
                                 z.write(fp, arcname=fn)
                         rep_dir = os.path.join(PROJECT_ROOT, "reports", "daily")
                         if os.path.isdir(rep_dir):
                             for rfn in os.listdir(rep_dir):
-                                z.write(os.path.join(rep_dir, rfn), arcname=os.path.join("reports", "daily", rfn))
+                                rfp = os.path.join(rep_dir, rfn)
+                                if os.path.isfile(rfp):
+                                    z.write(rfp, arcname=os.path.join("reports", "daily", rfn))
+                        sig_dir = os.path.join(PROJECT_ROOT, "data", "signals")
+                        if os.path.isdir(sig_dir):
+                            for root, _, files in os.walk(sig_dir):
+                                for sfn in files:
+                                    if sfn.endswith(".jsonl.gz"):
+                                        full_p = os.path.join(root, sfn)
+                                        rel_p = os.path.relpath(full_p, PROJECT_ROOT)
+                                        z.write(full_p, arcname=rel_p)
 
                     self.send_response(200)
                     self.send_header("Content-Type", "application/zip")
-                    self.send_header("Content-Disposition", f"attachment; filename=\"korean_sunrise_export.zip\"")
+                    self.send_header("Content-Disposition", "attachment; filename=\"korean_sunrise_export.zip\"")
                     self.end_headers()
                     with open(tmp.name, "rb") as f:
                         shutil.copyfileobj(f, self.wfile)
@@ -13712,12 +14822,16 @@ async function runPipeline() {{
 
 
 def _render_battle_tags(pool_snapshot: Dict[str, Any]) -> str:
-    battle = pool_snapshot.get("battle", [])
+    coins_dict = pool_snapshot.get("coins", {})
+    battle = [
+        c for c in coins_dict.values()
+        if isinstance(c, dict) and c.get("basket") == "battle"
+    ]
     if not battle:
         return "<span style='color:#64748b;font-size:13px;'>Боевой пул пока пуст. Монеты находятся в инкубаторе и промоутятся после оценки.</span>"
     tags = []
-    for c in battle:
-        name = c.get("coin", "")
+    for c in sorted(battle, key=lambda x: x.get("mean_net_pnl_bps", 0.0), reverse=True):
+        name = html.escape(str(c.get("coin", "")))
         en = c.get("enabled", True)
         col = "#10b981" if en else "#64748b"
         tags.append(f"""

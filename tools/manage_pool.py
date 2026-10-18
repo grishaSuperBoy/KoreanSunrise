@@ -134,8 +134,9 @@ def cmd_resume(psm: PoolStateManager, args: argparse.Namespace) -> None:
 
 
 def cmd_promote(psm: PoolStateManager, args: argparse.Namespace) -> None:
+    psm.reload()
     coin = args.coin.upper()
-    ok = psm.promote_to_battle(coin, score=100.0, ev_net_bps=25.0, top3_depth_usd=500.0, win_rate_pct=85.0, min_events=0)
+    ok = psm.promote_coin_manual(coin)
     if ok:
         print(f"[OK] Promoted {coin} to Battle pool.")
     else:
@@ -143,16 +144,25 @@ def cmd_promote(psm: PoolStateManager, args: argparse.Namespace) -> None:
 
 
 def cmd_demote(psm: PoolStateManager, args: argparse.Namespace) -> None:
+    psm.reload()
     coin = args.coin.upper()
-    psm.demote_to_incubator(coin, reason=args.reason or "manual_demote")
-    print(f"[OK] Demoted {coin} to Incubator pool.")
+    ok = psm.demote_to_incubator(coin, reason=args.reason or "manual_demote")
+    if ok:
+        print(f"[OK] Demoted {coin} to Incubator pool.")
+    else:
+        print(f"[!] Coin {coin} not found in pool.")
 
 
 def cmd_evaluate(psm: PoolStateManager, args: argparse.Namespace) -> None:
-    print(f"[*] Running quantitative evaluation across trailing {args.days} days...")
-    ev = SunriseEvaluator(data_root=os.path.join(PROJECT_ROOT, "data"), pool_state=psm)
-    res = ev.run()
-    print(f"[OK] Evaluation complete: {len(res)} coins qualified and promoted to Battle pool.")
+    dry = getattr(args, "dry_run", False)
+    print(f"[*] Running quantitative evaluation across trailing {args.days} days (dry_run={dry})...")
+    ev = SunriseEvaluator(
+        data_root=os.path.join(PROJECT_ROOT, "data"),
+        days_back=int(args.days),
+        pool_state=psm,
+    )
+    res = ev.run(dry_run=dry)
+    print(f"[OK] Evaluation complete: {len(res)} coins qualified for Battle pool.")
 
 
 def cmd_profile(args: argparse.Namespace) -> None:
@@ -234,6 +244,7 @@ def main() -> None:
     # evaluate
     p_ev = sub.add_parser("evaluate", help="Run pool promotion evaluator")
     p_ev.add_argument("--days", type=float, default=7.0)
+    p_ev.add_argument("--dry-run", action="store_true", help="Do not persist changes")
 
     # profile
     p_prof = sub.add_parser("profile", help="Show trading capital profile")

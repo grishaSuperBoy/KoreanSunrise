@@ -690,12 +690,16 @@ async function runPipeline() {{
 
 
 def _render_battle_tags(pool_snapshot: Dict[str, Any]) -> str:
-    battle = pool_snapshot.get("battle", [])
+    coins_dict = pool_snapshot.get("coins", {})
+    battle = [
+        c for c in coins_dict.values()
+        if isinstance(c, dict) and c.get("basket") == "battle"
+    ]
     if not battle:
         return "<span style='color:#64748b;font-size:13px;'>Боевой пул пока пуст. Монеты находятся в инкубаторе и промоутятся после оценки.</span>"
     tags = []
-    for c in battle:
-        name = c.get("coin", "")
+    for c in sorted(battle, key=lambda x: x.get("mean_net_pnl_bps", 0.0), reverse=True):
+        name = html.escape(str(c.get("coin", "")))
         en = c.get("enabled", True)
         col = "#10b981" if en else "#64748b"
         tags.append(f"""

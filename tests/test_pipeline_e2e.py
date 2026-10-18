@@ -232,6 +232,138 @@ class TestPipelineE2E(unittest.TestCase):
         self.assertTrue(engine.pool_state.is_battle_coin("SOL"))
         self.assertFalse(engine.pool_state.is_battle_coin("DOGE"))
 
+        # Test full tick-to-signal pipeline via BaseVenueStream._sanitise -> KoreanEngine
+        from venues.base import BaseVenueStream
+        emitted = []
+        engine.emit = lambda sig_dict: emitted.append(sig_dict)
+        engine.warmup_samples = 2
+
+        stream = BaseVenueStream("upbit", ["SOL"], engine.on_book_update)
+        now = 1792300000.0
+
+        # 1. Feed normal warmup ticks on Upbit and Binance
+        for i in range(12):
+            f_snap = OrderBookDepth5(
+                exchange="binance",
+                symbol="SOL",
+                raw_symbol="SOLUSDT",
+                ts=now + i,
+                exchange_ts=int((now + i) * 1000),
+                bids=[(100.00, 10.0), (99.95, 20.0), (99.90, 30.0)],
+                asks=[(100.05, 10.0), (100.10, 20.0), (100.15, 30.0)],
+            )
+            u_snap = OrderBookDepth5(
+                exchange="upbit",
+                symbol="SOL",
+                raw_symbol="KRW-SOL",
+                ts=now + i,
+                exchange_ts=int((now + i) * 1000),
+                bids=[(100.00, 10.0), (99.95, 20.0), (99.90, 30.0)],
+                asks=[(100.05, 10.0), (100.10, 20.0), (100.15, 30.0)],
+            )
+            stream._sanitise(f_snap)
+            stream._sanitise(u_snap)
+
+        self.assertEqual(stream.books_dropped, 0)
+        self.assertEqual(stream.levels_dropped, 0)
+        self.assertGreaterEqual(engine.counters["ticks_upbit"], 12)
+        self.assertGreaterEqual(engine.counters["ticks_followers"], 12)
+
+    def test_dynamic_thresholds_hold_sec_and_spike_gating(self):
+        # Create a mock matrix_thresholds.json with custom hold_sec and spike_sigma
+        thresh_file = os.path.join(self.test_dir, "matrix_thresholds.json")
+        matrix_data = {
+            "metadata": {"total_pairs_configured": 1},
+            "thresholds": {
+                "SOL:upbit-binance": {
+                    "min_spread_bps": 15.0,
+                    "max_hold_sec": 3.2,
+                    "spike_sigma": 3.5,
+                    "min_dev_z": 1.7,
+                    "expected_winrate": 0.85,
+                    "expected_net_bps": 25.0,
+                    "sample_trades": 10,
+                    "status": "aggressive_clean",
+                    "enabled": True,
+                }
+            }
+        }
+        with open(thresh_file, "w", encoding="utf-8") as f:
+            json.dump(matrix_data, f)
+
+        emitted = []
+        engine = KoreanEngine(
+            emit_callback=lambda sig_dict: emitted.append(sig_dict),
+            thresholds_file=thresh_file,
+            max_hold_sec=6.0,
+        )
+
+        # 1. Verify PairState gets pair-specific spike_sigma
+        st = engine._get_or_create_pair_state("SOL", "binance")
+        self.assertEqual(st.spike_sigma, 3.5)
+
+        # 2. Simulate warmup so st is warmed up
+        now = 1792300000.0
+        for i in range(35):
+            st.learn(10.0, now + i)
+        self.assertTrue(st.is_warmed_up)
+
+        # 3. Simulate Upbit pump event triggering signal
+        upbit_snap = OrderBookDepth5(
+            exchange="upbit",
+            symbol="SOL",
+            raw_symbol="KRW-SOL",
+            ts=now + 50,
+            exchange_ts=int((now + 50) * 1000),
+            bids=[(105.00, 10.0), (104.95, 20.0)],
+            asks=[(105.05, 10.0), (105.10, 20.0)],
+        )
+        f_snap = OrderBookDepth5(
+            exchange="binance",
+            symbol="SOL",
+            raw_symbol="SOLUSDT",
+            ts=now + 50,
+            exchange_ts=int((now + 50) * 1000),
+            bids=[(100.00, 10.0), (99.95, 20.0)],
+            asks=[(100.05, 1000.0), (100.10, 2000.0)],
+        )
+        engine._books[("upbit", "SOL")] = upbit_snap
+        engine._recv_ts[("upbit", "SOL")] = now + 50
+        engine._books[("binance", "SOL")] = f_snap
+        engine._recv_ts[("binance", "SOL")] = now + 50
+
+        engine._check_entry(
+            coin="SOL",
+            follower_ex="binance",
+            st=st,
+            upbit_snap=upbit_snap,
+            f_snap=f_snap,
+            f_book_age_ms=10.0,
+            norm_depth=1000.0,
+            norm_spread=5.0,
+            swept_usd=5000.0,
+            trigger_type="depth_drain",
+            drain_ratio=0.8,
+            blowout_ratio=3.0,
+            now=now + 50,
+        )
+
+        self.assertIsNotNone(st.open_signal)
+        sig = st.open_signal
+        # Personalized max_hold_sec assigned!
+        self.assertEqual(sig.max_hold_sec, 3.2)
+
+        # 4. Sweep timeouts before 3.2s -> signal stays open
+        engine.sweep_timeouts(now + 50 + 2.0)
+        self.assertFalse(sig.closed)
+
+        # 5. Sweep timeouts at 3.3s -> signal closed by timeout
+        engine.sweep_timeouts(now + 50 + 3.3)
+        self.assertTrue(sig.closed)
+        self.assertEqual(sig.close_reason, "timeout")
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(emitted[0]["max_hold_sec"], 3.2)
+
 
 if __name__ == "__main__":
     unittest.main()

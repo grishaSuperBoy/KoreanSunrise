@@ -26,6 +26,7 @@ import glob
 import gzip
 import json
 import os
+import statistics
 import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -44,6 +45,34 @@ BATTLE_FILE = os.path.join(PROJECT_ROOT, "live_trading_pool.json")
 
 SWEEP_THRESHOLDS = (10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 60.0)
 DEFAULT_GLOBAL_FALLBACK_BPS = 20.0
+DEFAULT_GLOBAL_HOLD_SEC = 6.0
+DEFAULT_SPIKE_SIGMA = 2.5
+DEFAULT_MIN_DEV_Z = 1.8
+
+
+def _calc_optimal_hold(t_peaks: List[float], default_val: float = DEFAULT_GLOBAL_HOLD_SEC) -> float:
+    """Calculates personalized holding horizon: median(T_peak) + 1.5*MAD (clamped [1.5s, 12.0s])."""
+    if not t_peaks:
+        return default_val
+    med = statistics.median(t_peaks)
+    abs_dev = [abs(x - med) for x in t_peaks]
+    mad = statistics.median(abs_dev) if abs_dev else 0.5
+    raw_hold = med + 1.5 * (1.4826 * mad)
+    return round(max(1.5, min(12.0, raw_hold)), 1)
+
+
+def _calc_spike_and_dev_z(dev_zs: List[float]) -> Tuple[float, float]:
+    """Calculates personalized spike gating threshold P90(dev_z) and entry dev_z."""
+    if len(dev_zs) < 5:
+        return DEFAULT_SPIKE_SIGMA, DEFAULT_MIN_DEV_Z
+    s_z = sorted(dev_zs)
+    idx90 = int(0.90 * len(s_z))
+    p90 = s_z[min(idx90, len(s_z) - 1)]
+    spike_sigma = round(max(2.0, min(4.5, p90)), 2)
+    idx25 = int(0.25 * len(s_z))
+    p25 = s_z[min(idx25, len(s_z) - 1)]
+    min_dev_z = round(max(1.5, min(2.5, p25)), 2)
+    return spike_sigma, min_dev_z
 
 
 def _collect_signal_files(days_back: float = 7.0) -> List[str]:
@@ -96,6 +125,9 @@ def calibrate(
             for t in SWEEP_THRESHOLDS
         }
     )
+    pair_metrics: Dict[str, Dict[str, List[float]]] = collections.defaultdict(
+        lambda: {"t_peaks": [], "dev_zs": []}
+    )
 
     total_rows = 0
     valid_events = 0
@@ -123,10 +155,21 @@ def calibrate(
                         if net_pnl is None:
                             continue
                         net_pnl = float(net_pnl)
-                        gross_edge = float(d.get("gross_exec_edge_bps") or 0.0)
+                        gross_edge = float(
+                            d.get("gross_exec_edge_bps")
+                            or (float(d.get("net_exec_edge_bps", 0.0)) + roundtrip_fee_bps * 0.5)
+                        )
 
                         pair_key = f"{coin}:upbit-{follower_ex}"
                         valid_events += 1
+
+                        # Collect metrics for individual hold & spike calibration
+                        t_pk = d.get("time_to_peak_sec")
+                        if t_pk is not None and float(t_pk) > 0 and net_pnl > 0:
+                            pair_metrics[pair_key]["t_peaks"].append(float(t_pk))
+                        dz = d.get("dev_z")
+                        if dz is not None and float(dz) > 0:
+                            pair_metrics[pair_key]["dev_zs"].append(float(dz))
 
                         gross = pos_size * (gross_edge / 10000.0)
                         net = pos_size * (net_pnl / 10000.0)
@@ -180,6 +223,9 @@ def calibrate(
                 pk = f"{c}:upbit-{v}"
                 matrix_output[pk] = {
                     "min_spread_bps": DEFAULT_GLOBAL_FALLBACK_BPS,
+                    "max_hold_sec": DEFAULT_GLOBAL_HOLD_SEC,
+                    "spike_sigma": DEFAULT_SPIKE_SIGMA,
+                    "min_dev_z": DEFAULT_MIN_DEV_Z,
                     "expected_winrate": 0.85,
                     "expected_net_bps": 22.0,
                     "sample_trades": 0,
@@ -234,9 +280,18 @@ def calibrate(
                     status = "default_baseline"
                     enabled = True
 
+            # Calculate optimal hold horizon & spike gating per pair
+            t_peaks = pair_metrics[pair_key]["t_peaks"]
+            dev_zs = pair_metrics[pair_key]["dev_zs"]
+            opt_hold = _calc_optimal_hold(t_peaks, default_val=DEFAULT_GLOBAL_HOLD_SEC)
+            spike_sigma, min_dev_z = _calc_spike_and_dev_z(dev_zs)
+
             classification_counts[status] += 1
             matrix_output[pair_key] = {
                 "min_spread_bps": round(best_t, 1),
+                "max_hold_sec": opt_hold,
+                "spike_sigma": spike_sigma,
+                "min_dev_z": min_dev_z,
                 "expected_winrate": round(best_wr, 3),
                 "expected_net_bps": round((best_net / pos_size) * 10000.0 / max(1, best_cnt), 1) if best_cnt else 0.0,
                 "sample_trades": best_cnt,
@@ -266,19 +321,20 @@ def calibrate(
         _write_json_atomic(out_file, doc)
 
     if not as_json:
-        print("\n" + "=" * 80)
-        print("  KOREAN SUNRISE: AUTOMATED SPREAD THRESHOLD CALIBRATION MATRIX")
-        print("=" * 80)
+        print("\n" + "=" * 96)
+        print("  KOREAN SUNRISE: AUTOMATED SPREAD & HOLD HORIZON CALIBRATION MATRIX")
+        print("=" * 96)
         print(f"  Signals Scanned: {valid_events:,} across {len(files)} archives ({days_back:.1f} days)")
         print(f"  Configured Pairs: {len(matrix_output)} pairs calibrated")
         print(f"  Classifications: {dict(classification_counts)}")
-        print("-" * 80)
-        print(f"  {'Pair (Coin:Leader-Follower)':<32} | {'Min Edge':<9} | {'Win Rate':<9} | {'Trades':<7} | {'Status':<16} | {'Active'}")
-        print("-" * 80)
+        print("-" * 96)
+        print(f"  {'Pair (Coin:Leader-Follower)':<28} | {'Min Edge':<9} | {'Hold':<7} | {'Spike':<6} | {'Win Rate':<9} | {'Trades':<7} | {'Status':<16} | {'Active'}")
+        print("-" * 96)
         for pk, cfg in sorted(matrix_output.items())[:35]:
             en_str = "YES" if cfg["enabled"] else "NO (PRUNED)"
             print(
-                f"  {pk:<32} | {cfg['min_spread_bps']:>5.1f} bps | "
+                f"  {pk:<28} | {cfg['min_spread_bps']:>5.1f} bps | "
+                f"{cfg.get('max_hold_sec', 6.0):>4.1f}s | {cfg.get('spike_sigma', 2.5):>4.1f}σ | "
                 f"{cfg['expected_winrate'] * 100:>6.1f}% | {cfg['sample_trades']:>7} | "
                 f"{cfg['status']:<16} | {en_str}"
             )

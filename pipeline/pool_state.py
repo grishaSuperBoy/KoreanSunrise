@@ -272,6 +272,61 @@ class PoolStateManager:
             log.info(f"[pool_state] Resumed coin: {coin}")
             return True
 
+    def promote_coin_manual(
+        self,
+        coin: str,
+        mean_net_pnl_bps: float = 25.0,
+        top3_depth_usd: float = 500.0,
+        win_rate_pct: float = 85.0,
+        profit_factor: float = 2.0,
+    ) -> bool:
+        """Manually promotes a single coin to the Battle pool."""
+        with self._lock:
+            coin = coin.upper()
+            entry = self._coins.get(coin)
+            if entry is None:
+                entry = CoinEntry(coin=coin, venues=["binance", "bybit"])
+                self._coins[coin] = entry
+
+            entry.basket = "battle"
+            entry.enabled = True
+            entry.pause_reason = None
+            if entry.top3_depth_usd <= 0:
+                entry.top3_depth_usd = top3_depth_usd
+            if entry.mean_net_pnl_bps <= 0:
+                entry.mean_net_pnl_bps = mean_net_pnl_bps
+                entry.median_net_pnl_bps = mean_net_pnl_bps
+            if entry.win_rate_pct <= 0:
+                entry.win_rate_pct = win_rate_pct
+            if entry.profit_factor <= 0:
+                entry.profit_factor = profit_factor
+            entry.promoted_at = time.time()
+
+            # Remove from paused_coins if it was paused
+            overrides = _read_json(self._overrides_file, default={})
+            paused = overrides.get("paused_coins", {})
+            if coin in paused:
+                paused.pop(coin, None)
+                overrides["paused_coins"] = paused
+                _write_json_atomic(self._overrides_file, overrides)
+                self._overrides = overrides
+
+            self._persist_battle_pool()
+            log.info(f"[pool_state] Manually promoted {coin} to Battle pool")
+            return True
+
+    def demote_to_incubator(self, coin: str, reason: str = "manual_demote") -> bool:
+        """Demotes a single coin from Battle back to Incubator."""
+        with self._lock:
+            coin = coin.upper()
+            entry = self._coins.get(coin)
+            if not entry:
+                return False
+            entry.basket = "incubator"
+            self._persist_battle_pool()
+            log.info(f"[pool_state] Demoted {coin} to Incubator (reason={reason})")
+            return True
+
     def promote_to_battle(self, qualifying_stats: List[Dict[str, Any]]) -> None:
         """
         Promotes qualifying coins from Incubator to Battle based on verified

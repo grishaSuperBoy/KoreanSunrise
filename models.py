@@ -136,6 +136,7 @@ class SunriseSignal:
     # Pool routing
     basket: str = "incubator"
     is_actionable: bool = False
+    max_hold_sec: float = 6.0
 
     # Outcome & Excursion tracking
     closed: bool = False

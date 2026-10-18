@@ -73,7 +73,11 @@ def generate_daily_report(
         try:
             with open(BATTLE_FILE, "r", encoding="utf-8") as bf:
                 bdoc = json.load(bf)
-                battle_coins = set(bdoc.get("battle_pool", {}).keys())
+                coins_map = bdoc.get("coins") or bdoc.get("battle_pool") or {}
+                battle_coins = {
+                    k.upper() for k, v in coins_map.items()
+                    if isinstance(v, dict) and v.get("enabled", True)
+                }
         except Exception:
             pass
 
@@ -97,11 +101,14 @@ def generate_daily_report(
     close_reasons = collections.Counter()
     trigger_types = collections.Counter()
 
+    def _new_bucket() -> Dict[str, Any]:
+        return {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0, "gains": 0.0, "losses": 0.0}
+
     pnl_scenarios = {
-        "all_signals": {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0},
-        "calibrated_threshold_only": {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0},
-        "battle_coins_only": {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0},
-        "funded_venues_only": {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0},
+        "all_signals": _new_bucket(),
+        "calibrated_threshold_only": _new_bucket(),
+        "battle_coins_only": _new_bucket(),
+        "funded_venues_only": _new_bucket(),
     }
 
     sweep = {t: {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0} for t in SWEEP_THRESHOLDS}
@@ -138,48 +145,38 @@ def generate_daily_report(
                     if net_pnl_bps is None:
                         continue
                     net_pnl_bps = float(net_pnl_bps)
-                    gross_edge_bps = float(d.get("gross_exec_edge_bps") or 0.0)
+                    gross_edge_bps = float(
+                        d.get("gross_exec_edge_bps")
+                        or (float(d.get("net_exec_edge_bps", 0.0)) + roundtrip_fee_bps * 0.5)
+                    )
 
-                    gross = pos_size * (gross_edge_bps / 10000.0)
+                    gross = pos_size * ((net_pnl_bps + roundtrip_fee_bps) / 10000.0)
                     net = pos_size * (net_pnl_bps / 10000.0)
                     is_win = 1 if net > 0 else 0
 
-                    # Scenario: All signals
-                    s_all = pnl_scenarios["all_signals"]
-                    s_all["count"] += 1
-                    s_all["gross"] += gross
-                    s_all["fee"] += fee_usd
-                    s_all["net"] += net
-                    s_all["wins"] += is_win
+                    def _add_to_bucket(b: Dict[str, Any]) -> None:
+                        b["count"] += 1
+                        b["gross"] += gross
+                        b["fee"] += fee_usd
+                        b["net"] += net
+                        b["wins"] += is_win
+                        if net > 0:
+                            b["gains"] += net
+                        elif net < 0:
+                            b["losses"] += abs(net)
 
-                    # Scenario: Calibrated threshold
+                    _add_to_bucket(pnl_scenarios["all_signals"])
+
                     pk = f"{coin}:upbit-{f_ex}"
                     req_edge = calibrated_thresholds.get(pk, 20.0)
                     if gross_edge_bps >= req_edge:
-                        s_cal = pnl_scenarios["calibrated_threshold_only"]
-                        s_cal["count"] += 1
-                        s_cal["gross"] += gross
-                        s_cal["fee"] += fee_usd
-                        s_cal["net"] += net
-                        s_cal["wins"] += is_win
+                        _add_to_bucket(pnl_scenarios["calibrated_threshold_only"])
 
-                    # Scenario: Battle coins only
                     if coin in battle_coins:
-                        s_bat = pnl_scenarios["battle_coins_only"]
-                        s_bat["count"] += 1
-                        s_bat["gross"] += gross
-                        s_bat["fee"] += fee_usd
-                        s_bat["net"] += net
-                        s_bat["wins"] += is_win
+                        _add_to_bucket(pnl_scenarios["battle_coins_only"])
 
-                    # Scenario: Funded venues only
                     if f_ex in FUNDED_VENUES:
-                        s_fun = pnl_scenarios["funded_venues_only"]
-                        s_fun["count"] += 1
-                        s_fun["gross"] += gross
-                        s_fun["fee"] += fee_usd
-                        s_fun["net"] += net
-                        s_fun["wins"] += is_win
+                        _add_to_bucket(pnl_scenarios["funded_venues_only"])
 
                     # Threshold sweep
                     for t in SWEEP_THRESHOLDS:
@@ -221,6 +218,9 @@ def generate_daily_report(
     pnl_summary = {}
     for name, sc in pnl_scenarios.items():
         cnt = sc["count"]
+        gains = sc.get("gains", 0.0)
+        losses = sc.get("losses", 0.0)
+        pf = (gains / losses) if losses > 0 else (99.0 if gains > 0 else 0.0)
         pnl_summary[name] = {
             "trades": cnt,
             "wins": sc["wins"],
@@ -228,7 +228,7 @@ def generate_daily_report(
             "gross_usd": round(sc["gross"], 2),
             "fee_usd": round(sc["fee"], 2),
             "net_pnl_usd": round(sc["net"], 2),
-            "profit_factor": round(sc["gross"] / max(0.01, sc["fee"]), 2) if sc["fee"] else 0.0,
+            "profit_factor": round(pf, 2),
         }
 
     # Format top pairs

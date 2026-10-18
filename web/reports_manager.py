@@ -100,10 +100,13 @@ def _build_card_from_files(date_key: str, md_path: str, json_path: str) -> Dict[
 
 
 def get_report_content(report_id: str) -> Optional[str]:
-    """Reads Markdown content of a specific report by date key."""
-    fn = f"report_{report_id}.md"
+    """Reads Markdown content of a specific report by date key (safe against traversal)."""
+    safe_id = re.sub(r"[^0-9\-]", "", str(report_id))
+    if not safe_id:
+        return None
+    fn = f"report_{safe_id}.md"
     fp = os.path.join(REPORTS_DIR, fn)
-    if os.path.exists(fp):
+    if os.path.isfile(fp):
         try:
             with open(fp, "r", encoding="utf-8") as f:
                 return f.read()

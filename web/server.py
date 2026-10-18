@@ -192,8 +192,7 @@ class APIServer:
 
             def _handle_battle(self) -> None:
                 if hasattr(server_ref.service, "pool_state") and server_ref.service.pool_state:
-                    snap = server_ref.service.pool_state.get_pool_snapshot()
-                    self._send_json(snap.get("battle", []))
+                    self._send_json(server_ref.service.pool_state.get_battle_coins())
                 else:
                     self._send_json([])
 
@@ -268,10 +267,10 @@ class APIServer:
                 self._send_json({"error": "pool_state unavailable"}, code=500)
 
             def _handle_download(self, q: Dict[str, List[str]]) -> None:
-                target_file = q.get("file", [""])[0]
+                target_file = os.path.basename(q.get("file", [""])[0])
                 if target_file:
                     fp = os.path.join(PROJECT_ROOT, "reports", "daily", target_file)
-                    if os.path.exists(fp):
+                    if os.path.isfile(fp):
                         self.send_response(200)
                         self.send_header("Content-Type", "application/octet-stream")
                         self.send_header("Content-Disposition", f"attachment; filename=\"{target_file}\"")
@@ -282,23 +281,33 @@ class APIServer:
                     self._send_404()
                     return
 
-                # Download zip of configs and reports
+                # Download zip of configs, reports, and signal archives
                 tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
                 tmp.close()
                 try:
                     with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as z:
-                        for fn in ["universe_live.json", "live_trading_pool.json", "matrix_thresholds.json", "trading_profile.json"]:
+                        for fn in ["universe_live.json", "live_trading_pool.json", "matrix_thresholds.json", "trading_profile.json", "runtime_overrides.json"]:
                             fp = os.path.join(PROJECT_ROOT, fn)
-                            if os.path.exists(fp):
+                            if os.path.isfile(fp):
                                 z.write(fp, arcname=fn)
                         rep_dir = os.path.join(PROJECT_ROOT, "reports", "daily")
                         if os.path.isdir(rep_dir):
                             for rfn in os.listdir(rep_dir):
-                                z.write(os.path.join(rep_dir, rfn), arcname=os.path.join("reports", "daily", rfn))
+                                rfp = os.path.join(rep_dir, rfn)
+                                if os.path.isfile(rfp):
+                                    z.write(rfp, arcname=os.path.join("reports", "daily", rfn))
+                        sig_dir = os.path.join(PROJECT_ROOT, "data", "signals")
+                        if os.path.isdir(sig_dir):
+                            for root, _, files in os.walk(sig_dir):
+                                for sfn in files:
+                                    if sfn.endswith(".jsonl.gz"):
+                                        full_p = os.path.join(root, sfn)
+                                        rel_p = os.path.relpath(full_p, PROJECT_ROOT)
+                                        z.write(full_p, arcname=rel_p)
 
                     self.send_response(200)
                     self.send_header("Content-Type", "application/zip")
-                    self.send_header("Content-Disposition", f"attachment; filename=\"korean_sunrise_export.zip\"")
+                    self.send_header("Content-Disposition", "attachment; filename=\"korean_sunrise_export.zip\"")
                     self.end_headers()
                     with open(tmp.name, "rb") as f:
                         shutil.copyfileobj(f, self.wfile)

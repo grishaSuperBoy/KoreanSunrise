@@ -1,6 +1,6 @@
 {
   "metadata": {
-    "generated_at": "2026-10-18T14:09:54.010303+00:00",
+    "generated_at": "2026-10-18T15:16:52.640214+00:00",
     "days_analyzed": 7.0,
     "order_size_usd": 10.0,
     "roundtrip_fee_bps": 10.0,
@@ -18,6 +18,9 @@
   "thresholds": {
     "VVV:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -26,6 +29,9 @@
     },
     "VVV:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -34,6 +40,9 @@
     },
     "VVV:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -42,6 +51,9 @@
     },
     "VVV:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -50,6 +62,9 @@
     },
     "VVV:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -58,6 +73,9 @@
     },
     "VVV:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -66,6 +84,9 @@
     },
     "VVV:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -74,6 +95,9 @@
     },
     "VVV:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -82,6 +106,9 @@
     },
     "LIT:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -90,6 +117,9 @@
     },
     "LIT:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -98,6 +128,9 @@
     },
     "LIT:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -106,6 +139,9 @@
     },
     "LIT:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -114,6 +150,9 @@
     },
     "LIT:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -122,6 +161,9 @@
     },
     "LIT:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -130,6 +172,9 @@
     },
     "LIT:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -138,6 +183,9 @@
     },
     "ICP:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -146,6 +194,9 @@
     },
     "ICP:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -154,6 +205,9 @@
     },
     "ICP:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -162,6 +216,9 @@
     },
     "ICP:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -170,6 +227,9 @@
     },
     "ICP:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -178,6 +238,9 @@
     },
     "ICP:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -186,6 +249,9 @@
     },
     "ICP:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -194,6 +260,9 @@
     },
     "ICP:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -202,6 +271,9 @@
     },
     "ETHFI:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -210,6 +282,9 @@
     },
     "ETHFI:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -218,6 +293,9 @@
     },
     "ETHFI:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -226,6 +304,9 @@
     },
     "ETHFI:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -234,6 +315,9 @@
     },
     "ETHFI:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -242,6 +326,9 @@
     },
     "ETHFI:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -250,6 +337,9 @@
     },
     "ETHFI:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -258,6 +348,9 @@
     },
     "RAY:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -266,6 +359,9 @@
     },
     "RAY:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -274,6 +370,9 @@
     },
     "RAY:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -282,6 +381,9 @@
     },
     "RAY:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -290,6 +392,9 @@
     },
     "RAY:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -298,6 +403,9 @@
     },
     "RAY:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -306,6 +414,9 @@
     },
     "PROM:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -314,6 +425,9 @@
     },
     "PROM:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -322,6 +436,9 @@
     },
     "PROM:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -330,6 +447,9 @@
     },
     "PROM:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -338,6 +458,9 @@
     },
     "PROM:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -346,6 +469,9 @@
     },
     "AXL:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -354,6 +480,9 @@
     },
     "AXL:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -362,6 +491,9 @@
     },
     "AXL:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -370,6 +502,9 @@
     },
     "AXL:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -378,6 +513,9 @@
     },
     "AXL:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -386,6 +524,9 @@
     },
     "TRUMP:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -394,6 +535,9 @@
     },
     "TRUMP:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -402,6 +546,9 @@
     },
     "TRUMP:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -410,6 +557,9 @@
     },
     "WLD:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -418,6 +568,9 @@
     },
     "WLD:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -426,6 +579,9 @@
     },
     "WLD:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -434,6 +590,9 @@
     },
     "WLD:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -442,6 +601,9 @@
     },
     "WLD:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -450,6 +612,9 @@
     },
     "WLD:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -458,6 +623,9 @@
     },
     "WLD:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -466,6 +634,9 @@
     },
     "WLD:upbit-htx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -474,6 +645,9 @@
     },
     "WLD:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -482,6 +656,9 @@
     },
     "ELSA:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -490,6 +667,9 @@
     },
     "ELSA:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -498,6 +678,9 @@
     },
     "ELSA:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -506,6 +689,9 @@
     },
     "ELSA:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -514,6 +700,9 @@
     },
     "ELSA:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -522,6 +711,9 @@
     },
     "ELSA:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -530,6 +722,9 @@
     },
     "SPX:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -538,6 +733,9 @@
     },
     "SPX:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -546,6 +744,9 @@
     },
     "SPX:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -554,6 +755,9 @@
     },
     "SPX:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -562,6 +766,9 @@
     },
     "SPX:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -570,6 +777,9 @@
     },
     "SPX:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -578,6 +788,9 @@
     },
     "SPX:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -586,6 +799,9 @@
     },
     "SPX:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -594,6 +810,9 @@
     },
     "SOMI:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -602,6 +821,9 @@
     },
     "SOMI:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -610,6 +832,9 @@
     },
     "SOMI:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -618,6 +843,9 @@
     },
     "SOMI:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -626,6 +854,9 @@
     },
     "GRT:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -634,6 +865,9 @@
     },
     "GRT:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -642,6 +876,9 @@
     },
     "GRT:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -650,6 +887,9 @@
     },
     "GRT:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -658,6 +898,9 @@
     },
     "EUL:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -666,6 +909,9 @@
     },
     "ZRO:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -674,6 +920,9 @@
     },
     "ZRO:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -682,6 +931,9 @@
     },
     "ZRO:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -690,6 +942,9 @@
     },
     "ZRO:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -698,6 +953,9 @@
     },
     "ZRO:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -706,6 +964,9 @@
     },
     "ZRO:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -714,6 +975,9 @@
     },
     "ZRO:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -722,6 +986,9 @@
     },
     "ZRO:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -730,6 +997,9 @@
     },
     "ZORA:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -738,6 +1008,9 @@
     },
     "ZORA:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -746,6 +1019,9 @@
     },
     "ZORA:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -754,6 +1030,9 @@
     },
     "ZORA:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -762,6 +1041,9 @@
     },
     "ZORA:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -770,6 +1052,9 @@
     },
     "ZORA:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -778,6 +1063,9 @@
     },
     "CAP:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -786,6 +1074,9 @@
     },
     "CAP:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -794,6 +1085,9 @@
     },
     "CAP:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -802,6 +1096,9 @@
     },
     "CAP:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -810,6 +1107,9 @@
     },
     "CAP:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -818,6 +1118,9 @@
     },
     "CAP:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -826,6 +1129,9 @@
     },
     "CAP:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -834,6 +1140,9 @@
     },
     "PIEVERSE:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -842,6 +1151,9 @@
     },
     "PIEVERSE:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -850,6 +1162,9 @@
     },
     "PIEVERSE:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -858,6 +1173,9 @@
     },
     "PIEVERSE:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -866,6 +1184,9 @@
     },
     "PIEVERSE:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -874,6 +1195,9 @@
     },
     "PIEVERSE:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -882,6 +1206,9 @@
     },
     "PIEVERSE:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -890,6 +1217,9 @@
     },
     "WCT:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -898,6 +1228,9 @@
     },
     "WCT:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -906,6 +1239,9 @@
     },
     "WCT:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -914,6 +1250,9 @@
     },
     "WCT:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -922,6 +1261,9 @@
     },
     "WCT:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -930,6 +1272,9 @@
     },
     "PROS:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -938,6 +1283,9 @@
     },
     "PROS:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -946,6 +1294,9 @@
     },
     "ENSO:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -954,6 +1305,9 @@
     },
     "ENSO:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -962,6 +1316,9 @@
     },
     "ENSO:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -970,6 +1327,9 @@
     },
     "ENSO:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -978,6 +1338,9 @@
     },
     "ENSO:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -986,6 +1349,9 @@
     },
     "BREV:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -994,6 +1360,9 @@
     },
     "BREV:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1002,6 +1371,9 @@
     },
     "BREV:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1010,6 +1382,9 @@
     },
     "BREV:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1018,6 +1393,9 @@
     },
     "BREV:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1026,6 +1404,9 @@
     },
     "ESP:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1034,6 +1415,9 @@
     },
     "ESP:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1042,6 +1426,9 @@
     },
     "NEAR:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1050,6 +1437,9 @@
     },
     "NEAR:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1058,6 +1448,9 @@
     },
     "NEAR:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1066,6 +1459,9 @@
     },
     "NEAR:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1074,6 +1470,9 @@
     },
     "NEAR:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1082,6 +1481,9 @@
     },
     "NEAR:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1090,6 +1492,9 @@
     },
     "NEAR:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1098,6 +1503,9 @@
     },
     "NEAR:upbit-htx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1106,6 +1514,9 @@
     },
     "NEAR:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1114,6 +1525,9 @@
     },
     "VET:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1122,6 +1536,9 @@
     },
     "VET:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1130,6 +1547,9 @@
     },
     "VET:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1138,6 +1558,9 @@
     },
     "VET:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1146,6 +1569,9 @@
     },
     "VET:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1154,6 +1580,9 @@
     },
     "KMNO:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1162,6 +1591,9 @@
     },
     "KMNO:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1170,6 +1602,9 @@
     },
     "KMNO:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1178,6 +1613,9 @@
     },
     "KMNO:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1186,6 +1624,9 @@
     },
     "KMNO:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1194,6 +1635,9 @@
     },
     "GTC:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1202,6 +1646,9 @@
     },
     "GTC:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1210,6 +1657,9 @@
     },
     "B3:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1218,6 +1668,9 @@
     },
     "B3:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1226,6 +1679,9 @@
     },
     "CYBER:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1234,6 +1690,9 @@
     },
     "CYBER:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1242,6 +1701,9 @@
     },
     "CYBER:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1250,6 +1712,9 @@
     },
     "CYBER:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1258,6 +1723,9 @@
     },
     "HYPER:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1266,6 +1734,9 @@
     },
     "HYPER:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1274,6 +1745,9 @@
     },
     "HYPER:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1282,6 +1756,9 @@
     },
     "SENT:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1290,6 +1767,9 @@
     },
     "AWE:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1298,6 +1778,9 @@
     },
     "AWE:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1306,6 +1789,9 @@
     },
     "AWE:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1314,6 +1800,9 @@
     },
     "AWE:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1322,6 +1811,9 @@
     },
     "ZKC:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1330,6 +1822,9 @@
     },
     "ZKC:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1338,6 +1833,9 @@
     },
     "ZKC:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1346,6 +1844,9 @@
     },
     "ZKC:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1354,6 +1855,9 @@
     },
     "ZKP:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1362,6 +1866,9 @@
     },
     "ZKP:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1370,6 +1877,9 @@
     },
     "ZKP:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1378,6 +1888,9 @@
     },
     "ZKP:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1386,6 +1899,9 @@
     },
     "ZKP:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1394,6 +1910,9 @@
     },
     "ZKP:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1402,6 +1921,9 @@
     },
     "NEO:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1410,6 +1932,9 @@
     },
     "NEO:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1418,6 +1943,9 @@
     },
     "NEO:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1426,6 +1954,9 @@
     },
     "NEO:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1434,6 +1965,9 @@
     },
     "IO:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1442,6 +1976,9 @@
     },
     "IO:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1450,6 +1987,9 @@
     },
     "IO:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1458,6 +1998,9 @@
     },
     "INJ:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1466,6 +2009,9 @@
     },
     "INJ:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1474,6 +2020,9 @@
     },
     "INJ:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1482,6 +2031,9 @@
     },
     "INJ:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1490,6 +2042,9 @@
     },
     "INJ:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1498,6 +2053,9 @@
     },
     "INJ:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1506,6 +2064,9 @@
     },
     "SKR:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1514,6 +2075,9 @@
     },
     "SKR:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1522,6 +2086,9 @@
     },
     "SKR:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1530,6 +2097,9 @@
     },
     "SKR:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1538,6 +2108,9 @@
     },
     "CARV:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1546,6 +2119,9 @@
     },
     "CARV:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1554,6 +2130,9 @@
     },
     "CARV:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1562,6 +2141,9 @@
     },
     "CARV:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1570,6 +2152,9 @@
     },
     "ERA:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1578,6 +2163,9 @@
     },
     "ERA:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1586,6 +2174,9 @@
     },
     "ERA:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1594,6 +2185,9 @@
     },
     "ERA:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1602,6 +2196,9 @@
     },
     "ERA:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1610,6 +2207,9 @@
     },
     "SEI:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1618,6 +2218,9 @@
     },
     "SEI:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1626,6 +2229,9 @@
     },
     "SEI:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1634,6 +2240,9 @@
     },
     "SEI:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1642,6 +2251,9 @@
     },
     "SEI:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1650,6 +2262,9 @@
     },
     "SEI:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1658,6 +2273,9 @@
     },
     "ARX:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1666,6 +2284,9 @@
     },
     "MMT:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1674,6 +2295,9 @@
     },
     "MNT:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1682,6 +2306,9 @@
     },
     "MNT:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1690,6 +2317,9 @@
     },
     "PONS:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1698,6 +2328,9 @@
     },
     "PONS:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1706,6 +2339,9 @@
     },
     "PONS:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1714,6 +2350,9 @@
     },
     "API3:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1722,6 +2361,9 @@
     },
     "API3:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1730,6 +2372,9 @@
     },
     "ENS:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1738,6 +2383,9 @@
     },
     "ENS:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1746,6 +2394,9 @@
     },
     "ENS:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1754,6 +2405,9 @@
     },
     "ENS:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1762,6 +2416,9 @@
     },
     "IOTA:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1770,6 +2427,9 @@
     },
     "IOTA:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1778,6 +2438,9 @@
     },
     "O:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1786,6 +2449,9 @@
     },
     "O:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1794,6 +2460,9 @@
     },
     "O:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1802,6 +2471,9 @@
     },
     "O:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1810,6 +2482,9 @@
     },
     "O:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1818,6 +2493,9 @@
     },
     "BCH:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1826,6 +2504,9 @@
     },
     "BCH:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1834,6 +2515,9 @@
     },
     "BCH:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1842,6 +2526,9 @@
     },
     "BCH:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1850,6 +2537,9 @@
     },
     "BCH:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1858,6 +2548,9 @@
     },
     "BEAM:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1866,6 +2559,9 @@
     },
     "BAT:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1874,6 +2570,9 @@
     },
     "BAT:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1882,6 +2581,9 @@
     },
     "BAT:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1890,6 +2592,9 @@
     },
     "BAT:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1898,6 +2603,9 @@
     },
     "BAT:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1906,6 +2614,9 @@
     },
     "BAT:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1914,6 +2625,9 @@
     },
     "BAT:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1922,6 +2636,9 @@
     },
     "PUMP:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1930,6 +2647,9 @@
     },
     "PUMP:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1938,6 +2658,9 @@
     },
     "PUMP:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1946,6 +2669,9 @@
     },
     "DOS:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1954,6 +2680,9 @@
     },
     "DOS:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1962,6 +2691,9 @@
     },
     "DOS:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1970,6 +2702,9 @@
     },
     "RENDER:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1978,6 +2713,9 @@
     },
     "RENDER:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1986,6 +2724,9 @@
     },
     "APT:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -1994,6 +2735,9 @@
     },
     "APT:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2002,6 +2746,9 @@
     },
     "APT:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2010,6 +2757,9 @@
     },
     "APT:upbit-gateio": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2018,6 +2768,9 @@
     },
     "APT:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2026,6 +2779,9 @@
     },
     "APT:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2034,6 +2790,9 @@
     },
     "APT:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2042,6 +2801,9 @@
     },
     "APT:upbit-pionex": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2050,6 +2812,9 @@
     },
     "2Z:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2058,6 +2823,9 @@
     },
     "F:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2066,6 +2834,9 @@
     },
     "BIO:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2074,6 +2845,9 @@
     },
     "BIO:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2082,6 +2856,9 @@
     },
     "BIO:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2090,6 +2867,9 @@
     },
     "BIO:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2098,6 +2878,9 @@
     },
     "NMR:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2106,6 +2889,9 @@
     },
     "MANA:upbit-kucoin": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2114,6 +2900,9 @@
     },
     "VTHO:upbit-binance": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2122,6 +2911,9 @@
     },
     "VTHO:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2130,6 +2922,9 @@
     },
     "MOODENG:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2138,6 +2933,9 @@
     },
     "ATOM:upbit-bybit": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2146,6 +2944,9 @@
     },
     "ATOM:upbit-mexc": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2154,6 +2955,9 @@
     },
     "ATOM:upbit-bingx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
@@ -2162,6 +2966,9 @@
     },
     "BIGTIME:upbit-okx": {
       "min_spread_bps": 20.0,
+      "max_hold_sec": 6.0,
+      "spike_sigma": 2.5,
+      "min_dev_z": 1.8,
       "expected_winrate": 0.85,
       "expected_net_bps": 22.0,
       "sample_trades": 0,
