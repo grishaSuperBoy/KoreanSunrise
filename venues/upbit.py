@@ -110,26 +110,46 @@ class UpbitRestClient:
     def fetch_klines_1m(
         self,
         market: str,
-        count: int = 200,
+        count: int = 1440,
     ) -> Dict[int, Tuple[float, float]]:
         """
-        Fetches up to 200 1-minute candles.
+        Fetches up to `count` 1-minute candles (default 1440 = 24h).
+        Paginates Upbit /v1/candles/minutes/1 in chunks of 200 candles using 'to' parameter.
         Returns dict: minute_ts_sec -> (close_krw, volume_krw).
         """
-        url = f"{self.BASE_URL}/candles/minutes/1?market={market}&count={min(count, 200)}"
         out: Dict[int, Tuple[float, float]] = {}
-        try:
-            r = self.session.get(url, timeout=6)
-            if r.status_code == 200:
-                for row in r.json():
+        to_param: Optional[str] = None
+        remaining = max(1, count)
+
+        while remaining > 0:
+            batch_count = min(remaining, 200)
+            url = f"{self.BASE_URL}/candles/minutes/1?market={market}&count={batch_count}"
+            if to_param:
+                url += f"&to={to_param}"
+            try:
+                r = self.session.get(url, timeout=6)
+                if r.status_code != 200:
+                    break
+                rows = r.json()
+                if not rows or not isinstance(rows, list):
+                    break
+                for row in rows:
                     ms = int(row.get("timestamp", 0))
                     t_sec = (ms // 60000) * 60
                     close_krw = float(row.get("trade_price", 0.0) or 0.0)
                     vol_krw = float(row.get("candle_acc_trade_price", 0.0) or 0.0)
                     if t_sec > 0 and close_krw > 0:
                         out[t_sec] = (close_krw, vol_krw)
-        except Exception:
-            pass
+
+                oldest = rows[-1].get("candle_date_time_utc")
+                if not oldest or len(rows) < batch_count:
+                    break
+                to_param = oldest
+                remaining -= len(rows)
+                time.sleep(0.04)  # 10 req/s compliance
+            except Exception:
+                break
+
         return out
 
 

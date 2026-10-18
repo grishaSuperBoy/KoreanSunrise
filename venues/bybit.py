@@ -87,7 +87,7 @@ class BybitRestClient:
     def fetch_klines_1m(
         self,
         symbol: str,
-        limit: int = 200,
+        limit: int = 1440,
         mult: float = 1.0,
     ) -> Dict[int, Tuple[float, float]]:
         """

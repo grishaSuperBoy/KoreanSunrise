@@ -282,7 +282,8 @@ class KoreanEngine:
             trigger_type = "spread_blowout"
             swept_usd = max(prev_upbit_snap.best_ask_usd, max(0.0, prev_upbit_snap.depth_ask_usd - cur_depth))
 
-        for follower_ex in ("binance", "bybit"):
+        follower_exchanges = [ex for (ex, c) in self._books.keys() if ex != "upbit" and c == coin]
+        for follower_ex in follower_exchanges:
             f_snap = self._books.get((follower_ex, coin))
             f_recv = self._recv_ts.get((follower_ex, coin), 0.0)
             if f_snap is None or (now - f_recv) > 2.0:

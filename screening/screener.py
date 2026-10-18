@@ -39,7 +39,7 @@ DEFAULT_MAX_PRICE_DIFF_PCT = 15.0       # Max 15% price diff (eliminates namesak
 DEFAULT_MIN_CORR = 0.65                 # Min correlation of minute log-returns
 DEFAULT_MIN_BOTH_TRADE = 0.15           # Min 15% of minutes traded on both sides
 DEFAULT_MIN_DEV_BPS = 8.0               # Min 8.0 bps P90 spread volatility
-DEFAULT_KLINE_LIMIT = 200               # 200 1-minute candles (~3.3 hours)
+DEFAULT_KLINE_LIMIT = 1440             # 1440 1-minute candles (24 hours = 1 day)
 
 CLIENT_FACTORIES: Dict[str, Any] = {
     "binance": BinanceRestClient,
