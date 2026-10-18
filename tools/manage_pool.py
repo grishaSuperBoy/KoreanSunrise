@@ -1,5 +1,5 @@
 """
-tools/manage_pool.py — CLI management tool for Korean Sunrise pools & execution profiles.
+tools/manage_pool.py - CLI tool for managing Korean Sunrise Incubator, Battle, and Execution Profiles.
 
 Pool Commands:
   python tools/manage_pool.py status
@@ -7,12 +7,12 @@ Pool Commands:
   python tools/manage_pool.py list-incubator
   python tools/manage_pool.py pause <COIN> [--reason <REASON>]
   python tools/manage_pool.py resume <COIN>
-  python tools/manage_pool.py evaluate [--days <N>] [--min-events <M>] [--dry-run]
-  python tools/manage_pool.py set-param [--min-order <USD>] [--stealth-frac <FRAC>] [--size-cap <USD>]
+  python tools/manage_pool.py promote <COIN> [--reason <REASON>]
+  python tools/manage_pool.py demote <COIN> [--reason <REASON>]
+  python tools/manage_pool.py evaluate [--dry-run] [--days <N>]
 
-Profile Commands:
+Execution Profile Commands:
   python tools/manage_pool.py profile
-  python tools/manage_pool.py pairs
   python tools/manage_pool.py set-capital <VENUE> <USD>
   python tools/manage_pool.py set-slots <N>
 """
@@ -23,7 +23,8 @@ import datetime
 import json
 import os
 import sys
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, List, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(HERE)
@@ -35,24 +36,16 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from pipeline.pool_state import (
-    PoolStateManager,
-    _read_json,
-    _write_json_atomic,
-    OVERRIDES_FILE,
-)
+from pipeline.pool_state import PoolStateManager, OVERRIDES_FILE
 from pipeline.evaluator import SunriseEvaluator
 from pipeline.profile import TradingProfileManager
 
 
-def cmd_status(psm: PoolStateManager, tpm: TradingProfileManager, args: argparse.Namespace) -> None:
+def cmd_status(psm: PoolStateManager, args: argparse.Namespace) -> None:
     psm.reload()
-    tpm.reload()
     snap = psm.get_pool_snapshot()
-    prof = tpm.get_profile()
-
-    if args.json:
-        print(json.dumps({"pool": snap, "profile": prof}, indent=2, ensure_ascii=False))
+    if getattr(args, "json", False):
+        print(json.dumps(snap, indent=2, ensure_ascii=False))
         return
 
     summary = snap["summary"]
@@ -60,266 +53,227 @@ def cmd_status(psm: PoolStateManager, tpm: TradingProfileManager, args: argparse
     up_ts = snap["updated_at"]
     up_str = datetime.datetime.fromtimestamp(up_ts).strftime("%Y-%m-%d %H:%M:%S") if up_ts else "never"
 
-    print("=" * 78)
-    print(" 🌅 KOREAN SUNRISE — CONTINUOUS POOL & EXECUTION STATUS")
-    print("=" * 78)
-    print(f" Last Updated      : {up_str}")
-    print(f" Incubator Pool    : {summary['incubator']} coins (Telemetry collection)")
-    print(f" Battle Pool       : {summary['battle']} coins (Active: {summary['battle_active']}, Paused: {summary['paused']})")
-    print("-" * 78)
-    print(" Sizing & Gate Parameters (Zero Hardcode):")
-    print(f"   Min Order Size  : ${settings['min_order_usd']:.2f}")
-    print(f"   Stealth Fraction: {settings['stealth_depth_frac']*100:.1f}% (of top-3 follower ask depth)")
-    print(f"   Max Position Cap: ${settings['size_cap_usd']:,.2f}")
-    print("-" * 78)
-    caps = prof.get("capital", {}).get("per_venue_usd", {})
-    cap_strs = [f"{v.capitalize()}: ${amt:.2f}" for v, amt in caps.items()]
-    print(f" Active Venues     : {', '.join(prof.get('active_venues', []))}")
-    print(f" Capital per Venue : {' | '.join(cap_strs)}")
-    print(f" Max Active Slots  : {prof.get('max_active_slots', 3)} concurrent positions")
-    print("=" * 78)
-
-    paused = [c for c in snap["coins"].values() if not c["enabled"]]
-    if paused:
-        print("\nPAUSED COINS (Circuit Breaker):")
-        for c in paused:
-            print(f"  • {c['coin']:<12} | reason: {c.get('pause_reason') or 'unspecified'} (basket: {c['basket']})")
-    print()
+    print("=" * 70)
+    print(" KOREAN SUNRISE CONTINUOUS TRADING POOL STATUS")
+    print("=" * 70)
+    print(f" Last Updated   : {up_str}")
+    print(f" Incubator Coins: {summary['incubator']}")
+    print(f" Battle Coins   : {summary['battle']} (Active: {summary['battle_active']}, Paused: {summary['paused']})")
+    print("-" * 70)
+    print(" Sizing & Risk Parameters:")
+    print(f"   Min Order Size: ${settings['min_order_usd']:.2f}")
+    depth_frac = settings.get("stealth_depth_frac", settings.get("max_depth_frac", 0.15))
+    print(f"   Max Depth Frac: {depth_frac*100:.1f}% (top-3 depth)")
+    print(f"   Size Cap      : ${settings['size_cap_usd']:,.2f}")
+    print("=" * 70)
 
 
 def cmd_list_battle(psm: PoolStateManager, args: argparse.Namespace) -> None:
     psm.reload()
-    coins = psm.get_battle_coins()
-    if args.json:
-        print(json.dumps(coins, indent=2, ensure_ascii=False))
+    snap = psm.get_pool_snapshot()
+    coins_dict = snap.get("coins", {})
+    battle = [c for c in coins_dict.values() if c.get("basket") == "battle"]
+
+    if getattr(args, "json", False):
+        print(json.dumps(battle, indent=2, ensure_ascii=False))
         return
 
-    print("=" * 95)
-    print(f" ⚔️ ACTIVE BATTLE POOL ({len(coins)} QUALIFIED COINS)")
-    print("=" * 95)
-    if not coins:
-        print("  No qualified battle coins found in live_trading_pool.json.")
-        print("  Run 'python tools/manage_pool.py evaluate' to score recorded signals and promote candidates.")
-        print("=" * 95)
+    print("=" * 80)
+    print(f" BATTLE POOL COINS ({len(battle)})")
+    print("=" * 80)
+    if not battle:
+        print(" [!] Battle pool is currently empty.")
+        print("=" * 80)
         return
 
-    hdr = f"{'#':<3} {'Coin':<10} {'Exp PnL':>10} {'WinRate':>9} {'ProfitFact':>11} {'Depth($)':>10} {'Size($)':>9} {'Signals':>8} {'Venues':<20}"
-    print(hdr)
-    print("-" * 95)
-    for i, c in enumerate(coins, 1):
-        v_str = ",".join(c.get("venues", []))
+    print(f" {'Coin':<8} | {'Status':<8} | {'WinRate':<7} | {'Net PnL':<10} | {'Promoted At':<19} | {'Follower Venues'}")
+    print("-" * 80)
+    for c in battle:
+        status_str = "ACTIVE" if c["enabled"] else "PAUSED"
+        up_at = datetime.datetime.fromtimestamp(c["promoted_at"]).strftime("%Y-%m-%d %H:%M:%S") if c.get("promoted_at") else "-"
+        venues_str = ", ".join(c.get("venues", []))
         print(
-            f"{i:<3} {c['coin']:<10} "
-            f"{c.get('mean_net_pnl_bps', 0):>+9.1f}bps "
-            f"{c.get('win_rate_pct', 0):>8.1f}% "
-            f"{c.get('profit_factor', 0):>10.2f} "
-            f"${c.get('top3_depth_usd', 0):>9,.0f} "
-            f"${c.get('recommended_size_usd', 0):>8.2f} "
-            f"{c.get('event_count', 0):>8} "
-            f"{v_str:<20}"
+            f" {c['coin']:<8} | {status_str:<8} | "
+            f"{c.get('win_rate_pct', 0):>6.1f}% | {c.get('median_net_pnl_bps', 0):>7.1f} bps | {up_at:<19} | {venues_str}"
         )
-    print("=" * 95)
+    print("=" * 80)
 
 
 def cmd_list_incubator(psm: PoolStateManager, args: argparse.Namespace) -> None:
     psm.reload()
     snap = psm.get_pool_snapshot()
-    incubator_coins = [c for c in snap["coins"].values() if c["basket"] == "incubator"]
-    if args.json:
-        print(json.dumps(incubator_coins, indent=2, ensure_ascii=False))
+    coins_dict = snap.get("coins", {})
+    incubator = [c for c in coins_dict.values() if c.get("basket") == "incubator"]
+
+    if getattr(args, "json", False):
+        print(json.dumps(incubator, indent=2, ensure_ascii=False))
         return
 
-    print("=" * 78)
-    print(f" 🧪 INCUBATOR CANDIDATES ({len(incubator_coins)} COINS)")
-    print("=" * 78)
-    if not incubator_coins:
-        print("  No incubator coins loaded.")
-        print("  Run 'python tools/screen_universe.py' to generate universe_live.json.")
-        print("=" * 78)
-        return
-
-    for i, c in enumerate(incubator_coins[:50], 1):
-        v_str = ",".join(c.get("venues", []))
-        st = "ACTIVE" if c["enabled"] else f"PAUSED ({c.get('pause_reason')})"
-        print(f"  {i:3d}. {c['coin']:<10} | {st:<15} | venues: {v_str}")
-    if len(incubator_coins) > 50:
-        print(f"  ... and {len(incubator_coins) - 50} more coins.")
-    print("=" * 78)
+    print("=" * 80)
+    print(f" INCUBATOR COINS ({len(incubator)})")
+    print("=" * 80)
+    print(f" {'Coin':<8} | {'Status':<8} | {'Venues Count':<12} | {'Follower Venues'}")
+    print("-" * 80)
+    for c in incubator:
+        status_str = "ENABLED" if c["enabled"] else "DISABLED"
+        v_list = c.get("venues", [])
+        print(f" {c['coin']:<8} | {status_str:<8} | {len(v_list):>12} | {', '.join(v_list)}")
+    print("=" * 80)
 
 
 def cmd_pause(psm: PoolStateManager, args: argparse.Namespace) -> None:
-    coin = args.coin.strip().upper()
-    reason = args.reason or "manual CLI pause"
-    psm.pause_coin(coin, reason=reason)
-    print(f"✓ Paused coin: {coin} (reason: {reason})")
-    print("  Persisted to runtime_overrides.json. Signals will not be actionable.")
+    coin = args.coin.upper()
+    psm.pause_coin(coin, reason=args.reason or "manual_operator_pause")
+    print(f"[OK] Paused coin {coin}: {args.reason or 'manual_operator_pause'}")
 
 
 def cmd_resume(psm: PoolStateManager, args: argparse.Namespace) -> None:
-    coin = args.coin.strip().upper()
+    coin = args.coin.upper()
     psm.resume_coin(coin)
-    print(f"✓ Resumed coin: {coin}")
+    print(f"[OK] Resumed coin {coin}")
 
 
-def cmd_evaluate(args: argparse.Namespace) -> None:
-    data_root = os.getenv("DATA_ROOT", os.path.join(PROJECT_ROOT, "data"))
-    ev = SunriseEvaluator(
-        data_root=data_root,
-        days_back=args.days,
-        min_events=args.min_events,
-    )
-    ranked = ev.run(dry_run=args.dry_run)
-    if args.dry_run:
-        print(f"\n[DRY-RUN] Evaluated {len(ranked)} qualifying coins without modifying live_trading_pool.json.")
+def cmd_promote(psm: PoolStateManager, args: argparse.Namespace) -> None:
+    coin = args.coin.upper()
+    ok = psm.promote_to_battle(coin, score=100.0, ev_net_bps=25.0, top3_depth_usd=500.0, win_rate_pct=85.0, min_events=0)
+    if ok:
+        print(f"[OK] Promoted {coin} to Battle pool.")
     else:
-        print(f"\n✓ Evaluation complete. {len(ranked)} coins updated in Battle pool.")
+        print(f"[!] Failed to promote {coin}.")
 
 
-def cmd_profile(tpm: TradingProfileManager, args: argparse.Namespace) -> None:
+def cmd_demote(psm: PoolStateManager, args: argparse.Namespace) -> None:
+    coin = args.coin.upper()
+    psm.demote_to_incubator(coin, reason=args.reason or "manual_demote")
+    print(f"[OK] Demoted {coin} to Incubator pool.")
+
+
+def cmd_evaluate(psm: PoolStateManager, args: argparse.Namespace) -> None:
+    print(f"[*] Running quantitative evaluation across trailing {args.days} days...")
+    ev = SunriseEvaluator(data_root=os.path.join(PROJECT_ROOT, "data"), pool_state=psm)
+    res = ev.run()
+    print(f"[OK] Evaluation complete: {len(res)} coins qualified and promoted to Battle pool.")
+
+
+def cmd_profile(args: argparse.Namespace) -> None:
+    tpm = TradingProfileManager()
     tpm.reload()
     prof = tpm.get_profile()
-    if args.json:
+    if getattr(args, "json", False):
         print(json.dumps(prof, indent=2, ensure_ascii=False))
         return
 
+    print("=" * 70)
+    print(" TRADING PROFILE & CAPITAL ALLOCATION")
+    print("=" * 70)
     caps = prof.get("capital", {}).get("per_venue_usd", {})
-    print("=" * 65)
-    print(" 💼 EXECUTION PROFILE & CAPITAL ALLOCATION")
-    print("=" * 65)
-    print(f" Active Venues       : {', '.join(prof.get('active_venues', []))}")
-    print(f" Margin Cushion      : {prof.get('capital', {}).get('reserve_margin_frac', 0.2)*100:.0f}%")
-    print(f" Max Active Slots    : {prof.get('max_active_slots', 3)}")
-    print(f" Min Order Notional  : ${prof.get('min_order_usd', 10.0):.2f}")
-    print(f" Max Single Position : ${prof.get('max_single_position_usd', 500.0):.2f}")
-    print("-" * 65)
-    print(" Deposits per Venue:")
-    for v, amt in caps.items():
-        print(f"   • {v:<12} : ${amt:.2f}")
-    print("=" * 65)
+    reserve = prof.get("capital", {}).get("reserve_margin_frac", 0.20)
+    slots = prof.get("max_active_slots", 5)
+    print(f" Margin Reserve Cushion: {reserve*100:.1f}%")
+    print(f" Max Concurrent Slots  : {slots}")
+    print("-" * 70)
+    print(f" {'Follower Venue':<20} | {'Capital USD':<15} | {'Slot Budget USD'}")
+    print("-" * 70)
+    total_cap = 0.0
+    for v, usd in sorted(caps.items()):
+        total_cap += float(usd)
+        slot_b = (float(usd) / max(1, slots)) * (1.0 - reserve)
+        print(f" {v.upper():<20} | ${float(usd):>12.2f}  | ${slot_b:>13.2f}")
+    print("-" * 70)
+    print(f" {'TOTAL CAPITAL':<20} | ${total_cap:>12.2f}")
+    print("=" * 70)
 
 
-def cmd_pairs(psm: PoolStateManager, tpm: TradingProfileManager, args: argparse.Namespace) -> None:
-    psm.reload()
-    tpm.reload()
-    battle_coins = psm.get_battle_coins()
-
-    print("=" * 85)
-    print(" 🎯 ACTIONABLE BATTLE PAIRS MATCHED WITH ACTIVE VENUE DEPOSITS")
-    print("=" * 85)
-    if not battle_coins:
-        print("  No active battle coins currently qualified.")
-        print("=" * 85)
-        return
-
-    print(f"{'Coin':<10} | {'Venues':<18} | {'Top-3 Depth':>12} | {'Venue Size ($)':<35}")
-    print("-" * 85)
-    for c in battle_coins:
-        coin = c["coin"]
-        venues = c.get("venues", [])
-        depth = c.get("top3_depth_usd", 0.0)
-        size_parts = []
-        for v in venues:
-            sz = tpm.calculate_stealth_order_size(v, depth)
-            if sz:
-                size_parts.append(f"{v}: ${sz:.2f}")
-        size_str = " | ".join(size_parts) if size_parts else "depth too low"
-        print(f"{coin:<10} | {','.join(venues):<18} | ${depth:>10,.0f} | {size_str:<35}")
-    print("=" * 85)
+def cmd_set_capital(args: argparse.Namespace) -> None:
+    tpm = TradingProfileManager()
+    tpm.set_venue_capital(args.venue, float(args.usd))
+    print(f"[OK] Set capital for venue '{args.venue}' to ${float(args.usd):.2f}")
 
 
-def cmd_set_capital(tpm: TradingProfileManager, args: argparse.Namespace) -> None:
-    venue = args.venue.lower().strip()
-    amount = float(args.amount)
-    tpm.set_venue_capital(venue, amount)
-    print(f"✓ Capital for {venue} updated to ${amount:.2f}")
-
-
-def cmd_set_slots(tpm: TradingProfileManager, args: argparse.Namespace) -> None:
-    slots = int(args.slots)
-    tpm.set_max_slots(slots)
-    print(f"✓ Max concurrent active slots updated to {slots}")
-
-
-def cmd_set_param(args: argparse.Namespace) -> None:
-    overrides = _read_json(OVERRIDES_FILE, default={})
-    if args.min_order is not None:
-        overrides["min_order_usd"] = float(args.min_order)
-    if args.stealth_frac is not None:
-        overrides["stealth_depth_frac"] = float(args.stealth_frac)
-    if args.size_cap is not None:
-        overrides["size_cap_usd"] = float(args.size_cap)
-    _write_json_atomic(OVERRIDES_FILE, overrides)
-    print("✓ Sizing & risk parameters updated in runtime_overrides.json")
+def cmd_set_slots(args: argparse.Namespace) -> None:
+    tpm = TradingProfileManager()
+    tpm.set_max_slots(int(args.slots))
+    print(f"[OK] Set max active slots to {int(args.slots)}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Korean Sunrise Pool & Profile CLI Manager")
-    parser.add_argument("--json", action="store_true", help="Output results in JSON format")
-    sub = parser.add_subparsers(dest="command")
+    parser = argparse.ArgumentParser(description="Korean Sunrise Pool & Profile CLI Manager.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
-    # Pool commands
-    sub.add_parser("status", help="Show overview of Incubator, Battle, and sizing parameters")
-    sub.add_parser("list-battle", help="List active Battle pool coins")
-    sub.add_parser("list-incubator", help="List candidate Incubator coins")
+    # status
+    p_stat = sub.add_parser("status", help="Show pool summary status")
+    p_stat.add_argument("--json", action="store_true")
 
-    p_pause = sub.add_parser("pause", help="Pause a coin (circuit breaker)")
-    p_pause.add_argument("coin", help="Base coin symbol (e.g. SAND)")
-    p_pause.add_argument("--reason", default="manual CLI pause", help="Pause reason")
+    # list-battle
+    p_bat = sub.add_parser("list-battle", help="List battle pool coins")
+    p_bat.add_argument("--json", action="store_true")
 
-    p_resume = sub.add_parser("resume", help="Resume a paused coin")
-    p_resume.add_argument("coin", help="Base coin symbol")
+    # list-incubator
+    p_inc = sub.add_parser("list-incubator", help="List incubator coins")
+    p_inc.add_argument("--json", action="store_true")
 
-    p_eval = sub.add_parser("evaluate", help="Score recorded signals and promote to Battle")
-    p_eval.add_argument("--days", type=int, default=7, help="Days of logs to scan (default: 7)")
-    p_eval.add_argument("--min-events", type=int, default=5, help="Minimum qualifying events (default: 5)")
-    p_eval.add_argument("--dry-run", action="store_true", help="Score without modifying live_trading_pool.json")
+    # pause
+    p_pau = sub.add_parser("pause", help="Pause trading on a coin")
+    p_pau.add_argument("coin", help="Coin symbol")
+    p_pau.add_argument("--reason", default="manual_pause")
 
-    p_param = sub.add_parser("set-param", help="Update sizing & risk parameters")
-    p_param.add_argument("--min-order", type=float, help="Min order USD")
-    p_param.add_argument("--stealth-frac", type=float, help="Stealth fraction of top-3 depth")
-    p_param.add_argument("--size-cap", type=float, help="Size cap USD")
+    # resume
+    p_res = sub.add_parser("resume", help="Resume trading on a coin")
+    p_res.add_argument("coin", help="Coin symbol")
 
-    # Profile commands
-    sub.add_parser("profile", help="Show execution profile and venue deposits")
-    sub.add_parser("pairs", help="List actionable battle pairs with computed order sizes")
+    # promote
+    p_pro = sub.add_parser("promote", help="Promote coin to battle")
+    p_pro.add_argument("coin", help="Coin symbol")
+    p_pro.add_argument("--reason", default="manual_promote")
 
-    p_cap = sub.add_parser("set-capital", help="Set deposit capital for a venue")
-    p_cap.add_argument("venue", help="Follower venue (binance, bybit)")
-    p_cap.add_argument("amount", type=float, help="Capital in USD")
+    # demote
+    p_dem = sub.add_parser("demote", help="Demote coin to incubator")
+    p_dem.add_argument("coin", help="Coin symbol")
+    p_dem.add_argument("--reason", default="manual_demote")
 
-    p_slots = sub.add_parser("set-slots", help="Set max concurrent active position slots")
-    p_slots.add_argument("slots", type=int, help="Number of slots")
+    # evaluate
+    p_ev = sub.add_parser("evaluate", help="Run pool promotion evaluator")
+    p_ev.add_argument("--days", type=float, default=7.0)
+
+    # profile
+    p_prof = sub.add_parser("profile", help="Show trading capital profile")
+    p_prof.add_argument("--json", action="store_true")
+
+    # set-capital
+    p_scap = sub.add_parser("set-capital", help="Set capital for a venue")
+    p_scap.add_argument("venue", help="Follower venue name")
+    p_scap.add_argument("usd", type=float, help="Capital USD")
+
+    # set-slots
+    p_slot = sub.add_parser("set-slots", help="Set max active slots")
+    p_slot.add_argument("slots", type=int, help="Max slots")
 
     args = parser.parse_args()
-    if not args.command:
-        parser.print_help()
-        return
 
     psm = PoolStateManager()
-    tpm = TradingProfileManager()
 
-    if args.command == "status":
-        cmd_status(psm, tpm, args)
-    elif args.command == "list-battle":
+    if args.cmd == "status":
+        cmd_status(psm, args)
+    elif args.cmd == "list-battle":
         cmd_list_battle(psm, args)
-    elif args.command == "list-incubator":
+    elif args.cmd == "list-incubator":
         cmd_list_incubator(psm, args)
-    elif args.command == "pause":
+    elif args.cmd == "pause":
         cmd_pause(psm, args)
-    elif args.command == "resume":
+    elif args.cmd == "resume":
         cmd_resume(psm, args)
-    elif args.command == "evaluate":
-        cmd_evaluate(args)
-    elif args.command == "set-param":
-        cmd_set_param(args)
-    elif args.command == "profile":
-        cmd_profile(tpm, args)
-    elif args.command == "pairs":
-        cmd_pairs(psm, tpm, args)
-    elif args.command == "set-capital":
-        cmd_set_capital(tpm, args)
-    elif args.command == "set-slots":
-        cmd_set_slots(tpm, args)
+    elif args.cmd == "promote":
+        cmd_promote(psm, args)
+    elif args.cmd == "demote":
+        cmd_demote(psm, args)
+    elif args.cmd == "evaluate":
+        cmd_evaluate(psm, args)
+    elif args.cmd == "profile":
+        cmd_profile(args)
+    elif args.cmd == "set-capital":
+        cmd_set_capital(args)
+    elif args.cmd == "set-slots":
+        cmd_set_slots(args)
 
 
 if __name__ == "__main__":

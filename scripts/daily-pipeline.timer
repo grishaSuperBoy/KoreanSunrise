@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily Timer for Korean Sunrise 24-Hour Autonomous Lifecycle Pipeline
+
+[Timer]
+OnCalendar=*-*-* 00:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

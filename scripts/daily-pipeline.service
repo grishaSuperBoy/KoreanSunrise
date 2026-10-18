@@ -1,0 +1,11 @@
+[Unit]
+Description=Korean Sunrise 24-Hour Autonomous Lifecycle Pipeline Service
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/KoreanSunrise
+ExecStart=/usr/bin/python3 tools/run_daily_pipeline.py
+StandardOutput=append:/root/KoreanSunrise/logs/daily_pipeline.log
+StandardError=append:/root/KoreanSunrise/logs/daily_pipeline.log

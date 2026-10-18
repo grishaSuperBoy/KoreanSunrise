@@ -1,0 +1,20 @@
+[Unit]
+Description=Korean Sunrise Lead-Lag Sniping & Data Telemetry Service
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/KoreanSunrise
+ExecStart=/usr/bin/python3 main.py
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=15
+LimitNOFILE=65535
+StandardOutput=append:/root/KoreanSunrise/logs/service_stdout.log
+StandardError=append:/root/KoreanSunrise/logs/service_stderr.log
+
+[Install]
+WantedBy=multi-user.target
