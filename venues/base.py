@@ -17,7 +17,7 @@ import requests
 from requests.adapters import HTTPAdapter
 import websockets
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 
 log = logging.getLogger("stream")
 
@@ -165,36 +165,66 @@ def _secs_until_daily_reconnect_for(name: str) -> float:
 
 class ReconnectPolicy:
     """
-    Adaptive exponential backoff policy with rate-limit and network error awareness.
-    Provides graduated backoff delays for 429 (Too Many Requests), 403 (Forbidden),
-    and DNS/network timeouts.
+    Unified exponential backoff and rate-limit mitigation policy for all stream connections.
+    Eliminates fragile hardcoded sleeps and protects against exchange IP bans.
     """
     def __init__(
         self,
         base_delay: float = 2.0,
-        max_delay: float = 60.0,
-        backoff_factor: float = 1.5,
+        max_delay: float = 120.0,
+        factor: float = 2.0,
+        healthy_threshold_sec: float = 15.0,
+        use_jitter: bool = False,
+        **kwargs: Any,
     ):
+        if "backoff_factor" in kwargs:
+            factor = float(kwargs["backoff_factor"])
         self.base_delay = base_delay
         self.max_delay = max_delay
-        self.backoff_factor = backoff_factor
-        self.attempts = 0
+        self.factor = factor
+        self.backoff_factor = factor  # alias for backward compatibility
+        self.healthy_threshold_sec = healthy_threshold_sec
+        self.use_jitter = use_jitter
+        self.consecutive_failures = 0
+        self._last_connected_ts = 0.0
+
+    def record_connected(self) -> None:
+        self._last_connected_ts = time.time()
+
+    def record_disconnected(self) -> None:
+        now = time.time()
+        # If the stream was connected and healthy for >= healthy_threshold_sec,
+        # reset consecutive failures so normal periodic reconnects start from base_delay.
+        if self._last_connected_ts > 0.0 and (now - self._last_connected_ts >= self.healthy_threshold_sec):
+            self.consecutive_failures = 0
+
+    def compute_delay(self, error: Any = None, use_jitter: Optional[bool] = None) -> float:
+        self.record_disconnected()
+        self.consecutive_failures += 1
+
+        # Exponential backoff: base_delay * (factor ** min(attempts, 6))
+        exp_delay = min(self.max_delay, self.base_delay * (self.factor ** min(self.consecutive_failures - 1, 6)))
+        should_jitter = self.use_jitter if use_jitter is None else use_jitter
+        if should_jitter:
+            # Predictable jitter based on attempt count (0.2s - 0.9s)
+            jitter = 0.2 + ((self.consecutive_failures * 17) % 70) / 100.0
+            delay = exp_delay + jitter
+        else:
+            delay = exp_delay
+
+        err_str = str(error or "").lower()
+        # Rate limit (HTTP 429 / 418 / "rate" / "too many requests") -> minimum 60.0s cool-down
+        if "429" in err_str or "418" in err_str or "rate" in err_str or "too many" in err_str:
+            delay = max(delay, 60.0)
+        # Cloudflare / DNS resolution / Block (HTTP 403 / 11001 / getaddrinfo) -> minimum 30.0s cool-down
+        elif "403" in err_str or "11001" in err_str or "getaddrinfo" in err_str:
+            delay = max(delay, 30.0)
+
+        return min(self.max_delay, delay)
 
     def reset(self) -> None:
-        self.attempts = 0
-
-    def compute_delay(self, exc: Optional[Exception] = None) -> float:
-        err_str = str(exc or "").lower()
-        if "429" in err_str or "too many requests" in err_str:
-            self.attempts += 2
-            return min(self.max_delay, max(30.0, self.base_delay * (self.backoff_factor ** self.attempts)))
-        if "403" in err_str or "forbidden" in err_str or "11001" in err_str or "getaddrinfo" in err_str:
-            self.attempts += 1
-            return min(self.max_delay, max(20.0, self.base_delay * (self.backoff_factor ** self.attempts)))
-
-        delay = min(self.max_delay, self.base_delay * (self.backoff_factor ** self.attempts))
-        self.attempts += 1
-        return delay
+        self.consecutive_failures = 0
+        self._last_connected_ts = 0.0
 
 
 class TTLCache:
@@ -238,10 +268,15 @@ class BaseVenueStream:
         self.connected = False
         self.last_msg_ts = 0.0
         self.last_data_ts = 0.0
+        self._connect_ts = 0.0
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self.subscribed: List[str] = []
+        self.sub_accepted: int = 0
+        self.sub_rejected: int = 0
+        self.sub_errors: List[str] = []
         self.symbols_seen: Set[str] = set()
+        self.sym_first_ts: Dict[str, float] = {}
         self.books_dropped = 0
         self.levels_dropped = 0
         self.seq_gaps = 0
@@ -249,19 +284,121 @@ class BaseVenueStream:
         self._last_u: Dict[str, int] = {}
         self._last_seq: Dict[str, int] = {}
         self._first_ts = 0.0
-        self._reconnect_policy = ReconnectPolicy(base_delay=2.0, max_delay=60.0)
+        self._reconnect_policy = ReconnectPolicy(base_delay=2.0, max_delay=120.0)
 
     def _note_connect(self) -> None:
         self.connected = True
         self.last_msg_ts = time.time()
+        self._connect_ts = self.last_msg_ts
         if not self._first_ts:
             self._first_ts = self.last_msg_ts
-        self._reconnect_policy.reset()
+        self._reconnect_policy.record_connected()
 
     def _note_symbol(self, sym: str) -> None:
-        if sym:
-            self.symbols_seen.add(str(sym).upper())
-            self.last_data_ts = time.time()
+        if not sym:
+            return
+        s = sym.upper()
+        self.last_data_ts = time.time()
+        if s not in self.symbols_seen:
+            self.symbols_seen.add(s)
+            if not self._first_ts:
+                self._first_ts = time.time()
+            self.sym_first_ts[s] = self._first_ts
+
+    def _note_sub(self, ok: bool, msg: str = "") -> None:
+        if ok:
+            self.sub_accepted += 1
+        else:
+            self.sub_rejected += 1
+            if msg:
+                self.sub_errors.append(msg[:200])
+                if len(self.sub_errors) > 20:
+                    del self.sub_errors[:-20]
+
+    def _starved_since_connect(self, now: float, grace_sec: float = 30.0) -> bool:
+        cts = getattr(self, "_connect_ts", 0.0) or 0.0
+        if cts <= 0:
+            return False
+        last_data = getattr(self, "last_data_ts", 0.0) or 0.0
+        return (now - cts > grace_sec) and (last_data <= cts)
+
+    @staticmethod
+    def _sub_reply_text(data: Dict[str, Any]) -> str:
+        for k in ("ret_msg", "msg", "message", "err_msg", "detail", "error"):
+            v = data.get(k)
+            if isinstance(v, str) and v:
+                return v
+            if isinstance(v, dict):
+                return json.dumps(v, ensure_ascii=False)[:200]
+        return ""
+
+    def _handle_sub_reply(self, data: Dict[str, Any]) -> None:
+        try:
+            if not isinstance(data, dict):
+                return
+            ev = str(data.get("event") or "").lower()
+            action = str(data.get("action") or "").lower()
+            msg_type = str(data.get("type") or "").lower()
+            req_id = str(data.get("id") or "")
+
+            if data.get("op") in ("ping", "pong") or str(data.get("ret_msg", "")).strip().lower() in ("pong", "ping"):
+                return
+
+            if data.get("error") not in (None, {}, "", []):
+                self._note_sub(False, self._sub_reply_text(data) or json.dumps(data.get("error"))[:200])
+                return
+
+            if data.get("success") is not None:
+                if data["success"]:
+                    self._note_sub(True)
+                else:
+                    self._note_sub(False, self._sub_reply_text(data) or "refused")
+                return
+
+            if data.get("op") == "error":
+                self._note_sub(False, self._sub_reply_text(data) or "error")
+                return
+
+            # Covers Toobit ("event": "sub"), OKX ("event": "subscribe"), LBank ("action": "subscribe")
+            if ev in ("sub", "subscribe", "unsubscribe") or action in ("sub", "subscribe"):
+                self._note_sub(True)
+                return
+            if ev == "error":
+                self._note_sub(False, self._sub_reply_text(data) or str(data.get("code", "")))
+                return
+
+            # KuCoin subscription acknowledgements
+            if msg_type in ("ack", "welcome"):
+                self._note_sub(True)
+                return
+
+            # XT / KuCoin batch response IDs
+            if req_id and (req_id.startswith("xt_") or req_id.startswith("kc_") or req_id.startswith("sub_")):
+                if "error" not in data and data.get("code") in (None, 0, "0", "00000", 200, "200"):
+                    self._note_sub(True)
+                    return
+
+            if "code" in data and not any(k in data for k in ("data", "dataType", "topic", "channel", "table")):
+                if str(data["code"]).strip() in ("0", "00000", "200000", "200"):
+                    self._note_sub(True)
+                else:
+                    self._note_sub(False, self._sub_reply_text(data) or str(data["code"]))
+                return
+
+            ch = str(data.get("channel", ""))
+            if ch.startswith("rs."):
+                reason = str(data.get("data", ""))
+                if ch == "rs.error" or reason not in ("success", ""):
+                    self._note_sub(False, reason or ch)
+                else:
+                    self._note_sub(True)
+                return
+
+            if "result" in data and data.get("result") is None:
+                self._note_sub(True)
+                return
+        except Exception:
+            pass
 
     def _sanitise(self, snap: OrderBookDepth5) -> None:
         """Sanitise and filter crossed books before forwarding to engine."""
@@ -297,7 +434,7 @@ class BaseVenueStream:
                 symbol=snap.symbol,
                 raw_symbol=snap.raw_symbol,
                 ts=snap.ts or now,
-                exchange_ts=int(snap.exchange_ts or (now * 1000)),
+                exchange_ts=normalize_exchange_ts(snap.exchange_ts) or int(now * 1000),
                 bids=bids[:5],
                 asks=asks[:5],
             )
@@ -330,6 +467,9 @@ class BaseVenueStream:
             "connected": self.connected,
             "symbols_seen": len(self.symbols_seen),
             "subscribed": len(self.subscribed),
+            "sub_accepted": self.sub_accepted,
+            "sub_rejected": self.sub_rejected,
+            "sub_errors": list(self.sub_errors),
             "last_data_ago_sec": (
                 round(time.time() - self.last_data_ts, 1)
                 if self.last_data_ts else None
@@ -440,10 +580,6 @@ class BaseCEXStream(BaseVenueStream):
                 continue
         return out
 
-    def _handle_sub_reply(self, data: Any) -> None:
-        """Hook to suppress subscription confirmation messages."""
-        pass
-
     async def _send_subscriptions(self, ws: Any) -> None:
         raise NotImplementedError
 
@@ -493,6 +629,10 @@ class BaseCEXStream(BaseVenueStream):
                                 log.info(f"[{self.name}] Scheduled daily reconnect. Reconnecting...")
                                 break
 
+                            if self._starved_since_connect(time.time()):
+                                log.warning(f"[{self.name}] Connected but no data in 30s, reconnecting...")
+                                break
+
                             if not self.last_msg_ts:
                                 self.last_msg_ts = time.time()
                             elif time.time() - self.last_msg_ts > 180.0:
@@ -536,5 +676,8 @@ class BaseCEXStream(BaseVenueStream):
             except Exception as e:
                 self.connected = False
                 delay = self._reconnect_policy.compute_delay(e)
-                log.warning(f"[{self.name}] WS disconnected: {e}. Reconnecting in {delay:.1f}s...")
+                log.warning(
+                    f"[{self.name}] WS disconnected: {e}. Reconnecting in {delay:.1f}s "
+                    f"(attempt {self._reconnect_policy.consecutive_failures})..."
+                )
                 await asyncio.sleep(delay)

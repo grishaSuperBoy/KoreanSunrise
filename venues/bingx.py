@@ -9,7 +9,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import BaseCEXStream, create_http_session, normalize_symbol, parse_symbol_and_mult, log
 
 
@@ -135,7 +135,7 @@ class BingXStream(BaseCEXStream):
                     symbol=sym,
                     raw_symbol=sym_raw,
                     ts=time.time(),
-                    exchange_ts=int(b_data.get("ts", 0) or time.time() * 1000),
+                    exchange_ts=normalize_exchange_ts(b_data.get("ts")) or int(time.time() * 1000),
                     bids=bids,
                     asks=asks,
                 ))

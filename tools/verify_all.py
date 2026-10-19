@@ -48,6 +48,7 @@ CORE_FILES = [
     "tools/pack_codebase.py",
     "tests/test_adaptive_stops_and_fixes.py",
     "tests/test_pipeline_e2e.py",
+    "tests/test_venues_streams_resilience.py",
 ]
 
 

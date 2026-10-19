@@ -13,9 +13,10 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
 import websockets
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import (
     BaseVenueStream,
+    ReconnectPolicy,
     create_http_session,
     normalize_symbol,
     parse_symbol_and_mult,
@@ -245,6 +246,10 @@ class HyperliquidStream(BaseVenueStream):
                                 log.info("[hyperliquid] Scheduled daily reconnect. Reconnecting...")
                                 break
 
+                            if self._starved_since_connect(time.time()):
+                                log.warning("[hyperliquid] Connected but no data in 30s, reconnecting...")
+                                break
+
                             if not self.last_msg_ts:
                                 self.last_msg_ts = time.time()
                             elif time.time() - self.last_msg_ts > 60.0:
@@ -266,8 +271,12 @@ class HyperliquidStream(BaseVenueStream):
                 break
             except Exception as e:
                 self.connected = False
-                log.warning(f"[hyperliquid] WS disconnected: {e}. Reconnecting in 3s...")
-                await asyncio.sleep(3.0)
+                delay = self._reconnect_policy.compute_delay(e)
+                log.warning(
+                    f"[hyperliquid] WS disconnected: {e}. Reconnecting in {delay:.1f}s "
+                    f"(attempt {self._reconnect_policy.consecutive_failures})..."
+                )
+                await asyncio.sleep(delay)
 
     async def _ping_loop(self, ws: Any) -> None:
         try:
@@ -281,6 +290,9 @@ class HyperliquidStream(BaseVenueStream):
         try:
             payload = json.loads(raw_msg)
             ch = payload.get("channel")
+            if ch == "subscriptionResponse":
+                self._note_sub(True)
+                return
             if ch != "l2Book":
                 return
 
@@ -328,12 +340,13 @@ class HyperliquidStream(BaseVenueStream):
             if not bids or not asks:
                 return
 
+            self._note_sub(True)
             snap = OrderBookDepth5(
                 exchange="hyperliquid",
                 symbol=coin,
                 raw_symbol=raw_sym,
                 ts=time.time(),
-                exchange_ts=int(data.get("time", 0)),
+                exchange_ts=normalize_exchange_ts(data.get("time")) or int(time.time() * 1000),
                 bids=bids,
                 asks=asks,
             )

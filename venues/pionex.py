@@ -9,7 +9,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import BaseCEXStream, create_http_session, normalize_symbol, parse_symbol_and_mult, log
 
 
@@ -145,7 +145,7 @@ class PionexStream(BaseCEXStream):
             asks = self._extract_levels(d.get("asks"), 5, mult=mult, contract_size=contract_size)
             if bids and asks:
                 self._note_symbol(sym)
-                ets = int(data.get("timestamp", 0) or time.time() * 1000)
+                ets = normalize_exchange_ts(data.get("timestamp")) or int(time.time() * 1000)
                 self.callback(OrderBookDepth5(
                     exchange="pionex",
                     symbol=sym,

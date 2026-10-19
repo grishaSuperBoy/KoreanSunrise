@@ -10,8 +10,15 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
 import websockets
 
-from models import OrderBookDepth5
-from venues.base import BaseVenueStream, create_http_session, normalize_symbol, _secs_until_daily_reconnect_for, log
+from models import OrderBookDepth5, normalize_exchange_ts
+from venues.base import (
+    BaseVenueStream,
+    ReconnectPolicy,
+    create_http_session,
+    normalize_symbol,
+    _secs_until_daily_reconnect_for,
+    log,
+)
 
 
 class KucoinRestClient:
@@ -160,7 +167,8 @@ class KucoinStream(BaseVenueStream):
                 token = data.get("token")
                 endpoints = data.get("instanceServers", [])
                 if not token or not endpoints:
-                    await asyncio.sleep(5.0)
+                    delay = self._reconnect_policy.compute_delay(Exception("kucoin bullet token failed"))
+                    await asyncio.sleep(delay)
                     continue
 
                 ws_endpoint = endpoints[0]["endpoint"]
@@ -207,6 +215,10 @@ class KucoinStream(BaseVenueStream):
                                 log.info("[kucoin] Daily scheduled reconnect. Reconnecting...")
                                 break
 
+                            if self._starved_since_connect(time.time()):
+                                log.warning("[kucoin] Connected but no data in 30s, reconnecting...")
+                                break
+
                             try:
                                 msg = await asyncio.wait_for(ws.recv(), timeout=min(30.0, remaining))
                             except asyncio.TimeoutError:
@@ -222,14 +234,20 @@ class KucoinStream(BaseVenueStream):
                 break
             except Exception as e:
                 self.connected = False
-                log.warning(f"[kucoin] WS error: {e}. Reconnecting in 3s...")
-                await asyncio.sleep(3.0)
+                delay = self._reconnect_policy.compute_delay(e)
+                log.warning(
+                    f"[kucoin] WS error: {e}. Reconnecting in {delay:.1f}s "
+                    f"(attempt {self._reconnect_policy.consecutive_failures})..."
+                )
+                await asyncio.sleep(delay)
 
     def _parse_message(self, raw_msg: str | bytes) -> None:
         try:
             if isinstance(raw_msg, bytes):
                 raw_msg = raw_msg.decode("utf-8")
             data = json.loads(raw_msg)
+            self._handle_sub_reply(data)
+
             topic = data.get("topic", "")
             if not topic.startswith("/contractMarket/level2Depth5:"):
                 return
@@ -244,7 +262,7 @@ class KucoinStream(BaseVenueStream):
             asks = [(float(p), float(q) * contract_size) for p, q in asks_raw if float(p) > 0 and float(q) > 0]
             if bids and asks:
                 self._note_symbol(sym)
-                ets = int(data.get("data", {}).get("timestamp", 0) or time.time() * 1000)
+                ets = normalize_exchange_ts(payload.get("timestamp")) or int(time.time() * 1000)
                 self.callback(OrderBookDepth5(
                     exchange="kucoin",
                     symbol=sym,

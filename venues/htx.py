@@ -9,7 +9,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import BaseCEXStream, create_http_session, normalize_symbol, log
 
 
@@ -153,7 +153,7 @@ class HTXStream(BaseCEXStream):
             asks = self._extract_levels(tick.get("asks"), 5, mult=mult, contract_size=contract_size)
             if bids and asks:
                 self._note_symbol(sym)
-                ets = int(data.get("ts", 0) or tick.get("ts", 0))
+                ets = normalize_exchange_ts(data.get("ts") or tick.get("ts")) or int(time.time() * 1000)
                 self.callback(OrderBookDepth5(
                     exchange="htx",
                     symbol=sym,

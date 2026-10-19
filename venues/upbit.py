@@ -13,9 +13,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 import websockets
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import (
     BaseVenueStream,
+    ReconnectPolicy,
     create_http_session,
     _secs_until_daily_reconnect_for,
     log,
@@ -235,7 +236,6 @@ class UpbitSpotStream(BaseVenueStream):
         self.rate_ts = time.time()
 
     async def _run_loop(self) -> None:
-        backoff = self.BACKOFF_MIN
         target_codes: List[str] = ["KRW-USDT"] + sorted(self._krw_to_coin.keys())
 
         while self._running:
@@ -262,11 +262,11 @@ class UpbitSpotStream(BaseVenueStream):
                     max_queue=4096,
                 ) as ws:
                     self._note_connect()
+                    self._note_sub(True)
                     self.last_msg_ts = time.time()
                     trades_note = " + trades" if self.trade_callback else ""
                     log.info(f"[upbit] Connected! Subscribed to {len(target_codes)} order books{trades_note} (incl. KRW-USDT).")
                     await ws.send(json.dumps(sub_msg))
-                    backoff = self.BACKOFF_MIN
 
                     try:
                         reconnect_in = _secs_until_daily_reconnect_for(self.name)
@@ -276,6 +276,10 @@ class UpbitSpotStream(BaseVenueStream):
                             remaining = deadline - time.monotonic()
                             if remaining <= 0:
                                 log.info("[upbit] Scheduled daily reconnect. Reconnecting...")
+                                break
+
+                            if self._starved_since_connect(time.time()):
+                                log.warning("[upbit] Connected but no data in 30s, reconnecting...")
                                 break
 
                             if time.time() - self.last_msg_ts > self.WATCHDOG_SECS:
@@ -296,9 +300,12 @@ class UpbitSpotStream(BaseVenueStream):
                 break
             except Exception as e:
                 self.connected = False
-                log.warning(f"[upbit] WS error: {e!r}. Reconnecting in {backoff:.0f}s...")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, self.BACKOFF_MAX)
+                delay = self._reconnect_policy.compute_delay(e)
+                log.warning(
+                    f"[upbit] WS error: {e!r}. Reconnecting in {delay:.1f}s "
+                    f"(attempt {self._reconnect_policy.consecutive_failures})..."
+                )
+                await asyncio.sleep(delay)
 
         self.connected = False
 
@@ -413,7 +420,7 @@ class UpbitSpotStream(BaseVenueStream):
             symbol=coin,
             raw_symbol=code,
             ts=time.time(),
-            exchange_ts=int(data.get("timestamp", 0)),
+            exchange_ts=normalize_exchange_ts(data.get("timestamp")) or int(time.time() * 1000),
             bids=bids,
             asks=asks,
         )

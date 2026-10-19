@@ -26,6 +26,7 @@ TARGET_FILES = [
     'tests/test_adaptive_stops_and_fixes.py',
     'tests/test_pipeline_e2e.py',
     'tests/test_venues_contract_size.py',
+    'tests/test_venues_streams_resilience.py',
     'tools/__init__.py',
     'tools/analyze_signals.py',
     'tools/audit_venues.py',

@@ -9166,6 +9166,508 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
+## tests/test_venues_streams_resilience.py
+
+```python
+"""
+tests/test_venues_streams_resilience.py - Deep Invariant and Resilience Tests for Venue Streams.
+
+Verifies:
+1. ReconnectPolicy: exponential backoff progression, jitter, 429 rate limit cooldown,
+   403/DNS cooldown, healthy connection reset (>15s), and fast-disconnect persistence.
+2. Starvation Detection: _starved_since_connect accurately catches silent zombie sockets.
+3. Subscription Telemetry: _note_sub and _handle_sub_reply across OKX, Bybit, KuCoin, Gate.io, MEXC.
+4. Timestamp Contracts: normalize_exchange_ts handles ns/us/ms/s, float, string, and invalid data.
+5. End-to-End Parsing: All 11 venue streams (Binance, Bybit, Upbit, Hyperliquid, KuCoin, OKX, Gateio,
+   MEXC, BingX, HTX, Pionex, Asterdex) emit clean, normalized OrderBookDepth5 with contract size adjustments.
+6. StreamManager: Telemetry rollup with sub_accepted, sub_rejected, sub_errors across all streams.
+"""
+from __future__ import annotations
+
+import json
+import time
+import unittest
+from typing import Any, Dict, List
+
+from config import MatchedUniverse
+from models import OrderBookDepth5, normalize_exchange_ts
+from venues.base import BaseVenueStream, BaseCEXStream, ReconnectPolicy
+from venues.manager import StreamManager
+from venues.binance import BinanceFuturesStream
+from venues.bybit import BybitPerpStream
+from venues.upbit import UpbitSpotStream
+from venues.hyperliquid import HyperliquidStream
+from venues.kucoin import KucoinStream
+from venues.okx import OKXStream
+from venues.gateio import GateioStream
+from venues.mexc import MEXCStream
+from venues.bingx import BingXStream
+from venues.htx import HTXStream
+from venues.pionex import PionexStream
+from venues.asterdex import AsterdexStream
+
+
+class TestReconnectPolicyResilience(unittest.TestCase):
+    """Tests exponential backoff, jitter, rate limits, and healthy threshold resets."""
+
+    def test_exponential_progression_deterministic(self):
+        policy = ReconnectPolicy(base_delay=2.0, max_delay=120.0, factor=2.0, use_jitter=False)
+        expected = [2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 120.0, 120.0]
+        actual = [policy.compute_delay() for _ in range(len(expected))]
+        self.assertEqual(actual, expected)
+
+    def test_jitter_variation(self):
+        policy = ReconnectPolicy(base_delay=2.0, max_delay=120.0, factor=2.0, use_jitter=True)
+        delays = [policy.compute_delay() for _ in range(5)]
+        # Delay must strictly exceed pure exponential progression due to positive jitter
+        pure_exp = [2.0, 4.0, 8.0, 16.0, 32.0]
+        for act, exp in zip(delays, pure_exp):
+            self.assertGreater(act, exp)
+            self.assertLessEqual(act, exp + 1.0)
+
+    def test_rate_limit_429_cooldown(self):
+        policy = ReconnectPolicy(base_delay=2.0, max_delay=120.0, factor=2.0)
+        delay_429 = policy.compute_delay(Exception("HTTP 429 Too Many Requests"))
+        self.assertGreaterEqual(delay_429, 60.0)
+
+        delay_rate = policy.compute_delay(Exception("rate limit exceeded"))
+        self.assertGreaterEqual(delay_rate, 60.0)
+
+    def test_forbidden_403_and_dns_cooldown(self):
+        policy = ReconnectPolicy(base_delay=2.0, max_delay=120.0, factor=2.0)
+        delay_403 = policy.compute_delay(Exception("HTTP 403 Forbidden Cloudflare"))
+        self.assertGreaterEqual(delay_403, 30.0)
+
+        delay_dns = policy.compute_delay(Exception("[Errno 11001] getaddrinfo failed"))
+        self.assertGreaterEqual(delay_dns, 30.0)
+
+    def test_healthy_connection_reset(self):
+        policy = ReconnectPolicy(base_delay=2.0, max_delay=120.0, factor=2.0, healthy_threshold_sec=15.0, use_jitter=False)
+        # Fail 1 -> 2.0
+        self.assertEqual(policy.compute_delay(), 2.0)
+        # Fail 2 -> 4.0
+        self.assertEqual(policy.compute_delay(), 4.0)
+
+        # Connect and stay connected for 20s (exceeds 15s healthy threshold)
+        t0 = time.time() - 20.0
+        policy._last_connected_ts = t0
+        # Disconnect after healthy connection -> consecutive_failures resets to 0, next delay starts at base 2.0
+        next_delay = policy.compute_delay()
+        self.assertEqual(next_delay, 2.0)
+
+    def test_fast_disconnect_preserves_backoff(self):
+        policy = ReconnectPolicy(base_delay=2.0, max_delay=120.0, factor=2.0, healthy_threshold_sec=15.0, use_jitter=False)
+        # Fail 1 -> 2.0
+        self.assertEqual(policy.compute_delay(), 2.0)
+
+        # Flapping connection: only stays up for 3 seconds (< 15s threshold)
+        t0 = time.time() - 3.0
+        policy._last_connected_ts = t0
+        # Disconnect -> consecutive failures preserved and incremented, next delay is 4.0
+        next_delay = policy.compute_delay()
+        self.assertEqual(next_delay, 4.0)
+
+
+class TestStarvationDetection(unittest.TestCase):
+    """Tests starvation detection logic for silent zombie sockets."""
+
+    def test_starvation_lifecycle(self):
+        stream = BaseVenueStream("test", ["BTC"], callback=lambda s: None)
+        now = time.time()
+
+        # Not yet connected
+        self.assertFalse(stream._starved_since_connect(now))
+
+        # Freshly connected
+        stream._note_connect()
+        # 10s after connect with no data: not starved yet (grace is 30s)
+        self.assertFalse(stream._starved_since_connect(stream._connect_ts + 10.0))
+
+        # 35s after connect with NO data: starved!
+        self.assertTrue(stream._starved_since_connect(stream._connect_ts + 35.0))
+
+        # Data arrives at connect + 15s
+        stream.last_data_ts = stream._connect_ts + 15.0
+        # At connect + 35s: data was received after connect -> NOT starved
+        self.assertFalse(stream._starved_since_connect(stream._connect_ts + 35.0))
+
+
+class TestSubscriptionTelemetry(unittest.TestCase):
+    """Tests subscription ACK tracking and payload parsing across venues."""
+
+    def test_note_sub_accounting(self):
+        stream = BaseVenueStream("test", ["BTC"], callback=lambda s: None)
+        self.assertEqual(stream.sub_accepted, 0)
+        self.assertEqual(stream.sub_rejected, 0)
+
+        stream._note_sub(True)
+        stream._note_sub(True)
+        self.assertEqual(stream.sub_accepted, 2)
+
+        stream._note_sub(False, "Symbol not supported")
+        self.assertEqual(stream.sub_rejected, 1)
+        self.assertEqual(stream.sub_errors, ["Symbol not supported"])
+
+    def test_handle_sub_reply_venues(self):
+        stream = BaseVenueStream("test", ["BTC"], callback=lambda s: None)
+
+        # OKX
+        stream._handle_sub_reply({"event": "subscribe", "arg": {"channel": "books5", "instId": "BTC-USDT-SWAP"}})
+        self.assertEqual(stream.sub_accepted, 1)
+
+        # Bybit
+        stream._handle_sub_reply({"op": "subscribe", "success": True, "ret_msg": ""})
+        self.assertEqual(stream.sub_accepted, 2)
+
+        # KuCoin Ack
+        stream._handle_sub_reply({"id": "kc_100", "type": "ack"})
+        self.assertEqual(stream.sub_accepted, 3)
+
+        # KuCoin Welcome
+        stream._handle_sub_reply({"id": "1", "type": "welcome"})
+        self.assertEqual(stream.sub_accepted, 4)
+
+        # Toobit / XT
+        stream._handle_sub_reply({"event": "sub"})
+        self.assertEqual(stream.sub_accepted, 5)
+
+        # Sub rejection / error
+        stream._handle_sub_reply({"event": "error", "code": "51000", "msg": "Invalid instrument"})
+        self.assertEqual(stream.sub_rejected, 1)
+
+        # Bybit failure
+        stream._handle_sub_reply({"op": "subscribe", "success": False, "ret_msg": "Too many topics"})
+        self.assertEqual(stream.sub_rejected, 2)
+
+        status = stream.get_status()
+        self.assertEqual(status["sub_accepted"], 5)
+        self.assertEqual(status["sub_rejected"], 2)
+        self.assertEqual(len(status["sub_errors"]), 2)
+
+
+class TestTimestampNormalizationContracts(unittest.TestCase):
+    """Tests normalize_exchange_ts handles all timestamp unit scales."""
+
+    def test_ns_us_ms_s_conversions(self):
+        t_ms = 1710000000123
+        t_ns = t_ms * 1_000_000
+        t_us = t_ms * 1_000
+        t_s = 1710000000
+
+        self.assertEqual(normalize_exchange_ts(t_ns), t_ms)
+        self.assertEqual(normalize_exchange_ts(t_us), t_ms)
+        self.assertEqual(normalize_exchange_ts(t_ms), t_ms)
+        self.assertEqual(normalize_exchange_ts(t_s), t_s * 1000)
+
+    def test_string_and_float_conversions(self):
+        self.assertEqual(normalize_exchange_ts("1710000000123"), 1710000000123)
+        self.assertEqual(normalize_exchange_ts(1710000000.5), 1710000000500)
+        self.assertEqual(normalize_exchange_ts("1710000000.5"), 1710000000500)
+
+    def test_invalid_inputs(self):
+        self.assertEqual(normalize_exchange_ts(None), 0)
+        self.assertEqual(normalize_exchange_ts(""), 0)
+        self.assertEqual(normalize_exchange_ts(0), 0)
+        self.assertEqual(normalize_exchange_ts(-500), 0)
+        self.assertEqual(normalize_exchange_ts("invalid_ts"), 0)
+
+
+class TestAllVenueStreamsParsing(unittest.TestCase):
+    """Tests parsing and emission across all 11 supported venue stream implementations."""
+
+    def test_binance_parsing(self):
+        received: List[OrderBookDepth5] = []
+        sym_map = {"BTCUSDT": ("BTC", 1.0, 1.0), "1000PEPEUSDT": ("PEPE", 1000.0, 1.0)}
+        stream = BinanceFuturesStream(sym_map, callback=lambda snap: received.append(snap))
+
+        payload = json.dumps({
+            "data": {
+                "s": "1000PEPEUSDT",
+                "E": 1710000000123,
+                "u": 100,
+                "pu": 99,
+                "b": [["0.01000", "50000"]],
+                "a": [["0.01005", "40000"]],
+            }
+        })
+        stream._parse_message(payload)
+        self.assertEqual(len(received), 1)
+        snap = received[0]
+        self.assertEqual(snap.exchange, "binance")
+        self.assertEqual(snap.symbol, "PEPE")
+        self.assertEqual(snap.exchange_ts, 1710000000123)
+        # Price scaled by 1/1000, size scaled by 1000
+        self.assertAlmostEqual(snap.bids[0][0], 0.00001, places=7)
+        self.assertAlmostEqual(snap.bids[0][1], 50000000.0, places=2)
+
+    def test_hyperliquid_parsing(self):
+        received: List[OrderBookDepth5] = []
+        sym_map = {"BTCUSDT": ("BTC", 1.0, 1.0), "kPEPEUSDT": ("PEPE", 1000.0, 1.0)}
+        stream = HyperliquidStream(sym_map, callback=lambda snap: received.append(snap))
+
+        # Sub confirm
+        stream._parse_message(json.dumps({"channel": "subscriptionResponse", "data": {}}))
+        self.assertEqual(stream.sub_accepted, 1)
+
+        # L2 Book
+        payload = json.dumps({
+            "channel": "l2Book",
+            "data": {
+                "coin": "BTC",
+                "time": 1710000000456,
+                "levels": [
+                    [{"px": "65000.0", "sz": "1.25"}],
+                    [{"px": "65010.0", "sz": "2.50"}],
+                ],
+            },
+        })
+        stream._parse_message(payload)
+        self.assertEqual(len(received), 1)
+        snap = received[0]
+        self.assertEqual(snap.exchange, "hyperliquid")
+        self.assertEqual(snap.symbol, "BTC")
+        self.assertEqual(snap.exchange_ts, 1710000000456)
+        self.assertEqual(snap.bids[0][0], 65000.0)
+
+    def test_upbit_parsing_with_fx_conversion(self):
+        received: List[OrderBookDepth5] = []
+        trades: List[tuple] = []
+        krw_map = {"KRW-BTC": "BTC"}
+        stream = UpbitSpotStream(
+            krw_map,
+            callback=lambda snap: received.append(snap),
+            trade_callback=lambda coin, usd, buy, ts: trades.append((coin, usd, buy, ts)),
+        )
+
+        # 1. Provide live KRW-USDT rate (1400 KRW = 1 USD)
+        rate_msg = json.dumps({
+            "code": "KRW-USDT",
+            "orderbook_units": [{"bid_price": 1400.0, "ask_price": 1400.0, "bid_size": 100, "ask_size": 100}],
+        })
+        stream._handle_msg(rate_msg)
+        self.assertTrue(stream.rate_ready)
+        self.assertEqual(stream.usdt_krw_rate, 1400.0)
+
+        # 2. Provide BTC KRW order book
+        ob_msg = json.dumps({
+            "code": "KRW-BTC",
+            "timestamp": 1710000000789,
+            "orderbook_units": [{"bid_price": 70000000.0, "ask_price": 70014000.0, "bid_size": 1.5, "ask_size": 2.0}],
+        })
+        stream._handle_msg(ob_msg)
+        self.assertEqual(len(received), 1)
+        snap = received[0]
+        self.assertEqual(snap.exchange, "upbit")
+        self.assertEqual(snap.symbol, "BTC")
+        self.assertEqual(snap.exchange_ts, 1710000000789)
+        # 70,000,000 / 1400 = 50,000 USD
+        self.assertAlmostEqual(snap.bids[0][0], 50000.0, places=2)
+
+    def test_bybit_parsing(self):
+        received: List[OrderBookDepth5] = []
+        sym_map = {"BTCUSDT": ("BTC", 1.0, 1.0)}
+        stream = BybitPerpStream(sym_map, callback=lambda snap: received.append(snap))
+
+        # Sub confirm
+        stream._parse_message(json.dumps({"op": "subscribe", "success": True}))
+        self.assertEqual(stream.sub_accepted, 1)
+
+        # Snapshot
+        payload = json.dumps({
+            "topic": "orderbook.50.BTCUSDT",
+            "type": "snapshot",
+            "ts": 1710000000999,
+            "data": {
+                "s": "BTCUSDT",
+                "u": 1,
+                "seq": 1,
+                "b": [["60000", "0.5"]],
+                "a": [["60010", "0.8"]],
+            },
+        })
+        stream._parse_message(payload)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].exchange_ts, 1710000000999)
+
+    def test_kucoin_parsing(self):
+        received: List[OrderBookDepth5] = []
+        sym_map = {"BTC": ("BTC", 1.0, 0.001)}
+        stream = KucoinStream(sym_map, callback=lambda snap: received.append(snap))
+        stream._venue_to_ours["XBTUSDTM"] = "BTC"
+        stream._contract_sizes["XBTUSDTM"] = 0.001
+
+        # Sub ack
+        stream._parse_message(json.dumps({"id": "sub_1", "type": "ack"}))
+        self.assertEqual(stream.sub_accepted, 1)
+
+        payload = json.dumps({
+            "topic": "/contractMarket/level2Depth5:XBTUSDTM",
+            "data": {
+                "timestamp": 1710000000222,
+                "bids": [["60000", "1500"]],
+                "asks": [["60010", "2000"]],
+            },
+        })
+        stream._parse_message(payload)
+        self.assertEqual(len(received), 1)
+        snap = received[0]
+        self.assertEqual(snap.exchange_ts, 1710000000222)
+        # Contract multiplier applied: 1500 * 0.001 = 1.5
+        self.assertAlmostEqual(snap.bids[0][1], 1.5, places=3)
+
+    def test_okx_parsing(self):
+        received: List[OrderBookDepth5] = []
+        sym_map = {"BTC-USDT-SWAP": ("BTC", 1.0, 1.0)}
+        stream = OKXStream(sym_map, callback=lambda snap: received.append(snap))
+
+        payload = json.dumps({
+            "arg": {"channel": "books5", "instId": "BTC-USDT-SWAP"},
+            "data": [{"ts": "1710000000333", "bids": [["60000", "1.0"]], "asks": [["60010", "1.0"]]}],
+        })
+        stream._parse_message(payload)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].exchange_ts, 1710000000333)
+
+    def test_gateio_parsing(self):
+        received: List[OrderBookDepth5] = []
+        sym_map = {"BTC_USDT": ("BTC", 1.0, 1.0)}
+        stream = GateioStream(sym_map, callback=lambda snap: received.append(snap))
+
+        payload = json.dumps({
+            "time": 1710000000,
+            "channel": "futures.order_book_update",
+            "event": "all",
+            "result": {
+                "t": 1710000000444,
+                "contract": "BTC_USDT",
+                "b": [{"p": "60000", "s": "2.0"}],
+                "a": [{"p": "60010", "s": "2.0"}],
+            },
+        })
+        stream._parse_message(payload)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].exchange_ts, 1710000000444)
+
+    def test_mexc_parsing(self):
+        received: List[OrderBookDepth5] = []
+        sym_map = {"BTC_USDT": ("BTC", 1.0, 1.0)}
+        stream = MEXCStream(sym_map, callback=lambda snap: received.append(snap))
+
+        payload = json.dumps({
+            "channel": "push.depth",
+            "symbol": "BTC_USDT",
+            "data": {
+                "cts": 1710000000555,
+                "bids": [{"p": "60000", "v": "1.0"}],
+                "asks": [{"p": "60010", "v": "1.0"}],
+            },
+        })
+        stream._parse_message(payload)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].exchange_ts, 1710000000555)
+
+    def test_bingx_parsing(self):
+        received: List[OrderBookDepth5] = []
+        sym_map = {"BTC-USDT": ("BTC", 1.0, 1.0)}
+        stream = BingXStream(sym_map, callback=lambda snap: received.append(snap))
+
+        payload = json.dumps({
+            "dataType": "BTC-USDT@depth20",
+            "data": {
+                "ts": 1710000000666,
+                "bids": [["60000", "1.0"]],
+                "asks": [["60010", "1.0"]],
+            },
+        })
+        stream._parse_message(payload)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].exchange_ts, 1710000000666)
+
+    def test_htx_parsing(self):
+        received: List[OrderBookDepth5] = []
+        sym_map = {"BTC-USDT": ("BTC", 1.0, 1.0)}
+        stream = HTXStream(sym_map, callback=lambda snap: received.append(snap))
+
+        payload = json.dumps({
+            "ch": "market.BTC-USDT.depth.step0",
+            "ts": 1710000000777,
+            "tick": {
+                "bids": [[60000.0, 1.0]],
+                "asks": [[60010.0, 1.0]],
+            },
+        })
+        stream._parse_message(payload)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].exchange_ts, 1710000000777)
+
+    def test_pionex_parsing(self):
+        received: List[OrderBookDepth5] = []
+        sym_map = {"BTC_USDT": ("BTC", 1.0, 1.0)}
+        stream = PionexStream(sym_map, callback=lambda snap: received.append(snap))
+
+        payload = json.dumps({
+            "topic": "DEPTH",
+            "symbol": "BTC_USDT",
+            "timestamp": 1710000000888,
+            "data": {
+                "bids": [["60000", "1.0"]],
+                "asks": [["60010", "1.0"]],
+            },
+        })
+        stream._parse_message(payload)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].exchange_ts, 1710000000888)
+
+    def test_asterdex_parsing(self):
+        received: List[OrderBookDepth5] = []
+        sym_map = {"BTCUSDT": ("BTC", 1.0, 1.0)}
+        stream = AsterdexStream(sym_map, callback=lambda snap: received.append(snap))
+
+        # Sub confirm
+        stream._parse_message(json.dumps({"id": 1, "result": None}))
+        self.assertEqual(stream.sub_accepted, 1)
+
+        payload = json.dumps({
+            "e": "depthUpdate",
+            "s": "BTCUSDT",
+            "E": 1710000000999,
+            "u": 10,
+            "pu": 9,
+            "b": [["60000", "1.0"]],
+            "a": [["60010", "1.0"]],
+        })
+        stream._parse_message(payload)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].exchange_ts, 1710000000999)
+
+
+class TestStreamManagerStatus(unittest.TestCase):
+    """Tests StreamManager initialization and telemetry summary."""
+
+    def test_manager_status_contains_sub_telemetry(self):
+        mock_universe = MatchedUniverse(
+            coins=["BTC"],
+            upbit_krw_to_coin={"KRW-BTC": "BTC"},
+            binance_sym_map={"BTCUSDT": ("BTC", 1.0)},
+            bybit_sym_map={"BTCUSDT": ("BTC", 1.0)},
+        )
+        mgr = StreamManager(mock_universe, callback=lambda s: None, active_venues=["binance", "bybit"])
+        status = mgr.get_status()
+
+        self.assertIn("upbit", status)
+        self.assertIn("binance", status)
+        self.assertIn("bybit", status)
+        for v_name, v_status in status.items():
+            self.assertIn("sub_accepted", v_status)
+            self.assertIn("sub_rejected", v_status)
+            self.assertIn("sub_errors", v_status)
+            self.assertIn("connected", v_status)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
 ## tools/__init__.py
 
 ```python
@@ -11212,6 +11714,7 @@ CORE_FILES = [
     "tools/pack_codebase.py",
     "tests/test_adaptive_stops_and_fixes.py",
     "tests/test_pipeline_e2e.py",
+    "tests/test_venues_streams_resilience.py",
 ]
 
 
@@ -16376,7 +16879,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import (
     BaseCEXStream,
     create_http_session,
@@ -16522,13 +17025,11 @@ class AsterdexStream(BaseCEXStream):
             await ws.send(json.dumps(sub_msg))
             await asyncio.sleep(0.05)
 
-    def _handle_sub_reply(self, data: Any) -> None:
-        pass
-
     def _parse_message(self, raw_msg: str) -> None:
         try:
             payload = json.loads(raw_msg)
             if payload.get("id") is not None and "result" in payload:
+                self._handle_sub_reply(payload)
                 return
 
             data = payload.get("data", payload)
@@ -16559,7 +17060,7 @@ class AsterdexStream(BaseCEXStream):
 
             coin, mult = self._resolve_coin_and_mult(raw_sym)
             c_size = self._get_contract_size(raw_sym)
-            exchange_ts = int(data.get("E", 0))
+            exchange_ts = normalize_exchange_ts(data.get("E")) or int(time.time() * 1000)
 
             raw_bids = data.get("b", [])
             raw_asks = data.get("a", [])
@@ -16570,6 +17071,7 @@ class AsterdexStream(BaseCEXStream):
             if not bids or not asks:
                 return
 
+            self._note_sub(True)
             snap = OrderBookDepth5(
                 exchange="asterdex",
                 symbol=coin,
@@ -16606,7 +17108,7 @@ import requests
 from requests.adapters import HTTPAdapter
 import websockets
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 
 log = logging.getLogger("stream")
 
@@ -16754,36 +17256,66 @@ def _secs_until_daily_reconnect_for(name: str) -> float:
 
 class ReconnectPolicy:
     """
-    Adaptive exponential backoff policy with rate-limit and network error awareness.
-    Provides graduated backoff delays for 429 (Too Many Requests), 403 (Forbidden),
-    and DNS/network timeouts.
+    Unified exponential backoff and rate-limit mitigation policy for all stream connections.
+    Eliminates fragile hardcoded sleeps and protects against exchange IP bans.
     """
     def __init__(
         self,
         base_delay: float = 2.0,
-        max_delay: float = 60.0,
-        backoff_factor: float = 1.5,
+        max_delay: float = 120.0,
+        factor: float = 2.0,
+        healthy_threshold_sec: float = 15.0,
+        use_jitter: bool = False,
+        **kwargs: Any,
     ):
+        if "backoff_factor" in kwargs:
+            factor = float(kwargs["backoff_factor"])
         self.base_delay = base_delay
         self.max_delay = max_delay
-        self.backoff_factor = backoff_factor
-        self.attempts = 0
+        self.factor = factor
+        self.backoff_factor = factor  # alias for backward compatibility
+        self.healthy_threshold_sec = healthy_threshold_sec
+        self.use_jitter = use_jitter
+        self.consecutive_failures = 0
+        self._last_connected_ts = 0.0
+
+    def record_connected(self) -> None:
+        self._last_connected_ts = time.time()
+
+    def record_disconnected(self) -> None:
+        now = time.time()
+        # If the stream was connected and healthy for >= healthy_threshold_sec,
+        # reset consecutive failures so normal periodic reconnects start from base_delay.
+        if self._last_connected_ts > 0.0 and (now - self._last_connected_ts >= self.healthy_threshold_sec):
+            self.consecutive_failures = 0
+
+    def compute_delay(self, error: Any = None, use_jitter: Optional[bool] = None) -> float:
+        self.record_disconnected()
+        self.consecutive_failures += 1
+
+        # Exponential backoff: base_delay * (factor ** min(attempts, 6))
+        exp_delay = min(self.max_delay, self.base_delay * (self.factor ** min(self.consecutive_failures - 1, 6)))
+        should_jitter = self.use_jitter if use_jitter is None else use_jitter
+        if should_jitter:
+            # Predictable jitter based on attempt count (0.2s - 0.9s)
+            jitter = 0.2 + ((self.consecutive_failures * 17) % 70) / 100.0
+            delay = exp_delay + jitter
+        else:
+            delay = exp_delay
+
+        err_str = str(error or "").lower()
+        # Rate limit (HTTP 429 / 418 / "rate" / "too many requests") -> minimum 60.0s cool-down
+        if "429" in err_str or "418" in err_str or "rate" in err_str or "too many" in err_str:
+            delay = max(delay, 60.0)
+        # Cloudflare / DNS resolution / Block (HTTP 403 / 11001 / getaddrinfo) -> minimum 30.0s cool-down
+        elif "403" in err_str or "11001" in err_str or "getaddrinfo" in err_str:
+            delay = max(delay, 30.0)
+
+        return min(self.max_delay, delay)
 
     def reset(self) -> None:
-        self.attempts = 0
-
-    def compute_delay(self, exc: Optional[Exception] = None) -> float:
-        err_str = str(exc or "").lower()
-        if "429" in err_str or "too many requests" in err_str:
-            self.attempts += 2
-            return min(self.max_delay, max(30.0, self.base_delay * (self.backoff_factor ** self.attempts)))
-        if "403" in err_str or "forbidden" in err_str or "11001" in err_str or "getaddrinfo" in err_str:
-            self.attempts += 1
-            return min(self.max_delay, max(20.0, self.base_delay * (self.backoff_factor ** self.attempts)))
-
-        delay = min(self.max_delay, self.base_delay * (self.backoff_factor ** self.attempts))
-        self.attempts += 1
-        return delay
+        self.consecutive_failures = 0
+        self._last_connected_ts = 0.0
 
 
 class TTLCache:
@@ -16827,10 +17359,15 @@ class BaseVenueStream:
         self.connected = False
         self.last_msg_ts = 0.0
         self.last_data_ts = 0.0
+        self._connect_ts = 0.0
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self.subscribed: List[str] = []
+        self.sub_accepted: int = 0
+        self.sub_rejected: int = 0
+        self.sub_errors: List[str] = []
         self.symbols_seen: Set[str] = set()
+        self.sym_first_ts: Dict[str, float] = {}
         self.books_dropped = 0
         self.levels_dropped = 0
         self.seq_gaps = 0
@@ -16838,19 +17375,121 @@ class BaseVenueStream:
         self._last_u: Dict[str, int] = {}
         self._last_seq: Dict[str, int] = {}
         self._first_ts = 0.0
-        self._reconnect_policy = ReconnectPolicy(base_delay=2.0, max_delay=60.0)
+        self._reconnect_policy = ReconnectPolicy(base_delay=2.0, max_delay=120.0)
 
     def _note_connect(self) -> None:
         self.connected = True
         self.last_msg_ts = time.time()
+        self._connect_ts = self.last_msg_ts
         if not self._first_ts:
             self._first_ts = self.last_msg_ts
-        self._reconnect_policy.reset()
+        self._reconnect_policy.record_connected()
 
     def _note_symbol(self, sym: str) -> None:
-        if sym:
-            self.symbols_seen.add(str(sym).upper())
-            self.last_data_ts = time.time()
+        if not sym:
+            return
+        s = sym.upper()
+        self.last_data_ts = time.time()
+        if s not in self.symbols_seen:
+            self.symbols_seen.add(s)
+            if not self._first_ts:
+                self._first_ts = time.time()
+            self.sym_first_ts[s] = self._first_ts
+
+    def _note_sub(self, ok: bool, msg: str = "") -> None:
+        if ok:
+            self.sub_accepted += 1
+        else:
+            self.sub_rejected += 1
+            if msg:
+                self.sub_errors.append(msg[:200])
+                if len(self.sub_errors) > 20:
+                    del self.sub_errors[:-20]
+
+    def _starved_since_connect(self, now: float, grace_sec: float = 30.0) -> bool:
+        cts = getattr(self, "_connect_ts", 0.0) or 0.0
+        if cts <= 0:
+            return False
+        last_data = getattr(self, "last_data_ts", 0.0) or 0.0
+        return (now - cts > grace_sec) and (last_data <= cts)
+
+    @staticmethod
+    def _sub_reply_text(data: Dict[str, Any]) -> str:
+        for k in ("ret_msg", "msg", "message", "err_msg", "detail", "error"):
+            v = data.get(k)
+            if isinstance(v, str) and v:
+                return v
+            if isinstance(v, dict):
+                return json.dumps(v, ensure_ascii=False)[:200]
+        return ""
+
+    def _handle_sub_reply(self, data: Dict[str, Any]) -> None:
+        try:
+            if not isinstance(data, dict):
+                return
+            ev = str(data.get("event") or "").lower()
+            action = str(data.get("action") or "").lower()
+            msg_type = str(data.get("type") or "").lower()
+            req_id = str(data.get("id") or "")
+
+            if data.get("op") in ("ping", "pong") or str(data.get("ret_msg", "")).strip().lower() in ("pong", "ping"):
+                return
+
+            if data.get("error") not in (None, {}, "", []):
+                self._note_sub(False, self._sub_reply_text(data) or json.dumps(data.get("error"))[:200])
+                return
+
+            if data.get("success") is not None:
+                if data["success"]:
+                    self._note_sub(True)
+                else:
+                    self._note_sub(False, self._sub_reply_text(data) or "refused")
+                return
+
+            if data.get("op") == "error":
+                self._note_sub(False, self._sub_reply_text(data) or "error")
+                return
+
+            # Covers Toobit ("event": "sub"), OKX ("event": "subscribe"), LBank ("action": "subscribe")
+            if ev in ("sub", "subscribe", "unsubscribe") or action in ("sub", "subscribe"):
+                self._note_sub(True)
+                return
+            if ev == "error":
+                self._note_sub(False, self._sub_reply_text(data) or str(data.get("code", "")))
+                return
+
+            # KuCoin subscription acknowledgements
+            if msg_type in ("ack", "welcome"):
+                self._note_sub(True)
+                return
+
+            # XT / KuCoin batch response IDs
+            if req_id and (req_id.startswith("xt_") or req_id.startswith("kc_") or req_id.startswith("sub_")):
+                if "error" not in data and data.get("code") in (None, 0, "0", "00000", 200, "200"):
+                    self._note_sub(True)
+                    return
+
+            if "code" in data and not any(k in data for k in ("data", "dataType", "topic", "channel", "table")):
+                if str(data["code"]).strip() in ("0", "00000", "200000", "200"):
+                    self._note_sub(True)
+                else:
+                    self._note_sub(False, self._sub_reply_text(data) or str(data["code"]))
+                return
+
+            ch = str(data.get("channel", ""))
+            if ch.startswith("rs."):
+                reason = str(data.get("data", ""))
+                if ch == "rs.error" or reason not in ("success", ""):
+                    self._note_sub(False, reason or ch)
+                else:
+                    self._note_sub(True)
+                return
+
+            if "result" in data and data.get("result") is None:
+                self._note_sub(True)
+                return
+        except Exception:
+            pass
 
     def _sanitise(self, snap: OrderBookDepth5) -> None:
         """Sanitise and filter crossed books before forwarding to engine."""
@@ -16886,7 +17525,7 @@ class BaseVenueStream:
                 symbol=snap.symbol,
                 raw_symbol=snap.raw_symbol,
                 ts=snap.ts or now,
-                exchange_ts=int(snap.exchange_ts or (now * 1000)),
+                exchange_ts=normalize_exchange_ts(snap.exchange_ts) or int(now * 1000),
                 bids=bids[:5],
                 asks=asks[:5],
             )
@@ -16919,6 +17558,9 @@ class BaseVenueStream:
             "connected": self.connected,
             "symbols_seen": len(self.symbols_seen),
             "subscribed": len(self.subscribed),
+            "sub_accepted": self.sub_accepted,
+            "sub_rejected": self.sub_rejected,
+            "sub_errors": list(self.sub_errors),
             "last_data_ago_sec": (
                 round(time.time() - self.last_data_ts, 1)
                 if self.last_data_ts else None
@@ -17029,10 +17671,6 @@ class BaseCEXStream(BaseVenueStream):
                 continue
         return out
 
-    def _handle_sub_reply(self, data: Any) -> None:
-        """Hook to suppress subscription confirmation messages."""
-        pass
-
     async def _send_subscriptions(self, ws: Any) -> None:
         raise NotImplementedError
 
@@ -17082,6 +17720,10 @@ class BaseCEXStream(BaseVenueStream):
                                 log.info(f"[{self.name}] Scheduled daily reconnect. Reconnecting...")
                                 break
 
+                            if self._starved_since_connect(time.time()):
+                                log.warning(f"[{self.name}] Connected but no data in 30s, reconnecting...")
+                                break
+
                             if not self.last_msg_ts:
                                 self.last_msg_ts = time.time()
                             elif time.time() - self.last_msg_ts > 180.0:
@@ -17125,7 +17767,10 @@ class BaseCEXStream(BaseVenueStream):
             except Exception as e:
                 self.connected = False
                 delay = self._reconnect_policy.compute_delay(e)
-                log.warning(f"[{self.name}] WS disconnected: {e}. Reconnecting in {delay:.1f}s...")
+                log.warning(
+                    f"[{self.name}] WS disconnected: {e}. Reconnecting in {delay:.1f}s "
+                    f"(attempt {self._reconnect_policy.consecutive_failures})..."
+                )
                 await asyncio.sleep(delay)
 ```
 
@@ -17147,9 +17792,10 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
 import websockets
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import (
     BaseVenueStream,
+    ReconnectPolicy,
     create_http_session,
     normalize_symbol,
     _secs_until_daily_reconnect_for,
@@ -17263,6 +17909,7 @@ class BinanceFuturesStream(BaseVenueStream):
         self._raw_symbols: List[str] = sorted(self._sym_map.keys())
         self.subscribed = list(coins)
         self._connected_chunks: Set[int] = set()
+        self._chunk_policies: Dict[int, ReconnectPolicy] = {}
 
     async def _run_loop(self) -> None:
         if not self._raw_symbols:
@@ -17292,6 +17939,7 @@ class BinanceFuturesStream(BaseVenueStream):
         sub_streams = [f"{s.lower()}@depth5@100ms" for s in raw_syms]
         url = f"{self.BASE_WS_URL}?streams=" + "/".join(sub_streams)
         tag = f"binance#{chunk_id}" if chunk_id > 0 else "binance"
+        policy = self._chunk_policies.setdefault(chunk_id, ReconnectPolicy(base_delay=2.0, max_delay=120.0))
 
         while self._running:
             try:
@@ -17305,6 +17953,7 @@ class BinanceFuturesStream(BaseVenueStream):
                 ) as ws:
                     self._connected_chunks.add(chunk_id)
                     self._note_connect()
+                    policy.record_connected()
                     log.info(f"[{tag}] Connected! Streaming depth5@100ms...")
                     reconnect_in = _secs_until_daily_reconnect_for(f"{self.name}_{chunk_id}")
                     deadline = time.monotonic() + reconnect_in
@@ -17315,6 +17964,10 @@ class BinanceFuturesStream(BaseVenueStream):
                             remaining = deadline - time.monotonic()
                             if remaining <= 0:
                                 log.info(f"[{tag}] Scheduled daily reconnect. Reconnecting...")
+                                break
+
+                            if self._starved_since_connect(time.time()):
+                                log.warning(f"[{tag}] Connected but no data in 30s, reconnecting...")
                                 break
 
                             if time.time() - chunk_last_msg_ts > self.WATCHDOG_SECS:
@@ -17338,8 +17991,12 @@ class BinanceFuturesStream(BaseVenueStream):
             except Exception as e:
                 self._connected_chunks.discard(chunk_id)
                 self.connected = bool(self._connected_chunks)
-                log.warning(f"[{tag}] WS disconnected: {e}. Reconnecting in 3s...")
-                await asyncio.sleep(3.0)
+                delay = policy.compute_delay(e)
+                log.warning(
+                    f"[{tag}] WS disconnected: {e}. Reconnecting in {delay:.1f}s "
+                    f"(attempt {policy.consecutive_failures})..."
+                )
+                await asyncio.sleep(delay)
 
     def _parse_message(self, raw_msg: str | bytes) -> None:
         try:
@@ -17391,13 +18048,14 @@ class BinanceFuturesStream(BaseVenueStream):
                 bids = [(float(p), float(q)) for p, q in raw_bids]
                 asks = [(float(p), float(q)) for p, q in raw_asks]
 
+            self._note_sub(True)
             self.callback(
                 OrderBookDepth5(
                     exchange="binance",
                     symbol=coin,
                     raw_symbol=raw_sym,
                     ts=time.time(),
-                    exchange_ts=int(data.get("E") or (time.time() * 1000)),
+                    exchange_ts=normalize_exchange_ts(data.get("E")) or int(time.time() * 1000),
                     bids=bids,
                     asks=asks,
                 )
@@ -17434,7 +18092,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import BaseCEXStream, create_http_session, normalize_symbol, parse_symbol_and_mult, log
 
 
@@ -17560,7 +18218,7 @@ class BingXStream(BaseCEXStream):
                     symbol=sym,
                     raw_symbol=sym_raw,
                     ts=time.time(),
-                    exchange_ts=int(b_data.get("ts", 0) or time.time() * 1000),
+                    exchange_ts=normalize_exchange_ts(b_data.get("ts")) or int(time.time() * 1000),
                     bids=bids,
                     asks=asks,
                 ))
@@ -17587,9 +18245,10 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
 import websockets
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import (
     BaseVenueStream,
+    ReconnectPolicy,
     create_http_session,
     normalize_symbol,
     parse_symbol_and_mult,
@@ -17762,6 +18421,10 @@ class BybitPerpStream(BaseVenueStream):
                                 log.info("[bybit] Scheduled daily reconnect. Reconnecting...")
                                 break
 
+                            if self._starved_since_connect(time.time()):
+                                log.warning("[bybit] Connected but no data in 30s, reconnecting...")
+                                break
+
                             if time.time() - self.last_msg_ts > self.WATCHDOG_SECS:
                                 log.warning(f"[bybit] No messages for >{self.WATCHDOG_SECS:.0f}s, reconnecting...")
                                 break
@@ -17781,14 +18444,21 @@ class BybitPerpStream(BaseVenueStream):
                 break
             except Exception as e:
                 self.connected = False
-                log.warning(f"[bybit] WS disconnected: {e}. Reconnecting in 3s...")
-                await asyncio.sleep(3.0)
+                delay = self._reconnect_policy.compute_delay(e)
+                log.warning(
+                    f"[bybit] WS disconnected: {e}. Reconnecting in {delay:.1f}s "
+                    f"(attempt {self._reconnect_policy.consecutive_failures})..."
+                )
+                await asyncio.sleep(delay)
 
     def _parse_message(self, raw_msg: str | bytes) -> None:
         try:
             if isinstance(raw_msg, bytes):
                 raw_msg = raw_msg.decode("utf-8")
             data = json.loads(raw_msg)
+            if data.get("op") == "subscribe" or "success" in data or "ret_msg" in data:
+                self._handle_sub_reply(data)
+
             topic = data.get("topic", "")
             if not topic.startswith("orderbook."):
                 return
@@ -17897,7 +18567,7 @@ class BybitPerpStream(BaseVenueStream):
                     symbol=coin,
                     raw_symbol=raw_sym,
                     ts=time.time(),
-                    exchange_ts=int(d.get("cts") or data.get("ts") or (time.time() * 1000)),
+                    exchange_ts=normalize_exchange_ts(d.get("cts") or data.get("ts")) or int(time.time() * 1000),
                     bids=norm_bids,
                     asks=norm_asks,
                 )
@@ -17935,7 +18605,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import BaseCEXStream, create_http_session, normalize_symbol, parse_symbol_and_mult, log
 
 
@@ -18181,7 +18851,7 @@ class GateioStream(BaseCEXStream):
                 top_asks = sorted_asks_raw[:5]
 
             if top_bids and top_asks:
-                ets = int(result.get("t") or data.get("time_ms") or ((data.get("time") or time.time()) * 1000))
+                ets = normalize_exchange_ts(result.get("t") or data.get("time_ms") or data.get("time")) or int(time.time() * 1000)
                 self.callback(OrderBookDepth5(
                     exchange="gateio",
                     symbol=sym,
@@ -18209,7 +18879,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import BaseCEXStream, create_http_session, normalize_symbol, log
 
 
@@ -18353,7 +19023,7 @@ class HTXStream(BaseCEXStream):
             asks = self._extract_levels(tick.get("asks"), 5, mult=mult, contract_size=contract_size)
             if bids and asks:
                 self._note_symbol(sym)
-                ets = int(data.get("ts", 0) or tick.get("ts", 0))
+                ets = normalize_exchange_ts(data.get("ts") or tick.get("ts")) or int(time.time() * 1000)
                 self.callback(OrderBookDepth5(
                     exchange="htx",
                     symbol=sym,
@@ -18385,9 +19055,10 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
 import websockets
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import (
     BaseVenueStream,
+    ReconnectPolicy,
     create_http_session,
     normalize_symbol,
     parse_symbol_and_mult,
@@ -18617,6 +19288,10 @@ class HyperliquidStream(BaseVenueStream):
                                 log.info("[hyperliquid] Scheduled daily reconnect. Reconnecting...")
                                 break
 
+                            if self._starved_since_connect(time.time()):
+                                log.warning("[hyperliquid] Connected but no data in 30s, reconnecting...")
+                                break
+
                             if not self.last_msg_ts:
                                 self.last_msg_ts = time.time()
                             elif time.time() - self.last_msg_ts > 60.0:
@@ -18638,8 +19313,12 @@ class HyperliquidStream(BaseVenueStream):
                 break
             except Exception as e:
                 self.connected = False
-                log.warning(f"[hyperliquid] WS disconnected: {e}. Reconnecting in 3s...")
-                await asyncio.sleep(3.0)
+                delay = self._reconnect_policy.compute_delay(e)
+                log.warning(
+                    f"[hyperliquid] WS disconnected: {e}. Reconnecting in {delay:.1f}s "
+                    f"(attempt {self._reconnect_policy.consecutive_failures})..."
+                )
+                await asyncio.sleep(delay)
 
     async def _ping_loop(self, ws: Any) -> None:
         try:
@@ -18653,6 +19332,9 @@ class HyperliquidStream(BaseVenueStream):
         try:
             payload = json.loads(raw_msg)
             ch = payload.get("channel")
+            if ch == "subscriptionResponse":
+                self._note_sub(True)
+                return
             if ch != "l2Book":
                 return
 
@@ -18700,12 +19382,13 @@ class HyperliquidStream(BaseVenueStream):
             if not bids or not asks:
                 return
 
+            self._note_sub(True)
             snap = OrderBookDepth5(
                 exchange="hyperliquid",
                 symbol=coin,
                 raw_symbol=raw_sym,
                 ts=time.time(),
-                exchange_ts=int(data.get("time", 0)),
+                exchange_ts=normalize_exchange_ts(data.get("time")) or int(time.time() * 1000),
                 bids=bids,
                 asks=asks,
             )
@@ -18729,8 +19412,15 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
 import websockets
 
-from models import OrderBookDepth5
-from venues.base import BaseVenueStream, create_http_session, normalize_symbol, _secs_until_daily_reconnect_for, log
+from models import OrderBookDepth5, normalize_exchange_ts
+from venues.base import (
+    BaseVenueStream,
+    ReconnectPolicy,
+    create_http_session,
+    normalize_symbol,
+    _secs_until_daily_reconnect_for,
+    log,
+)
 
 
 class KucoinRestClient:
@@ -18879,7 +19569,8 @@ class KucoinStream(BaseVenueStream):
                 token = data.get("token")
                 endpoints = data.get("instanceServers", [])
                 if not token or not endpoints:
-                    await asyncio.sleep(5.0)
+                    delay = self._reconnect_policy.compute_delay(Exception("kucoin bullet token failed"))
+                    await asyncio.sleep(delay)
                     continue
 
                 ws_endpoint = endpoints[0]["endpoint"]
@@ -18926,6 +19617,10 @@ class KucoinStream(BaseVenueStream):
                                 log.info("[kucoin] Daily scheduled reconnect. Reconnecting...")
                                 break
 
+                            if self._starved_since_connect(time.time()):
+                                log.warning("[kucoin] Connected but no data in 30s, reconnecting...")
+                                break
+
                             try:
                                 msg = await asyncio.wait_for(ws.recv(), timeout=min(30.0, remaining))
                             except asyncio.TimeoutError:
@@ -18941,14 +19636,20 @@ class KucoinStream(BaseVenueStream):
                 break
             except Exception as e:
                 self.connected = False
-                log.warning(f"[kucoin] WS error: {e}. Reconnecting in 3s...")
-                await asyncio.sleep(3.0)
+                delay = self._reconnect_policy.compute_delay(e)
+                log.warning(
+                    f"[kucoin] WS error: {e}. Reconnecting in {delay:.1f}s "
+                    f"(attempt {self._reconnect_policy.consecutive_failures})..."
+                )
+                await asyncio.sleep(delay)
 
     def _parse_message(self, raw_msg: str | bytes) -> None:
         try:
             if isinstance(raw_msg, bytes):
                 raw_msg = raw_msg.decode("utf-8")
             data = json.loads(raw_msg)
+            self._handle_sub_reply(data)
+
             topic = data.get("topic", "")
             if not topic.startswith("/contractMarket/level2Depth5:"):
                 return
@@ -18963,7 +19664,7 @@ class KucoinStream(BaseVenueStream):
             asks = [(float(p), float(q) * contract_size) for p, q in asks_raw if float(p) > 0 and float(q) > 0]
             if bids and asks:
                 self._note_symbol(sym)
-                ets = int(data.get("data", {}).get("timestamp", 0) or time.time() * 1000)
+                ets = normalize_exchange_ts(payload.get("timestamp")) or int(time.time() * 1000)
                 self.callback(OrderBookDepth5(
                     exchange="kucoin",
                     symbol=sym,
@@ -18992,6 +19693,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from config import MatchedUniverse
 from models import OrderBookDepth5
+from venues.base import BaseVenueStream
 from venues.asterdex import AsterdexStream
 from venues.bingx import BingXStream
 from venues.binance import BinanceFuturesStream
@@ -19123,6 +19825,9 @@ class StreamManager:
                 "connected": s.connected,
                 "symbols_seen": len(s.symbols_seen),
                 "subscribed": len(s.subscribed),
+                "sub_accepted": getattr(s, "sub_accepted", 0),
+                "sub_rejected": getattr(s, "sub_rejected", 0),
+                "sub_errors": list(getattr(s, "sub_errors", [])),
                 "books_dropped": s.books_dropped,
                 "seq_gaps": getattr(s, "seq_gaps", 0),
                 "seq_duplicates": getattr(s, "seq_duplicates", 0),
@@ -19147,7 +19852,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import BaseCEXStream, create_http_session, normalize_symbol, log
 
 
@@ -19291,7 +19996,7 @@ class MEXCStream(BaseCEXStream):
             asks = self._extract_levels(d.get("asks"), 5, mult=mult, contract_size=contract_size)
             if bids and asks:
                 self._note_symbol(sym)
-                ets = int(d.get("cts", 0) or data.get("ts", 0))
+                ets = normalize_exchange_ts(d.get("cts") or data.get("ts")) or int(time.time() * 1000)
                 self.callback(OrderBookDepth5(
                     exchange="mexc",
                     symbol=sym,
@@ -19319,7 +20024,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import BaseCEXStream, create_http_session, normalize_symbol, log
 
 
@@ -19470,7 +20175,7 @@ class OKXStream(BaseCEXStream):
             asks = self._extract_levels(book_data.get("asks") or book_data.get("a"), 5, mult=mult, contract_size=contract_size)
             if bids and asks:
                 self._note_symbol(sym)
-                ets = int(book_data.get("ts", 0) or data.get("ts", 0))
+                ets = normalize_exchange_ts(book_data.get("ts") or data.get("ts")) or int(time.time() * 1000)
                 self.callback(OrderBookDepth5(
                     exchange="okx",
                     symbol=sym,
@@ -19498,7 +20203,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import BaseCEXStream, create_http_session, normalize_symbol, parse_symbol_and_mult, log
 
 
@@ -19634,7 +20339,7 @@ class PionexStream(BaseCEXStream):
             asks = self._extract_levels(d.get("asks"), 5, mult=mult, contract_size=contract_size)
             if bids and asks:
                 self._note_symbol(sym)
-                ets = int(data.get("timestamp", 0) or time.time() * 1000)
+                ets = normalize_exchange_ts(data.get("timestamp")) or int(time.time() * 1000)
                 self.callback(OrderBookDepth5(
                     exchange="pionex",
                     symbol=sym,
@@ -19666,9 +20371,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 import websockets
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import (
     BaseVenueStream,
+    ReconnectPolicy,
     create_http_session,
     _secs_until_daily_reconnect_for,
     log,
@@ -19888,7 +20594,6 @@ class UpbitSpotStream(BaseVenueStream):
         self.rate_ts = time.time()
 
     async def _run_loop(self) -> None:
-        backoff = self.BACKOFF_MIN
         target_codes: List[str] = ["KRW-USDT"] + sorted(self._krw_to_coin.keys())
 
         while self._running:
@@ -19915,11 +20620,11 @@ class UpbitSpotStream(BaseVenueStream):
                     max_queue=4096,
                 ) as ws:
                     self._note_connect()
+                    self._note_sub(True)
                     self.last_msg_ts = time.time()
                     trades_note = " + trades" if self.trade_callback else ""
                     log.info(f"[upbit] Connected! Subscribed to {len(target_codes)} order books{trades_note} (incl. KRW-USDT).")
                     await ws.send(json.dumps(sub_msg))
-                    backoff = self.BACKOFF_MIN
 
                     try:
                         reconnect_in = _secs_until_daily_reconnect_for(self.name)
@@ -19929,6 +20634,10 @@ class UpbitSpotStream(BaseVenueStream):
                             remaining = deadline - time.monotonic()
                             if remaining <= 0:
                                 log.info("[upbit] Scheduled daily reconnect. Reconnecting...")
+                                break
+
+                            if self._starved_since_connect(time.time()):
+                                log.warning("[upbit] Connected but no data in 30s, reconnecting...")
                                 break
 
                             if time.time() - self.last_msg_ts > self.WATCHDOG_SECS:
@@ -19949,9 +20658,12 @@ class UpbitSpotStream(BaseVenueStream):
                 break
             except Exception as e:
                 self.connected = False
-                log.warning(f"[upbit] WS error: {e!r}. Reconnecting in {backoff:.0f}s...")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, self.BACKOFF_MAX)
+                delay = self._reconnect_policy.compute_delay(e)
+                log.warning(
+                    f"[upbit] WS error: {e!r}. Reconnecting in {delay:.1f}s "
+                    f"(attempt {self._reconnect_policy.consecutive_failures})..."
+                )
+                await asyncio.sleep(delay)
 
         self.connected = False
 
@@ -20066,7 +20778,7 @@ class UpbitSpotStream(BaseVenueStream):
             symbol=coin,
             raw_symbol=code,
             ts=time.time(),
-            exchange_ts=int(data.get("timestamp", 0)),
+            exchange_ts=normalize_exchange_ts(data.get("timestamp")) or int(time.time() * 1000),
             bids=bids,
             asks=asks,
         )

@@ -13,9 +13,10 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
 import websockets
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import (
     BaseVenueStream,
+    ReconnectPolicy,
     create_http_session,
     normalize_symbol,
     _secs_until_daily_reconnect_for,
@@ -129,6 +130,7 @@ class BinanceFuturesStream(BaseVenueStream):
         self._raw_symbols: List[str] = sorted(self._sym_map.keys())
         self.subscribed = list(coins)
         self._connected_chunks: Set[int] = set()
+        self._chunk_policies: Dict[int, ReconnectPolicy] = {}
 
     async def _run_loop(self) -> None:
         if not self._raw_symbols:
@@ -158,6 +160,7 @@ class BinanceFuturesStream(BaseVenueStream):
         sub_streams = [f"{s.lower()}@depth5@100ms" for s in raw_syms]
         url = f"{self.BASE_WS_URL}?streams=" + "/".join(sub_streams)
         tag = f"binance#{chunk_id}" if chunk_id > 0 else "binance"
+        policy = self._chunk_policies.setdefault(chunk_id, ReconnectPolicy(base_delay=2.0, max_delay=120.0))
 
         while self._running:
             try:
@@ -171,6 +174,7 @@ class BinanceFuturesStream(BaseVenueStream):
                 ) as ws:
                     self._connected_chunks.add(chunk_id)
                     self._note_connect()
+                    policy.record_connected()
                     log.info(f"[{tag}] Connected! Streaming depth5@100ms...")
                     reconnect_in = _secs_until_daily_reconnect_for(f"{self.name}_{chunk_id}")
                     deadline = time.monotonic() + reconnect_in
@@ -181,6 +185,10 @@ class BinanceFuturesStream(BaseVenueStream):
                             remaining = deadline - time.monotonic()
                             if remaining <= 0:
                                 log.info(f"[{tag}] Scheduled daily reconnect. Reconnecting...")
+                                break
+
+                            if self._starved_since_connect(time.time()):
+                                log.warning(f"[{tag}] Connected but no data in 30s, reconnecting...")
                                 break
 
                             if time.time() - chunk_last_msg_ts > self.WATCHDOG_SECS:
@@ -204,8 +212,12 @@ class BinanceFuturesStream(BaseVenueStream):
             except Exception as e:
                 self._connected_chunks.discard(chunk_id)
                 self.connected = bool(self._connected_chunks)
-                log.warning(f"[{tag}] WS disconnected: {e}. Reconnecting in 3s...")
-                await asyncio.sleep(3.0)
+                delay = policy.compute_delay(e)
+                log.warning(
+                    f"[{tag}] WS disconnected: {e}. Reconnecting in {delay:.1f}s "
+                    f"(attempt {policy.consecutive_failures})..."
+                )
+                await asyncio.sleep(delay)
 
     def _parse_message(self, raw_msg: str | bytes) -> None:
         try:
@@ -257,13 +269,14 @@ class BinanceFuturesStream(BaseVenueStream):
                 bids = [(float(p), float(q)) for p, q in raw_bids]
                 asks = [(float(p), float(q)) for p, q in raw_asks]
 
+            self._note_sub(True)
             self.callback(
                 OrderBookDepth5(
                     exchange="binance",
                     symbol=coin,
                     raw_symbol=raw_sym,
                     ts=time.time(),
-                    exchange_ts=int(data.get("E") or (time.time() * 1000)),
+                    exchange_ts=normalize_exchange_ts(data.get("E")) or int(time.time() * 1000),
                     bids=bids,
                     asks=asks,
                 )

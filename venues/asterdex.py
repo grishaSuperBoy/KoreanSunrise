@@ -12,7 +12,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import (
     BaseCEXStream,
     create_http_session,
@@ -158,13 +158,11 @@ class AsterdexStream(BaseCEXStream):
             await ws.send(json.dumps(sub_msg))
             await asyncio.sleep(0.05)
 
-    def _handle_sub_reply(self, data: Any) -> None:
-        pass
-
     def _parse_message(self, raw_msg: str) -> None:
         try:
             payload = json.loads(raw_msg)
             if payload.get("id") is not None and "result" in payload:
+                self._handle_sub_reply(payload)
                 return
 
             data = payload.get("data", payload)
@@ -195,7 +193,7 @@ class AsterdexStream(BaseCEXStream):
 
             coin, mult = self._resolve_coin_and_mult(raw_sym)
             c_size = self._get_contract_size(raw_sym)
-            exchange_ts = int(data.get("E", 0))
+            exchange_ts = normalize_exchange_ts(data.get("E")) or int(time.time() * 1000)
 
             raw_bids = data.get("b", [])
             raw_asks = data.get("a", [])
@@ -206,6 +204,7 @@ class AsterdexStream(BaseCEXStream):
             if not bids or not asks:
                 return
 
+            self._note_sub(True)
             snap = OrderBookDepth5(
                 exchange="asterdex",
                 symbol=coin,

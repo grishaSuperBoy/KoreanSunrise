@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from config import MatchedUniverse
 from models import OrderBookDepth5
+from venues.base import BaseVenueStream
 from venues.asterdex import AsterdexStream
 from venues.bingx import BingXStream
 from venues.binance import BinanceFuturesStream
@@ -141,6 +142,9 @@ class StreamManager:
                 "connected": s.connected,
                 "symbols_seen": len(s.symbols_seen),
                 "subscribed": len(s.subscribed),
+                "sub_accepted": getattr(s, "sub_accepted", 0),
+                "sub_rejected": getattr(s, "sub_rejected", 0),
+                "sub_errors": list(getattr(s, "sub_errors", [])),
                 "books_dropped": s.books_dropped,
                 "seq_gaps": getattr(s, "seq_gaps", 0),
                 "seq_duplicates": getattr(s, "seq_duplicates", 0),

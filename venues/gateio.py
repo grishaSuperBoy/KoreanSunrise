@@ -10,7 +10,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import BaseCEXStream, create_http_session, normalize_symbol, parse_symbol_and_mult, log
 
 
@@ -256,7 +256,7 @@ class GateioStream(BaseCEXStream):
                 top_asks = sorted_asks_raw[:5]
 
             if top_bids and top_asks:
-                ets = int(result.get("t") or data.get("time_ms") or ((data.get("time") or time.time()) * 1000))
+                ets = normalize_exchange_ts(result.get("t") or data.get("time_ms") or data.get("time")) or int(time.time() * 1000)
                 self.callback(OrderBookDepth5(
                     exchange="gateio",
                     symbol=sym,

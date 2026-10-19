@@ -14,9 +14,10 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
 import websockets
 
-from models import OrderBookDepth5
+from models import OrderBookDepth5, normalize_exchange_ts
 from venues.base import (
     BaseVenueStream,
+    ReconnectPolicy,
     create_http_session,
     normalize_symbol,
     parse_symbol_and_mult,
@@ -189,6 +190,10 @@ class BybitPerpStream(BaseVenueStream):
                                 log.info("[bybit] Scheduled daily reconnect. Reconnecting...")
                                 break
 
+                            if self._starved_since_connect(time.time()):
+                                log.warning("[bybit] Connected but no data in 30s, reconnecting...")
+                                break
+
                             if time.time() - self.last_msg_ts > self.WATCHDOG_SECS:
                                 log.warning(f"[bybit] No messages for >{self.WATCHDOG_SECS:.0f}s, reconnecting...")
                                 break
@@ -208,14 +213,21 @@ class BybitPerpStream(BaseVenueStream):
                 break
             except Exception as e:
                 self.connected = False
-                log.warning(f"[bybit] WS disconnected: {e}. Reconnecting in 3s...")
-                await asyncio.sleep(3.0)
+                delay = self._reconnect_policy.compute_delay(e)
+                log.warning(
+                    f"[bybit] WS disconnected: {e}. Reconnecting in {delay:.1f}s "
+                    f"(attempt {self._reconnect_policy.consecutive_failures})..."
+                )
+                await asyncio.sleep(delay)
 
     def _parse_message(self, raw_msg: str | bytes) -> None:
         try:
             if isinstance(raw_msg, bytes):
                 raw_msg = raw_msg.decode("utf-8")
             data = json.loads(raw_msg)
+            if data.get("op") == "subscribe" or "success" in data or "ret_msg" in data:
+                self._handle_sub_reply(data)
+
             topic = data.get("topic", "")
             if not topic.startswith("orderbook."):
                 return
@@ -324,7 +336,7 @@ class BybitPerpStream(BaseVenueStream):
                     symbol=coin,
                     raw_symbol=raw_sym,
                     ts=time.time(),
-                    exchange_ts=int(d.get("cts") or data.get("ts") or (time.time() * 1000)),
+                    exchange_ts=normalize_exchange_ts(d.get("cts") or data.get("ts")) or int(time.time() * 1000),
                     bids=norm_bids,
                     asks=norm_asks,
                 )
