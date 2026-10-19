@@ -25,16 +25,6 @@ NORM_TAU = 600.0        # EWMA time constant for Upbit depth and spread normaliz
 BASELINE_TAU = 3600.0   # EWMA time constant for cross-venue basis baseline (sec)
 
 
-def _base(symbol: str) -> str:
-    s = symbol.upper()
-    if s.startswith("KRW-"):
-        return s[4:]
-    for suff in ("-PERP", "_PERP", "PERP", "USDT"):
-        if s.endswith(suff) and len(s) > len(suff):
-            return s[: -len(suff)]
-    return s
-
-
 @dataclass(slots=True)
 class UpbitNormState:
     """EWMA normalized depth, spread, and top-level liquidity for Upbit spot."""

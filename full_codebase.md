@@ -405,16 +405,6 @@ NORM_TAU = 600.0        # EWMA time constant for Upbit depth and spread normaliz
 BASELINE_TAU = 3600.0   # EWMA time constant for cross-venue basis baseline (sec)
 
 
-def _base(symbol: str) -> str:
-    s = symbol.upper()
-    if s.startswith("KRW-"):
-        return s[4:]
-    for suff in ("-PERP", "_PERP", "PERP", "USDT"):
-        if s.endswith(suff) and len(s) > len(suff):
-            return s[: -len(suff)]
-    return s
-
-
 @dataclass(slots=True)
 class UpbitNormState:
     """EWMA normalized depth, spread, and top-level liquidity for Upbit spot."""
@@ -18901,7 +18891,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
@@ -18913,11 +18902,10 @@ from venues.base import (
     ReconnectPolicy,
     create_http_session,
     normalize_symbol,
+    parse_symbol_and_mult,
     _secs_until_daily_reconnect_for,
     log,
 )
-
-_MULT_PREFIX_RE = re.compile(r"^(1000000|100000|10000|1000|100)([A-Z0-9]+)$")
 
 
 class BinanceRestClient:
@@ -18947,11 +18935,7 @@ class BinanceRestClient:
                     ):
                         raw_sym = s["symbol"].upper()
                         base_asset = s.get("baseAsset", "").upper()
-                        mult = 1.0
-                        m = _MULT_PREFIX_RE.match(base_asset)
-                        if m:
-                            mult = float(m.group(1))
-                            base_asset = m.group(2)
+                        base_asset, mult = parse_symbol_and_mult(base_asset)
                         out[raw_sym] = (base_asset, mult)
         except Exception as e:
             log.error(f"[binance_rest] Failed to fetch exchangeInfo: {e}")
@@ -19347,7 +19331,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -19364,8 +19347,6 @@ from venues.base import (
     _secs_until_daily_reconnect_for,
     log,
 )
-
-_MULT_PREFIX_RE = re.compile(r"^(1000000|100000|10000|1000|100)([A-Z0-9]+)$")
 
 
 class BybitRestClient:
@@ -22178,7 +22159,7 @@ class APIServer:
                     if "=" in part:
                         k, v = part.strip().split("=", 1)
                         if k == "token":
-                            return v.strip(), "cookie"
+                            return urllib.parse.unquote(v.strip()), "cookie"
                 return "", ""
 
             def _is_authenticated(self) -> bool:
@@ -22324,7 +22305,8 @@ class APIServer:
 
                 if not server_ref.token or hmac.compare_digest(submitted_token, server_ref.token):
                     csrf_tok = server_ref.get_csrf_token(server_ref.token)
-                    cookie_tok = f"token={server_ref.token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400"
+                    tok_quoted = urllib.parse.quote(server_ref.token, safe="")
+                    cookie_tok = f"token={tok_quoted}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400"
                     cookie_csrf = f"csrf_token={csrf_tok}; Path=/; SameSite=Strict; Max-Age=86400"
 
                     if is_form or "text/html" in self.headers.get("Accept", ""):
@@ -22374,7 +22356,8 @@ class APIServer:
                 effective_tok = tok or server_ref.token
                 csrf_tok = server_ref.get_csrf_token(effective_tok)
 
-                cookie_tok_hdr = f"token={effective_tok}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400"
+                eff_tok_quoted = urllib.parse.quote(effective_tok, safe="")
+                cookie_tok_hdr = f"token={eff_tok_quoted}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400"
                 cookie_csrf_hdr = f"csrf_token={csrf_tok}; Path=/; SameSite=Strict; Max-Age=86400"
 
                 # Collect live status
@@ -22596,6 +22579,7 @@ class APIServer:
 
         try:
             self._server = http.server.ThreadingHTTPServer((self.host, self.port), Handler)
+            self.port = self._server.server_address[1]
             self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
             self._thread.start()
             self._running = True

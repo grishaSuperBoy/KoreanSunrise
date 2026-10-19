@@ -118,7 +118,7 @@ class APIServer:
                     if "=" in part:
                         k, v = part.strip().split("=", 1)
                         if k == "token":
-                            return v.strip(), "cookie"
+                            return urllib.parse.unquote(v.strip()), "cookie"
                 return "", ""
 
             def _is_authenticated(self) -> bool:
@@ -264,7 +264,8 @@ class APIServer:
 
                 if not server_ref.token or hmac.compare_digest(submitted_token, server_ref.token):
                     csrf_tok = server_ref.get_csrf_token(server_ref.token)
-                    cookie_tok = f"token={server_ref.token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400"
+                    tok_quoted = urllib.parse.quote(server_ref.token, safe="")
+                    cookie_tok = f"token={tok_quoted}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400"
                     cookie_csrf = f"csrf_token={csrf_tok}; Path=/; SameSite=Strict; Max-Age=86400"
 
                     if is_form or "text/html" in self.headers.get("Accept", ""):
@@ -314,7 +315,8 @@ class APIServer:
                 effective_tok = tok or server_ref.token
                 csrf_tok = server_ref.get_csrf_token(effective_tok)
 
-                cookie_tok_hdr = f"token={effective_tok}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400"
+                eff_tok_quoted = urllib.parse.quote(effective_tok, safe="")
+                cookie_tok_hdr = f"token={eff_tok_quoted}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400"
                 cookie_csrf_hdr = f"csrf_token={csrf_tok}; Path=/; SameSite=Strict; Max-Age=86400"
 
                 # Collect live status
@@ -536,6 +538,7 @@ class APIServer:
 
         try:
             self._server = http.server.ThreadingHTTPServer((self.host, self.port), Handler)
+            self.port = self._server.server_address[1]
             self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
             self._thread.start()
             self._running = True

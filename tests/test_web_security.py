@@ -27,9 +27,9 @@ class TestWebSecurity(unittest.TestCase):
         cls.mock_service.stream_manager.get_usdt_krw_rate.return_value = 1380.0
 
         cls.token = "super_secret_test_token_2026"
-        cls.server = APIServer(service=cls.mock_service, host="127.0.0.1", port=18089, token=cls.token)
+        cls.server = APIServer(service=cls.mock_service, host="127.0.0.1", port=0, token=cls.token)
         cls.server.start()
-        cls.base_url = "http://127.0.0.1:18089"
+        cls.base_url = f"http://127.0.0.1:{cls.server.port}"
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -225,6 +225,38 @@ class TestWebSecurity(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 409)
         finally:
             self.server._pipeline_proc = None
+
+    def test_token_with_special_characters_cookie(self) -> None:
+        """Tokens containing special characters (;, =, spaces) work with quoted cookies."""
+        import urllib.parse
+        special_token = "tok;with,special=chars and spaces!"
+        server = APIServer(service=self.mock_service, host="127.0.0.1", port=0, token=special_token)
+        server.start()
+        try:
+            url = f"http://127.0.0.1:{server.port}"
+            # 1. Login with special token
+            req = urllib.request.Request(
+                f"{url}/login",
+                data=json.dumps({"token": special_token}).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req) as resp:
+                self.assertEqual(resp.status, 200)
+                cookie_hdrs = resp.headers.get_all("Set-Cookie")
+                cookie_str = "; ".join(cookie_hdrs)
+                # Verify token is URL-quoted in Set-Cookie
+                quoted_tok = urllib.parse.quote(special_token, safe="")
+                self.assertIn(f"token={quoted_tok}", cookie_str)
+
+            # 2. Access dashboard stats using the quoted cookie
+            req_dash = urllib.request.Request(
+                f"{url}/stats",
+                headers={"Cookie": f"token={quoted_tok}"}
+            )
+            with urllib.request.urlopen(req_dash) as resp_dash:
+                self.assertEqual(resp_dash.status, 200)
+        finally:
+            server.stop()
 
 
 if __name__ == "__main__":

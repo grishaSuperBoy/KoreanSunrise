@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -24,8 +23,6 @@ from venues.base import (
     _secs_until_daily_reconnect_for,
     log,
 )
-
-_MULT_PREFIX_RE = re.compile(r"^(1000000|100000|10000|1000|100)([A-Z0-9]+)$")
 
 
 class BybitRestClient:

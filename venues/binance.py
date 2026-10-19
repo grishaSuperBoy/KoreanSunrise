@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import requests
@@ -19,11 +18,10 @@ from venues.base import (
     ReconnectPolicy,
     create_http_session,
     normalize_symbol,
+    parse_symbol_and_mult,
     _secs_until_daily_reconnect_for,
     log,
 )
-
-_MULT_PREFIX_RE = re.compile(r"^(1000000|100000|10000|1000|100)([A-Z0-9]+)$")
 
 
 class BinanceRestClient:
@@ -53,11 +51,7 @@ class BinanceRestClient:
                     ):
                         raw_sym = s["symbol"].upper()
                         base_asset = s.get("baseAsset", "").upper()
-                        mult = 1.0
-                        m = _MULT_PREFIX_RE.match(base_asset)
-                        if m:
-                            mult = float(m.group(1))
-                            base_asset = m.group(2)
+                        base_asset, mult = parse_symbol_and_mult(base_asset)
                         out[raw_sym] = (base_asset, mult)
         except Exception as e:
             log.error(f"[binance_rest] Failed to fetch exchangeInfo: {e}")
