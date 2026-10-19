@@ -245,9 +245,6 @@ class GateioStream(BaseCEXStream):
                 # Atomic Copy-on-Write assignment
                 self._books[contract] = {"bids": new_bids, "asks": new_asks}
 
-                top_bids = sorted_bids_raw[:5]
-                top_asks = sorted_asks_raw[:5]
-
             if mult != 1.0:
                 inv_mult = 1.0 / mult
                 top_bids = [(p * inv_mult, q * mult) for p, q in sorted_bids_raw[:5]]

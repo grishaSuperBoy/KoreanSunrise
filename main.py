@@ -149,7 +149,10 @@ class KoreanSunriseService:
         try:
             while not self._shutdown_event.is_set():
                 now = time.time()
-                self.engine.sweep_timeouts(now)
+                try:
+                    self.engine.sweep_timeouts(now)
+                except Exception as e:
+                    log.error(f"[main] sweep_timeouts error: {e}")
                 await asyncio.to_thread(self.writer.maybe_flush, now)
 
                 if now - last_reload >= 30.0:

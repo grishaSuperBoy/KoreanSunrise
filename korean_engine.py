@@ -878,7 +878,10 @@ class KoreanEngine:
         else:
             self.counters["signals_timeout"] += 1
 
-        self.emit(sig.to_dict())
+        try:
+            self.emit(sig.to_dict())
+        except Exception as e:
+            log.error(f"[engine] Failed to emit closed signal {getattr(sig, 'id', '')}: {e}")
 
         pair_key = (sig.coin, sig.follower_exchange)
         st = self._pairs.get(pair_key)
@@ -898,19 +901,22 @@ class KoreanEngine:
         """
         for coin, signals in list(self._active_signals.items()):
             for sig in list(signals):
-                hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
-                if not sig.closed and (now - sig.open_ts) >= hold_sec:
-                    f_snap = self._books.get((sig.follower_exchange, coin))
-                    if f_snap:
-                        f_mid_move = (
-                            (f_snap.mid_price - sig.follower_mid) / sig.follower_mid * 1e4
-                            if sig.follower_mid > 0
-                            else 0.0
-                        )
-                        entry_px = getattr(sig, "follower_entry_px", 0.0) or sig.follower_best_ask
-                        exit_px = f_snap.vwap_bid_usd(sig.suggested_size_usd) if sig.suggested_size_usd > 0 else f_snap.best_bid
-                        f_exec_move = (exit_px - entry_px) / entry_px * 1e4 if entry_px > 0 else 0.0
-                    else:
-                        f_mid_move = 0.0
-                        f_exec_move = 0.0
-                    self._close_signal(sig, now, "timeout", f_mid_move, f_exec_move)
+                try:
+                    hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
+                    if not sig.closed and (now - sig.open_ts) >= hold_sec:
+                        f_snap = self._books.get((sig.follower_exchange, coin))
+                        if f_snap:
+                            f_mid_move = (
+                                (f_snap.mid_price - sig.follower_mid) / sig.follower_mid * 1e4
+                                if sig.follower_mid > 0
+                                else 0.0
+                            )
+                            entry_px = getattr(sig, "follower_entry_px", 0.0) or sig.follower_best_ask
+                            exit_px = f_snap.vwap_bid_usd(sig.suggested_size_usd) if sig.suggested_size_usd > 0 else f_snap.best_bid
+                            f_exec_move = (exit_px - entry_px) / entry_px * 1e4 if entry_px > 0 else 0.0
+                        else:
+                            f_mid_move = 0.0
+                            f_exec_move = 0.0
+                        self._close_signal(sig, now, "timeout", f_mid_move, f_exec_move)
+                except Exception as e:
+                    log.error(f"[engine] Error sweeping timeout for signal {getattr(sig, 'id', '')}: {e}")

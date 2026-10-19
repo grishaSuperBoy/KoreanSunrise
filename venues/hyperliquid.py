@@ -340,7 +340,6 @@ class HyperliquidStream(BaseVenueStream):
             if not bids or not asks:
                 return
 
-            self._note_sub(True)
             snap = OrderBookDepth5(
                 exchange="hyperliquid",
                 symbol=coin,

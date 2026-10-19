@@ -203,9 +203,6 @@ class TradingProfileManager:
 
             size = min(slot_budget, stealth_size, max_cap)
             if size < min_order:
-                # If slot budget allows min_order and depth is within 80% of min_order requirement
-                if slot_budget >= min_order and stealth_size >= (min_order * 0.8):
-                    return min_order
                 return None
 
             return round(size, 2)

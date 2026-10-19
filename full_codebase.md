@@ -1388,7 +1388,10 @@ class KoreanEngine:
         else:
             self.counters["signals_timeout"] += 1
 
-        self.emit(sig.to_dict())
+        try:
+            self.emit(sig.to_dict())
+        except Exception as e:
+            log.error(f"[engine] Failed to emit closed signal {getattr(sig, 'id', '')}: {e}")
 
         pair_key = (sig.coin, sig.follower_exchange)
         st = self._pairs.get(pair_key)
@@ -1408,22 +1411,25 @@ class KoreanEngine:
         """
         for coin, signals in list(self._active_signals.items()):
             for sig in list(signals):
-                hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
-                if not sig.closed and (now - sig.open_ts) >= hold_sec:
-                    f_snap = self._books.get((sig.follower_exchange, coin))
-                    if f_snap:
-                        f_mid_move = (
-                            (f_snap.mid_price - sig.follower_mid) / sig.follower_mid * 1e4
-                            if sig.follower_mid > 0
-                            else 0.0
-                        )
-                        entry_px = getattr(sig, "follower_entry_px", 0.0) or sig.follower_best_ask
-                        exit_px = f_snap.vwap_bid_usd(sig.suggested_size_usd) if sig.suggested_size_usd > 0 else f_snap.best_bid
-                        f_exec_move = (exit_px - entry_px) / entry_px * 1e4 if entry_px > 0 else 0.0
-                    else:
-                        f_mid_move = 0.0
-                        f_exec_move = 0.0
-                    self._close_signal(sig, now, "timeout", f_mid_move, f_exec_move)
+                try:
+                    hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
+                    if not sig.closed and (now - sig.open_ts) >= hold_sec:
+                        f_snap = self._books.get((sig.follower_exchange, coin))
+                        if f_snap:
+                            f_mid_move = (
+                                (f_snap.mid_price - sig.follower_mid) / sig.follower_mid * 1e4
+                                if sig.follower_mid > 0
+                                else 0.0
+                            )
+                            entry_px = getattr(sig, "follower_entry_px", 0.0) or sig.follower_best_ask
+                            exit_px = f_snap.vwap_bid_usd(sig.suggested_size_usd) if sig.suggested_size_usd > 0 else f_snap.best_bid
+                            f_exec_move = (exit_px - entry_px) / entry_px * 1e4 if entry_px > 0 else 0.0
+                        else:
+                            f_mid_move = 0.0
+                            f_exec_move = 0.0
+                        self._close_signal(sig, now, "timeout", f_mid_move, f_exec_move)
+                except Exception as e:
+                    log.error(f"[engine] Error sweeping timeout for signal {getattr(sig, 'id', '')}: {e}")
 ```
 
 ## main.py
@@ -1580,7 +1586,10 @@ class KoreanSunriseService:
         try:
             while not self._shutdown_event.is_set():
                 now = time.time()
-                self.engine.sweep_timeouts(now)
+                try:
+                    self.engine.sweep_timeouts(now)
+                except Exception as e:
+                    log.error(f"[main] sweep_timeouts error: {e}")
                 await asyncio.to_thread(self.writer.maybe_flush, now)
 
                 if now - last_reload >= 30.0:
@@ -5938,9 +5947,6 @@ class TradingProfileManager:
 
             size = min(slot_budget, stealth_size, max_cap)
             if size < min_order:
-                # If slot budget allows min_order and depth is within 80% of min_order requirement
-                if slot_budget >= min_order and stealth_size >= (min_order * 0.8):
-                    return min_order
                 return None
 
             return round(size, 2)
@@ -7944,6 +7950,10 @@ class TestPipelineE2E(unittest.TestCase):
         # Book is too shallow to absorb minimum order safely
         size_shallow = profile_mgr.calculate_stealth_order_size("binance", follower_top3_ask_usd=30.0)
         self.assertIsNone(size_shallow)
+
+        # Strict 15% limit: top3 ask $60 -> stealth_size = $9.00 < $10.0 min order (no artificial bump)
+        size_no_bump = profile_mgr.calculate_stealth_order_size("binance", follower_top3_ask_usd=60.0)
+        self.assertIsNone(size_no_bump)
 
         # Initialize PoolStateManager
         psm = PoolStateManager(
@@ -18147,7 +18157,8 @@ class AsterdexStream(BaseCEXStream):
             if not bids or not asks:
                 return
 
-            self._note_sub(True)
+            if coin not in self.symbols_seen:
+                self._note_sub(True)
             snap = OrderBookDepth5(
                 exchange="asterdex",
                 symbol=coin,
@@ -19129,7 +19140,8 @@ class BinanceFuturesStream(BaseVenueStream):
                 bids = [(float(p), float(q)) for p, q in raw_bids]
                 asks = [(float(p), float(q)) for p, q in raw_asks]
 
-            self._note_sub(True)
+            if coin not in self.symbols_seen:
+                self._note_sub(True)
             self.callback(
                 OrderBookDepth5(
                     exchange="binance",
@@ -19143,20 +19155,6 @@ class BinanceFuturesStream(BaseVenueStream):
             )
         except Exception:
             pass
-
-    async def start(self) -> None:
-        self._running = True
-        self._task = asyncio.create_task(self._run_loop())
-
-    async def stop(self) -> None:
-        self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-        self.connected = False
 ```
 
 ## venues/bingx.py
@@ -19657,20 +19655,6 @@ class BybitPerpStream(BaseVenueStream):
             )
         except Exception:
             pass
-
-    async def start(self) -> None:
-        self._running = True
-        self._task = asyncio.create_task(self._run_loop())
-
-    async def stop(self) -> None:
-        self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-        self.connected = False
 ```
 
 ## venues/gateio.py
@@ -19922,9 +19906,6 @@ class GateioStream(BaseCEXStream):
 
                 # Atomic Copy-on-Write assignment
                 self._books[contract] = {"bids": new_bids, "asks": new_asks}
-
-                top_bids = sorted_bids_raw[:5]
-                top_asks = sorted_asks_raw[:5]
 
             if mult != 1.0:
                 inv_mult = 1.0 / mult
@@ -20467,7 +20448,6 @@ class HyperliquidStream(BaseVenueStream):
             if not bids or not asks:
                 return
 
-            self._note_sub(True)
             snap = OrderBookDepth5(
                 exchange="hyperliquid",
                 symbol=coin,
@@ -21890,20 +21870,6 @@ class UpbitSpotStream(BaseVenueStream):
             bids=bids,
             asks=asks,
         )
-
-    async def start(self) -> None:
-        self._running = True
-        self._task = asyncio.create_task(self._run_loop())
-
-    async def stop(self) -> None:
-        self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-        self.connected = False
 ```
 
 ## web/__init__.py

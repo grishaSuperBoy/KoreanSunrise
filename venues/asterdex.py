@@ -204,7 +204,8 @@ class AsterdexStream(BaseCEXStream):
             if not bids or not asks:
                 return
 
-            self._note_sub(True)
+            if coin not in self.symbols_seen:
+                self._note_sub(True)
             snap = OrderBookDepth5(
                 exchange="asterdex",
                 symbol=coin,

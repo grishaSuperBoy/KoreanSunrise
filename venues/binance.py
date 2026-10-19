@@ -274,7 +274,8 @@ class BinanceFuturesStream(BaseVenueStream):
                 bids = [(float(p), float(q)) for p, q in raw_bids]
                 asks = [(float(p), float(q)) for p, q in raw_asks]
 
-            self._note_sub(True)
+            if coin not in self.symbols_seen:
+                self._note_sub(True)
             self.callback(
                 OrderBookDepth5(
                     exchange="binance",
@@ -288,17 +289,3 @@ class BinanceFuturesStream(BaseVenueStream):
             )
         except Exception:
             pass
-
-    async def start(self) -> None:
-        self._running = True
-        self._task = asyncio.create_task(self._run_loop())
-
-    async def stop(self) -> None:
-        self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-        self.connected = False

@@ -86,6 +86,10 @@ class TestPipelineE2E(unittest.TestCase):
         size_shallow = profile_mgr.calculate_stealth_order_size("binance", follower_top3_ask_usd=30.0)
         self.assertIsNone(size_shallow)
 
+        # Strict 15% limit: top3 ask $60 -> stealth_size = $9.00 < $10.0 min order (no artificial bump)
+        size_no_bump = profile_mgr.calculate_stealth_order_size("binance", follower_top3_ask_usd=60.0)
+        self.assertIsNone(size_no_bump)
+
         # Initialize PoolStateManager
         psm = PoolStateManager(
             universe_file=self.universe_file,
