@@ -779,6 +779,54 @@ class TestKoreanEngineStrategy(unittest.TestCase):
         norm["depth_ask"] = 1500.0
         self.assertEqual(norm.depth_ask, 1500.0)
 
+    # -------------------------------------------------------------------------
+    # 14. Minimum Order Size Guard
+    # -------------------------------------------------------------------------
+    def test_min_order_size_rejection(self):
+        coin = "MICRO"
+        now = time.time()
+
+        st = self.engine._get_or_create_pair_state(coin, "binance")
+        for i in range(6):
+            st.learn(0.0, now - 30.0 + i * 2.0)
+
+        # Norm ask depth $1000
+        self.engine._upbit_norm[coin] = {
+            "depth_ask": 1000.0,
+            "best_ask_usd": 100.0,
+            "spread_bps": 2.0,
+            "t": now - 1.0,
+        }
+
+        # Follower book has tiny depth: Top-3 Ask = $40.0. 15% stealth capacity = $6.00 < $10.0 min_order!
+        f_snap = OrderBookDepth5(
+            exchange="binance", symbol=coin, raw_symbol="MICROUSDT",
+            ts=now, exchange_ts=int(now * 1000),
+            bids=[(99.95, 10.0)],
+            asks=[(100.00, 0.2), (100.05, 0.1), (100.10, 0.1)],  # 0.4 * ~100 = $40 total
+        )
+        self.engine._books[("binance", coin)] = f_snap
+        self.engine._recv_ts[("binance", coin)] = now
+
+        u_prev = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now - 0.1, exchange_ts=int((now - 0.1) * 1000),
+            bids=[(99.95, 5.0)],
+            asks=[(100.00, 10.0), (100.05, 5.0), (100.50, 20.0)],
+        )
+        self.engine._books[("upbit", coin)] = u_prev
+
+        u_curr = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now, exchange_ts=int(now * 1000),
+            bids=[(100.00, 5.0)],
+            asks=[(100.50, 20.0)],
+        )
+        self.engine.on_book_update(u_curr)
+
+        # Order size was $6.00 < min_order_usd ($10.00) -> MUST BE REJECTED
+        self.assertIsNone(st.open_signal)
+
 
 if __name__ == "__main__":
     unittest.main()

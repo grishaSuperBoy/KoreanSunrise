@@ -32,7 +32,13 @@ class PionexRestClient:
                     sym = s.get("symbol", "").upper()
                     if not sym.endswith("_PERP") or "USDT" not in sym:
                         continue
-                    base_coin, mult = parse_symbol_and_mult(s.get("baseCoin", "") or sym)
+                    base_coin, mult = parse_symbol_and_mult(sym)
+                    if mult == 1.0:
+                        base_curr = str(s.get("baseCurrency", "") or s.get("baseCoin", "")).upper()
+                        if base_curr:
+                            b_coin, b_mult = parse_symbol_and_mult(base_curr)
+                            if b_mult != 1.0:
+                                base_coin, mult = b_coin, b_mult
                     out[sym] = (base_coin, mult)
         except Exception as e:
             log.error(f"[pionex_rest] Failed to fetch symbols: {e}")

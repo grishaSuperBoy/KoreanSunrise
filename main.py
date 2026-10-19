@@ -52,6 +52,7 @@ class KoreanSunriseService:
             blowout_threshold=C.BLOWOUT_THRESHOLD,
             min_edge_bps=C.MIN_EXEC_EDGE_BPS,
             max_position_budget_usd=C.MAX_POSITION_BUDGET_USD,
+            min_order_usd=getattr(C, "MIN_ORDER_USD", 10.0),
             stealth_depth_fraction=C.STEALTH_DEPTH_FRACTION,
             taker_fee_bps=C.TAKER_FEE_BPS,
             roundtrip_fee_bps=C.ROUNDTRIP_FEE_BPS,

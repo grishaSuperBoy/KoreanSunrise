@@ -276,6 +276,7 @@ DRAIN_THRESHOLD = 0.50          # 50% of normal top-5 ask depth swept on Upbit
 BLOWOUT_THRESHOLD = 2.5         # Instant spread >= 2.5x normal EWMA spread AND >= 2 ticks
 MIN_EXEC_EDGE_BPS = 12.0        # Minimum net executable edge after entry taker fee
 MAX_POSITION_BUDGET_USD = 10000.0
+MIN_ORDER_USD = 10.0            # Minimum order size in USD to reject non-executable micro-orders
 STEALTH_DEPTH_FRACTION = 0.15   # Max 15% of top 3 ask levels on follower order book
 
 # Execution Fees & Warmup Safety
@@ -714,6 +715,7 @@ class KoreanEngine:
         blowout_threshold: float = C.BLOWOUT_THRESHOLD,
         min_edge_bps: float = C.MIN_EXEC_EDGE_BPS,
         max_position_budget_usd: float = C.MAX_POSITION_BUDGET_USD,
+        min_order_usd: float = getattr(C, "MIN_ORDER_USD", 10.0),
         stealth_depth_fraction: float = C.STEALTH_DEPTH_FRACTION,
         taker_fee_bps: float = C.TAKER_FEE_BPS,
         roundtrip_fee_bps: float = C.ROUNDTRIP_FEE_BPS,
@@ -733,6 +735,7 @@ class KoreanEngine:
         self.blowout_threshold = blowout_threshold
         self.min_edge_bps = min_edge_bps
         self.max_position_budget_usd = max_position_budget_usd
+        self.min_order_usd = min_order_usd
         self.stealth_fraction = stealth_depth_fraction
         self.taker_fee_bps = taker_fee_bps
         self.roundtrip_fee_bps = roundtrip_fee_bps
@@ -1160,6 +1163,10 @@ class KoreanEngine:
                 stealth_capacity_usd,
             )
 
+        # Reject non-executable micro-orders smaller than exchange minimum notional
+        if suggested_size_usd < self.min_order_usd:
+            return
+
         # True VWAP execution fill price across ask levels for suggested size
         f_entry_px = f_snap.vwap_ask_usd(suggested_size_usd)
         if f_entry_px <= 0:
@@ -1476,6 +1483,7 @@ class KoreanSunriseService:
             blowout_threshold=C.BLOWOUT_THRESHOLD,
             min_edge_bps=C.MIN_EXEC_EDGE_BPS,
             max_position_budget_usd=C.MAX_POSITION_BUDGET_USD,
+            min_order_usd=getattr(C, "MIN_ORDER_USD", 10.0),
             stealth_depth_fraction=C.STEALTH_DEPTH_FRACTION,
             taker_fee_bps=C.TAKER_FEE_BPS,
             roundtrip_fee_bps=C.ROUNDTRIP_FEE_BPS,
@@ -7792,6 +7800,54 @@ class TestKoreanEngineStrategy(unittest.TestCase):
         self.assertEqual(norm["depth_ask"], 1200.0)
         norm["depth_ask"] = 1500.0
         self.assertEqual(norm.depth_ask, 1500.0)
+
+    # -------------------------------------------------------------------------
+    # 14. Minimum Order Size Guard
+    # -------------------------------------------------------------------------
+    def test_min_order_size_rejection(self):
+        coin = "MICRO"
+        now = time.time()
+
+        st = self.engine._get_or_create_pair_state(coin, "binance")
+        for i in range(6):
+            st.learn(0.0, now - 30.0 + i * 2.0)
+
+        # Norm ask depth $1000
+        self.engine._upbit_norm[coin] = {
+            "depth_ask": 1000.0,
+            "best_ask_usd": 100.0,
+            "spread_bps": 2.0,
+            "t": now - 1.0,
+        }
+
+        # Follower book has tiny depth: Top-3 Ask = $40.0. 15% stealth capacity = $6.00 < $10.0 min_order!
+        f_snap = OrderBookDepth5(
+            exchange="binance", symbol=coin, raw_symbol="MICROUSDT",
+            ts=now, exchange_ts=int(now * 1000),
+            bids=[(99.95, 10.0)],
+            asks=[(100.00, 0.2), (100.05, 0.1), (100.10, 0.1)],  # 0.4 * ~100 = $40 total
+        )
+        self.engine._books[("binance", coin)] = f_snap
+        self.engine._recv_ts[("binance", coin)] = now
+
+        u_prev = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now - 0.1, exchange_ts=int((now - 0.1) * 1000),
+            bids=[(99.95, 5.0)],
+            asks=[(100.00, 10.0), (100.05, 5.0), (100.50, 20.0)],
+        )
+        self.engine._books[("upbit", coin)] = u_prev
+
+        u_curr = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now, exchange_ts=int(now * 1000),
+            bids=[(100.00, 5.0)],
+            asks=[(100.50, 20.0)],
+        )
+        self.engine.on_book_update(u_curr)
+
+        # Order size was $6.00 < min_order_usd ($10.00) -> MUST BE REJECTED
+        self.assertIsNone(st.open_signal)
 
 
 if __name__ == "__main__":
@@ -18977,7 +19033,9 @@ class BinanceFuturesStream(BaseVenueStream):
                     log.info(f"[{tag}] Connected! Streaming depth5@100ms...")
                     reconnect_in = _secs_until_daily_reconnect_for(f"{self.name}_{chunk_id}")
                     deadline = time.monotonic() + reconnect_in
-                    chunk_last_msg_ts = time.time()
+                    chunk_connect_ts = time.time()
+                    chunk_last_msg_ts = chunk_connect_ts
+                    chunk_data_ts = 0.0
 
                     try:
                         while self._running:
@@ -18986,11 +19044,12 @@ class BinanceFuturesStream(BaseVenueStream):
                                 log.info(f"[{tag}] Scheduled daily reconnect. Reconnecting...")
                                 break
 
-                            if self._starved_since_connect(time.time()):
+                            now = time.time()
+                            if (now - chunk_connect_ts > 30.0) and (chunk_data_ts <= chunk_connect_ts):
                                 log.warning(f"[{tag}] Connected but no data in 30s, reconnecting...")
                                 break
 
-                            if time.time() - chunk_last_msg_ts > self.WATCHDOG_SECS:
+                            if now - chunk_last_msg_ts > self.WATCHDOG_SECS:
                                 log.warning(f"[{tag}] No messages for >{self.WATCHDOG_SECS:.0f}s, reconnecting...")
                                 break
 
@@ -18999,8 +19058,10 @@ class BinanceFuturesStream(BaseVenueStream):
                             except asyncio.TimeoutError:
                                 continue
 
-                            chunk_last_msg_ts = time.time()
-                            self.last_msg_ts = chunk_last_msg_ts
+                            recv_now = time.time()
+                            chunk_last_msg_ts = recv_now
+                            chunk_data_ts = recv_now
+                            self.last_msg_ts = recv_now
                             self._parse_message(msg)
                     finally:
                         self._connected_chunks.discard(chunk_id)
@@ -21265,7 +21326,13 @@ class PionexRestClient:
                     sym = s.get("symbol", "").upper()
                     if not sym.endswith("_PERP") or "USDT" not in sym:
                         continue
-                    base_coin, mult = parse_symbol_and_mult(s.get("baseCoin", "") or sym)
+                    base_coin, mult = parse_symbol_and_mult(sym)
+                    if mult == 1.0:
+                        base_curr = str(s.get("baseCurrency", "") or s.get("baseCoin", "")).upper()
+                        if base_curr:
+                            b_coin, b_mult = parse_symbol_and_mult(base_curr)
+                            if b_mult != 1.0:
+                                base_coin, mult = b_coin, b_mult
                     out[sym] = (base_coin, mult)
         except Exception as e:
             log.error(f"[pionex_rest] Failed to fetch symbols: {e}")
@@ -21501,7 +21568,7 @@ class UpbitRestClient:
                                 "price_usd": price_krw / usdt_krw_rate,
                                 "vol_usd_24h": vol_krw / usdt_krw_rate,
                             }
-                time.sleep(0.08)  # Upbit 10 req/s rate compliance
+                time.sleep(0.12)  # Upbit 10 req/s rate compliance (<= 8.3 req/s safe buffer)
             except Exception as e:
                 log.warning(f"[upbit_rest] Failed to fetch ticker batch ({len(chunk)}): {e}")
 
@@ -21546,7 +21613,7 @@ class UpbitRestClient:
                     break
                 to_param = oldest
                 remaining -= len(rows)
-                time.sleep(0.04)  # 10 req/s compliance
+                time.sleep(0.12)  # Upbit 10 req/s rate compliance (<= 8.3 req/s safe buffer)
             except Exception:
                 break
 

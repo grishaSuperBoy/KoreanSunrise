@@ -205,6 +205,7 @@ class KoreanEngine:
         blowout_threshold: float = C.BLOWOUT_THRESHOLD,
         min_edge_bps: float = C.MIN_EXEC_EDGE_BPS,
         max_position_budget_usd: float = C.MAX_POSITION_BUDGET_USD,
+        min_order_usd: float = getattr(C, "MIN_ORDER_USD", 10.0),
         stealth_depth_fraction: float = C.STEALTH_DEPTH_FRACTION,
         taker_fee_bps: float = C.TAKER_FEE_BPS,
         roundtrip_fee_bps: float = C.ROUNDTRIP_FEE_BPS,
@@ -224,6 +225,7 @@ class KoreanEngine:
         self.blowout_threshold = blowout_threshold
         self.min_edge_bps = min_edge_bps
         self.max_position_budget_usd = max_position_budget_usd
+        self.min_order_usd = min_order_usd
         self.stealth_fraction = stealth_depth_fraction
         self.taker_fee_bps = taker_fee_bps
         self.roundtrip_fee_bps = roundtrip_fee_bps
@@ -650,6 +652,10 @@ class KoreanEngine:
                 self.max_position_budget_usd,
                 stealth_capacity_usd,
             )
+
+        # Reject non-executable micro-orders smaller than exchange minimum notional
+        if suggested_size_usd < self.min_order_usd:
+            return
 
         # True VWAP execution fill price across ask levels for suggested size
         f_entry_px = f_snap.vwap_ask_usd(suggested_size_usd)

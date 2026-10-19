@@ -46,6 +46,7 @@ DRAIN_THRESHOLD = 0.50          # 50% of normal top-5 ask depth swept on Upbit
 BLOWOUT_THRESHOLD = 2.5         # Instant spread >= 2.5x normal EWMA spread AND >= 2 ticks
 MIN_EXEC_EDGE_BPS = 12.0        # Minimum net executable edge after entry taker fee
 MAX_POSITION_BUDGET_USD = 10000.0
+MIN_ORDER_USD = 10.0            # Minimum order size in USD to reject non-executable micro-orders
 STEALTH_DEPTH_FRACTION = 0.15   # Max 15% of top 3 ask levels on follower order book
 
 # Execution Fees & Warmup Safety

@@ -178,7 +178,9 @@ class BinanceFuturesStream(BaseVenueStream):
                     log.info(f"[{tag}] Connected! Streaming depth5@100ms...")
                     reconnect_in = _secs_until_daily_reconnect_for(f"{self.name}_{chunk_id}")
                     deadline = time.monotonic() + reconnect_in
-                    chunk_last_msg_ts = time.time()
+                    chunk_connect_ts = time.time()
+                    chunk_last_msg_ts = chunk_connect_ts
+                    chunk_data_ts = 0.0
 
                     try:
                         while self._running:
@@ -187,11 +189,12 @@ class BinanceFuturesStream(BaseVenueStream):
                                 log.info(f"[{tag}] Scheduled daily reconnect. Reconnecting...")
                                 break
 
-                            if self._starved_since_connect(time.time()):
+                            now = time.time()
+                            if (now - chunk_connect_ts > 30.0) and (chunk_data_ts <= chunk_connect_ts):
                                 log.warning(f"[{tag}] Connected but no data in 30s, reconnecting...")
                                 break
 
-                            if time.time() - chunk_last_msg_ts > self.WATCHDOG_SECS:
+                            if now - chunk_last_msg_ts > self.WATCHDOG_SECS:
                                 log.warning(f"[{tag}] No messages for >{self.WATCHDOG_SECS:.0f}s, reconnecting...")
                                 break
 
@@ -200,8 +203,10 @@ class BinanceFuturesStream(BaseVenueStream):
                             except asyncio.TimeoutError:
                                 continue
 
-                            chunk_last_msg_ts = time.time()
-                            self.last_msg_ts = chunk_last_msg_ts
+                            recv_now = time.time()
+                            chunk_last_msg_ts = recv_now
+                            chunk_data_ts = recv_now
+                            self.last_msg_ts = recv_now
                             self._parse_message(msg)
                     finally:
                         self._connected_chunks.discard(chunk_id)

@@ -102,7 +102,7 @@ class UpbitRestClient:
                                 "price_usd": price_krw / usdt_krw_rate,
                                 "vol_usd_24h": vol_krw / usdt_krw_rate,
                             }
-                time.sleep(0.08)  # Upbit 10 req/s rate compliance
+                time.sleep(0.12)  # Upbit 10 req/s rate compliance (<= 8.3 req/s safe buffer)
             except Exception as e:
                 log.warning(f"[upbit_rest] Failed to fetch ticker batch ({len(chunk)}): {e}")
 
@@ -147,7 +147,7 @@ class UpbitRestClient:
                     break
                 to_param = oldest
                 remaining -= len(rows)
-                time.sleep(0.04)  # 10 req/s compliance
+                time.sleep(0.12)  # Upbit 10 req/s rate compliance (<= 8.3 req/s safe buffer)
             except Exception:
                 break
 
