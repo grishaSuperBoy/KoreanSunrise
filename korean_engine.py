@@ -132,7 +132,10 @@ class KoreanEngine:
         roundtrip_fee_bps: float = C.ROUNDTRIP_FEE_BPS,
         warmup_samples: int = C.MIN_WARMUP_SAMPLES,
         max_hold_sec: float = C.MAX_SIGNAL_HOLD_SEC,
-        max_follower_book_age_sec: float = getattr(C, "MAX_FOLLOWER_BOOK_AGE_SEC", 0.30),
+        max_follower_book_age_sec: float = getattr(C, "MAX_FOLLOWER_BOOK_AGE_SEC", 5.0),
+        stop_invalidation_bps: float = getattr(C, "STOP_INVALIDATION_BPS", 15.0),
+        stop_adverse_pnl_bps: float = getattr(C, "STOP_ADVERSE_PNL_BPS", 35.0),
+        alpha_decay_sec: float = getattr(C, "ALPHA_DECAY_SEC", 8.0),
         require_trade_confirmation: bool = False,
         pool_state: Any = None,
         profile_manager: Any = None,
@@ -149,6 +152,9 @@ class KoreanEngine:
         self.warmup_samples = warmup_samples
         self.max_hold_sec = max_hold_sec
         self.max_follower_book_age_sec = max_follower_book_age_sec
+        self.stop_invalidation_bps = stop_invalidation_bps
+        self.stop_adverse_pnl_bps = stop_adverse_pnl_bps
+        self.alpha_decay_sec = alpha_decay_sec
         self.require_trade_confirmation = require_trade_confirmation
         self.pool_state = pool_state
         self.profile_manager = profile_manager
@@ -185,6 +191,9 @@ class KoreanEngine:
             "signals_converged": 0,
             "signals_reversed": 0,
             "signals_timeout": 0,
+            "signals_stop_loss_invalidation": 0,
+            "signals_stop_loss_adverse_pnl": 0,
+            "signals_stop_loss_decay": 0,
         }
 
         # Pair-specific calibrated execution thresholds
@@ -265,7 +274,7 @@ class KoreanEngine:
         else:
             self.counters["ticks_followers"] += 1
             upbit_snap = self._books.get(("upbit", coin))
-            if upbit_snap is not None and (now - self._recv_ts.get(("upbit", coin), 0.0)) <= 2.0:
+            if upbit_snap is not None and (now - self._recv_ts.get(("upbit", coin), 0.0)) <= 15.0:
                 st = self._get_or_create_pair_state(coin, ex)
                 if upbit_snap.mid_price > 0 and snap.mid_price > 0:
                     raw_diff_bps = (upbit_snap.mid_price - snap.mid_price) / snap.mid_price * 1e4
@@ -397,13 +406,13 @@ class KoreanEngine:
         # verify that the liquidity drop was backed by real taker buys rather than MM cancels/quote pullbacks.
         recent_buys_usd = 0.0
         if trigger_type is not None:
-            cutoff = now - 2.5
+            cutoff = now - 6.0
             recent_buys_usd, has_trades = self.get_recent_upbit_buys(coin, cutoff)
 
             should_verify_trades = self.require_trade_confirmation or has_trades
             if should_verify_trades:
-                ratio_needed = 0.40 if ask_held else 0.25
-                min_buys_needed = max(20.0, swept_usd * ratio_needed)
+                ratio_needed = 0.25 if ask_held else 0.15
+                min_buys_needed = max(15.0, swept_usd * ratio_needed)
 
                 if recent_buys_usd < min_buys_needed:
                     self.counters["cancels_blocked"] = self.counters.get("cancels_blocked", 0) + 1
@@ -420,7 +429,13 @@ class KoreanEngine:
         for follower_ex in follower_exchanges:
             f_snap = self._books.get((follower_ex, coin))
             f_recv = self._recv_ts.get((follower_ex, coin), 0.0)
-            if f_snap is None or (now - f_recv) > self.max_follower_book_age_sec:
+            if f_snap is None:
+                continue
+
+            book_age_sec = now - f_recv
+            # Decouple baseline learning from entry age guard:
+            # Baseline learning tolerates up to 15.0s, ensuring pair warms up on slow alts
+            if book_age_sec > 15.0:
                 continue
 
             st = self._get_or_create_pair_state(coin, follower_ex)
@@ -432,14 +447,20 @@ class KoreanEngine:
 
             raw_diff_bps = (upbit_mid - f_mid) / f_mid * 1e4
 
-            if trigger_type and st.open_signal is None and st.is_warmed_up:
+            # Entry check requires fresh follower book (<= max_follower_book_age_sec, default 5.0s)
+            if (
+                trigger_type
+                and st.open_signal is None
+                and st.is_warmed_up
+                and book_age_sec <= self.max_follower_book_age_sec
+            ):
                 self._check_entry(
                     coin=coin,
                     follower_ex=follower_ex,
                     st=st,
                     upbit_snap=upbit_snap,
                     f_snap=f_snap,
-                    f_book_age_ms=(now - f_recv) * 1000.0,
+                    f_book_age_ms=book_age_sec * 1000.0,
                     norm_depth=norm_depth,
                     norm_spread=norm_spread,
                     swept_usd=swept_usd,
@@ -538,9 +559,6 @@ class KoreanEngine:
 
         req_edge = float(pair_cfg.get("min_spread_bps", self.min_edge_bps))
         if net_edge < req_edge:
-            return
-
-        if f_snap.spread_bps >= gross_exec_edge_bps * 0.8:
             return
 
         # Initial executable PnL at t=0 (if bought at f_entry_px and immediately sold at VWAP bid)
@@ -674,15 +692,49 @@ class KoreanEngine:
                     round(rem_edge, 2),
                 ])
 
-            # Closure evaluation:
+            # Closure & Stop-Loss evaluation:
+            pair_cfg = self.get_pair_threshold_config(coin, follower_ex)
             hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
-            if cur_net_pnl >= (sig.net_exec_edge_bps * 0.8) and cur_net_pnl > 0.0:
+            pair_decay_sec = float(pair_cfg.get("alpha_decay_sec", self.alpha_decay_sec))
+            sigma = max(sig.pair_sigma_bps, 2.0)
+
+            # --- Model A: Microstructure Invalidation Stop ---
+            # Triggers if the Upbit leader pump breaks down (Upbit mid drops >= 1.5*sigma below entry
+            # or cross-venue basis dislocates negatively beyond invalidation tolerance)
+            upbit_drop_bps = (sig.leader_mid - upbit_snap.mid_price) / sig.leader_mid * 1e4
+            cur_dislocation_bps = cur_diff_bps - sig.kimchi_baseline_bps
+            if upbit_drop_bps >= (1.5 * sigma) or cur_dislocation_bps <= -self.stop_invalidation_bps:
+                sig.stop_hit = True
+                sig.stop_type = "invalidation"
+                sig.stop_loss_bps = round(abs(min(0.0, cur_net_pnl)), 2)
+                self._close_signal(sig, now, "stop_invalidation", f_mid_move, f_exec_move)
+                continue
+
+            # --- Model B: Hard Adverse PnL Drawdown Stop ---
+            # Triggers if follower order book experiences violent adverse excursion
+            adverse_limit = max(self.stop_adverse_pnl_bps, 2.5 * sigma)
+            if cur_net_pnl <= -adverse_limit:
+                sig.stop_hit = True
+                sig.stop_type = "adverse_pnl"
+                sig.stop_loss_bps = round(abs(cur_net_pnl), 2)
+                self._close_signal(sig, now, "stop_adverse_pnl", f_mid_move, f_exec_move)
+                continue
+
+            # --- Model C: Alpha Decay Timeout Stop ---
+            # If transmission window elapsed (dt >= pair_decay_sec) and net PnL is still non-positive,
+            # alpha has decayed -> exit to avoid adverse toxic drift
+            if dt >= pair_decay_sec and cur_net_pnl <= 0.0:
+                sig.stop_hit = True
+                sig.stop_type = "alpha_decay"
+                sig.stop_loss_bps = round(abs(cur_net_pnl), 2)
+                self._close_signal(sig, now, "stop_decay", f_mid_move, f_exec_move)
+                continue
+
+            # --- Normal Take-Profit / Edge Absorption ---
+            if cur_net_pnl >= (sig.net_exec_edge_bps * 0.75) and cur_net_pnl > 0.0:
                 self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
-            elif rem_edge <= 0.0:
-                if cur_net_pnl > 0.0:
-                    self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
-                else:
-                    self._close_signal(sig, now, "reversed", f_mid_move, f_exec_move)
+            elif rem_edge <= 0.0 and cur_net_pnl > 0.0:
+                self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
             elif dt >= hold_sec:
                 self._close_signal(sig, now, "timeout", f_mid_move, f_exec_move)
 
@@ -704,6 +756,12 @@ class KoreanEngine:
 
         if reason == "converged":
             self.counters["signals_converged"] += 1
+        elif reason == "stop_invalidation":
+            self.counters["signals_stop_loss_invalidation"] += 1
+        elif reason == "stop_adverse_pnl":
+            self.counters["signals_stop_loss_adverse_pnl"] += 1
+        elif reason == "stop_decay":
+            self.counters["signals_stop_loss_decay"] += 1
         elif reason == "reversed":
             self.counters["signals_reversed"] += 1
         else:

@@ -101,6 +101,14 @@ def generate_daily_report(
     coins_seen: Set[str] = set()
     close_reasons = collections.Counter()
     trigger_types = collections.Counter()
+    stop_stats = {
+        "total_stops": 0,
+        "invalidation": 0,
+        "adverse_pnl": 0,
+        "alpha_decay": 0,
+        "other": 0,
+        "total_stop_pnl_usd": 0.0,
+    }
 
     def _new_bucket() -> Dict[str, Any]:
         return {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0, "gains": 0.0, "losses": 0.0}
@@ -149,6 +157,20 @@ def generate_daily_report(
                     trig = d.get("trigger_type", "unknown")
                     trigger_types[trig] += 1
 
+                    stop_hit = d.get("stop_hit", False)
+                    stop_type = d.get("stop_type")
+                    if not stop_hit and reason.startswith("stop_"):
+                        stop_hit = True
+                        stop_type = reason.replace("stop_", "")
+
+                    if stop_hit:
+                        stop_stats["total_stops"] += 1
+                        st_key = str(stop_type or "other").lower()
+                        if st_key in ("invalidation", "adverse_pnl", "alpha_decay"):
+                            stop_stats[st_key] += 1
+                        else:
+                            stop_stats["other"] += 1
+
                     net_pnl_bps = d.get("net_pnl_bps")
                     if net_pnl_bps is None:
                         continue
@@ -161,6 +183,9 @@ def generate_daily_report(
                     gross = pos_size * ((net_pnl_bps + roundtrip_fee_bps) / 10000.0)
                     net = pos_size * (net_pnl_bps / 10000.0)
                     is_win = 1 if net > 0 else 0
+
+                    if stop_hit:
+                        stop_stats["total_stop_pnl_usd"] += net
 
                     def _add_to_bucket(b: Dict[str, Any]) -> None:
                         b["count"] += 1
@@ -180,7 +205,7 @@ def generate_daily_report(
                     swept_usd = float(d.get("leader_swept_usd", 0.0))
                     f_top3_ask = float(d.get("follower_top3_ask_usd", 0.0))
                     cross_ratio = (swept_usd / f_top3_ask) if f_top3_ask > 0 else 0.0
-                    if drain_ratio < 0.40 and cross_ratio < 0.50:
+                    if drain_ratio < 0.30 and cross_ratio < 0.30:
                         continue
 
                     stealth_cap = float(d.get("stealth_capacity_usd", 0.0))
@@ -338,6 +363,15 @@ def generate_daily_report(
         },
         "close_reasons": dict(close_reasons),
         "trigger_types": dict(trigger_types),
+        "stop_loss_telemetry": {
+            "total_stops": stop_stats["total_stops"],
+            "stop_rate_pct": round((stop_stats["total_stops"] / total_signals * 100.0), 1) if total_signals else 0.0,
+            "invalidation_count": stop_stats["invalidation"],
+            "adverse_pnl_count": stop_stats["adverse_pnl"],
+            "alpha_decay_count": stop_stats["alpha_decay"],
+            "other_count": stop_stats["other"],
+            "total_stop_pnl_usd": round(stop_stats["total_stop_pnl_usd"], 2),
+        },
         "pnl_scenarios": pnl_summary,
         "venue_capacities": venue_summary,
         "sweep_thresholds": {
@@ -376,6 +410,8 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
     m = doc["metadata"]
     p = doc["pnl_scenarios"]
     vc = doc.get("venue_capacities", [])
+    sl = doc.get("stop_loss_telemetry", {})
+    cr = doc.get("close_reasons", {})
     lines = [
         f"# Korean Sunrise: Суточный Квантовый Отчёт ({m['report_date']})",
         f"*Сгенерирован:* `{m['generated_at']}` | *Окно:* `{m['days_analyzed']} d` | *Размер слота:* `${m['order_size_usd']}` | *Комиссия:* `{m['roundtrip_fee_bps']} bps`",
@@ -385,7 +421,7 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
         f"- **Активных монет с импульсами:** `{m['coins_active']}`",
         f"- **Фолловер-бирж активно:** `{len(m['venues_active'])}` ({', '.join(m['venues_active']) if m['venues_active'] else 'None'})",
         f"- **Архивов данных обработано:** `{m['total_files_scanned']}` (`{m['total_size_mb']} MB`)",
-        f"- **Причины закрытия импульсов:** `Converged: {doc['close_reasons'].get('converged', 0)}` | `Timeout: {doc['close_reasons'].get('timeout', 0)}` | `Reversed: {doc['close_reasons'].get('reversed', 0)}`",
+        f"- **Причины закрытия импульсов:** `Converged: {cr.get('converged', 0)}` | `Timeout: {cr.get('timeout', 0)}` | `Reversed: {cr.get('reversed', 0)}` | `Stops: {sl.get('total_stops', 0)}` (Inv: {sl.get('invalidation_count', 0)}, Adv: {sl.get('adverse_pnl_count', 0)}, Decay: {sl.get('alpha_decay_count', 0)})",
         f"- **Триггеры выкупа Upbit:** `Depth Drain: {doc['trigger_types'].get('depth_drain', 0)}` | `Spread Blowout: {doc['trigger_types'].get('spread_blowout', 0)}`",
         "",
         "## 2. PnL Сценарии исполнения",
@@ -405,10 +441,21 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
             f"${row['gross_usd']:.2f} | ${row['fee_usd']:.2f} | **${row['net_pnl_usd']:.2f}** | {row['profit_factor']} |"
         )
 
-    # Section 3: Physical order book capacity
+    # Section 3: Stop-Loss Protection Telemetry
     lines.extend([
         "",
-        "## 3. Физическая ёмкость стакана по биржам (Real Order Book Capacity)",
+        "## 3. Стоп-Лоссы и Защита от Токсичного Потока (Stop-Loss Protection)",
+        f"- **Всего сработало стоп-лоссов:** `{sl.get('total_stops', 0):,}` ({sl.get('stop_rate_pct', 0.0)}% от всех импульсов)",
+        f"- **Model A: Microstructure Invalidation:** `{sl.get('invalidation_count', 0):,}` (мгновенный сброс при сломе/откате пампа на Upbit)",
+        f"- **Model B: Hard Adverse PnL Drawdown:** `{sl.get('adverse_pnl_count', 0):,}` (жесткая отсечка при токсичном движении фолловера)",
+        f"- **Model C: Alpha Decay Timeout:** `{sl.get('alpha_decay_count', 0):,}` (сброс по истечении окна передачи импульса при PnL <= 0)",
+        f"- **Суммарный PnL по стопам:** `${sl.get('total_stop_pnl_usd', 0.0):.2f}` (контролируемые локальные риски вместо зависания в просадках)",
+    ])
+
+    # Section 4: Physical order book capacity
+    lines.extend([
+        "",
+        "## 4. Физическая ёмкость стакана по биржам (Real Order Book Capacity)",
         "| Биржа | Сигналов | Мед. Top-3 стакан ($) | Мед. 15% Ёмкость ($) | P25 Ёмкость ($) | P75 Ёмкость ($) | Мин. ($) | Макс. ($) |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ])
@@ -424,7 +471,7 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "## 4. Оптимизация порогов спреда (Threshold Sweep)",
+        "## 5. Оптимизация порогов спреда (Threshold Sweep)",
         "| Порог (bps) | Сигналов | Win Rate | Net PnL USD |",
         "| :---: | :---: | :---: | :---: |",
     ])
@@ -433,7 +480,7 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "## 5. Топ прибыльных связок (Upbit Leader <-> Perp Follower)",
+        "## 6. Топ прибыльных связок (Upbit Leader <-> Perp Follower)",
         "| Связка (Coin:Upbit-Follower) | Сделок | Win Rate | Gross USD | Net PnL USD | Мед. Top-3 ($) | Мед. 15% Ёмкость ($) |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
     ])
@@ -449,7 +496,7 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "## 6. Топ монет по эффективности опережения",
+        "## 7. Топ монет по эффективности опережения",
         "| Монета | Сделок | Win Rate | Net PnL USD | Мед. Top-3 ($) | Мед. 15% Ёмкость ($) | Ср. MFE (bps) | Медиана $T_{peak}$ |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ])

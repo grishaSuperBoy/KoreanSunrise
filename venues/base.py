@@ -163,6 +163,70 @@ def _secs_until_daily_reconnect_for(name: str) -> float:
     return max(1.0, _secs_until_daily_reconnect() + _reconnect_jitter_sec(name))
 
 
+class ReconnectPolicy:
+    """
+    Adaptive exponential backoff policy with rate-limit and network error awareness.
+    Provides graduated backoff delays for 429 (Too Many Requests), 403 (Forbidden),
+    and DNS/network timeouts.
+    """
+    def __init__(
+        self,
+        base_delay: float = 2.0,
+        max_delay: float = 60.0,
+        backoff_factor: float = 1.5,
+    ):
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.backoff_factor = backoff_factor
+        self.attempts = 0
+
+    def reset(self) -> None:
+        self.attempts = 0
+
+    def compute_delay(self, exc: Optional[Exception] = None) -> float:
+        err_str = str(exc or "").lower()
+        if "429" in err_str or "too many requests" in err_str:
+            self.attempts += 2
+            return min(self.max_delay, max(30.0, self.base_delay * (self.backoff_factor ** self.attempts)))
+        if "403" in err_str or "forbidden" in err_str or "11001" in err_str or "getaddrinfo" in err_str:
+            self.attempts += 1
+            return min(self.max_delay, max(20.0, self.base_delay * (self.backoff_factor ** self.attempts)))
+
+        delay = min(self.max_delay, self.base_delay * (self.backoff_factor ** self.attempts))
+        self.attempts += 1
+        return delay
+
+
+class TTLCache:
+    """
+    Lightweight in-memory TTL dictionary cache for deduplicating high-frequency
+    events and tracking subscription confirmations without unbounded memory growth.
+    """
+    def __init__(self, ttl_sec: float = 60.0):
+        self.ttl_sec = ttl_sec
+        self._store: Dict[Any, float] = {}
+
+    def get(self, key: Any) -> bool:
+        now = time.time()
+        exp = self._store.get(key)
+        if exp is None:
+            return False
+        if now > exp:
+            del self._store[key]
+            return False
+        return True
+
+    def set(self, key: Any) -> None:
+        now = time.time()
+        self._store[key] = now + self.ttl_sec
+        if len(self._store) > 10000:
+            self.cleanup()
+
+    def cleanup(self) -> None:
+        now = time.time()
+        self._store = {k: exp for k, exp in self._store.items() if exp > now}
+
+
 class BaseVenueStream:
     """Base class for venue-specific WebSocket feeds."""
 
@@ -185,12 +249,14 @@ class BaseVenueStream:
         self._last_u: Dict[str, int] = {}
         self._last_seq: Dict[str, int] = {}
         self._first_ts = 0.0
+        self._reconnect_policy = ReconnectPolicy(base_delay=2.0, max_delay=60.0)
 
     def _note_connect(self) -> None:
         self.connected = True
         self.last_msg_ts = time.time()
         if not self._first_ts:
             self._first_ts = self.last_msg_ts
+        self._reconnect_policy.reset()
 
     def _note_symbol(self, sym: str) -> None:
         if sym:
@@ -213,6 +279,10 @@ class BaseVenueStream:
             if not bids or not asks:
                 self.books_dropped += 1
                 return
+
+            # Defensively sort order book levels: bids descending, asks ascending
+            bids.sort(key=lambda x: x[0], reverse=True)
+            asks.sort(key=lambda x: x[0])
 
             # Reject inverted (crossed) books
             if bids[0][0] >= asks[0][0]:
@@ -465,7 +535,6 @@ class BaseCEXStream(BaseVenueStream):
                 break
             except Exception as e:
                 self.connected = False
-                err_str = str(e)
-                delay = 30.0 if ("403" in err_str or "11001" in err_str or "getaddrinfo" in err_str) else 3.0
-                log.warning(f"[{self.name}] WS disconnected: {e}. Reconnecting in {delay}s...")
+                delay = self._reconnect_policy.compute_delay(e)
+                log.warning(f"[{self.name}] WS disconnected: {e}. Reconnecting in {delay:.1f}s...")
                 await asyncio.sleep(delay)

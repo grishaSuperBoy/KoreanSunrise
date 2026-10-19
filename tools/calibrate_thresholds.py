@@ -45,20 +45,20 @@ BATTLE_FILE = os.path.join(PROJECT_ROOT, "live_trading_pool.json")
 
 SWEEP_THRESHOLDS = (10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 60.0)
 DEFAULT_GLOBAL_FALLBACK_BPS = 20.0
-DEFAULT_GLOBAL_HOLD_SEC = 6.0
+DEFAULT_GLOBAL_HOLD_SEC = 15.0
 DEFAULT_SPIKE_SIGMA = 2.5
 DEFAULT_MIN_DEV_Z = 1.8
 
 
 def _calc_optimal_hold(t_peaks: List[float], default_val: float = DEFAULT_GLOBAL_HOLD_SEC) -> float:
-    """Calculates personalized holding horizon: median(T_peak) + 1.5*MAD (clamped [1.5s, 12.0s])."""
+    """Calculates personalized holding horizon: median(T_peak) + 1.5*MAD (clamped [2.0s, 60.0s])."""
     if not t_peaks:
         return default_val
     med = statistics.median(t_peaks)
     abs_dev = [abs(x - med) for x in t_peaks]
     mad = statistics.median(abs_dev) if abs_dev else 0.5
     raw_hold = med + 1.5 * (1.4826 * mad)
-    return round(max(1.5, min(12.0, raw_hold)), 1)
+    return round(max(2.0, min(60.0, raw_hold)), 1)
 
 
 def _calc_spike_and_dev_z(dev_zs: List[float]) -> Tuple[float, float]:

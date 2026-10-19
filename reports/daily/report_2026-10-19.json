@@ -1,0 +1,114 @@
+{
+  "metadata": {
+    "report_date": "2026-10-19",
+    "generated_at": "2026-10-19T11:38:31.056210+00:00",
+    "days_analyzed": 1.0,
+    "order_size_usd": 10.0,
+    "roundtrip_fee_bps": 10.0,
+    "total_files_scanned": 0,
+    "total_size_mb": 0.0,
+    "total_signals_recorded": 0,
+    "coins_active": 0,
+    "venues_active": [],
+    "elapsed_sec": 0.005
+  },
+  "close_reasons": {},
+  "trigger_types": {},
+  "stop_loss_telemetry": {
+    "total_stops": 0,
+    "stop_rate_pct": 0.0,
+    "invalidation_count": 0,
+    "adverse_pnl_count": 0,
+    "alpha_decay_count": 0,
+    "other_count": 0,
+    "total_stop_pnl_usd": 0.0
+  },
+  "pnl_scenarios": {
+    "all_signals": {
+      "trades": 0,
+      "wins": 0,
+      "winrate_pct": 0.0,
+      "gross_usd": 0.0,
+      "fee_usd": 0.0,
+      "net_pnl_usd": 0.0,
+      "profit_factor": 0.0
+    },
+    "calibrated_threshold_only": {
+      "trades": 0,
+      "wins": 0,
+      "winrate_pct": 0.0,
+      "gross_usd": 0.0,
+      "fee_usd": 0.0,
+      "net_pnl_usd": 0.0,
+      "profit_factor": 0.0
+    },
+    "battle_coins_only": {
+      "trades": 0,
+      "wins": 0,
+      "winrate_pct": 0.0,
+      "gross_usd": 0.0,
+      "fee_usd": 0.0,
+      "net_pnl_usd": 0.0,
+      "profit_factor": 0.0
+    },
+    "funded_venues_only": {
+      "trades": 0,
+      "wins": 0,
+      "winrate_pct": 0.0,
+      "gross_usd": 0.0,
+      "fee_usd": 0.0,
+      "net_pnl_usd": 0.0,
+      "profit_factor": 0.0
+    }
+  },
+  "venue_capacities": [],
+  "sweep_thresholds": {
+    "10": {
+      "trades": 0,
+      "winrate_pct": 0.0,
+      "net_usd": 0.0
+    },
+    "15": {
+      "trades": 0,
+      "winrate_pct": 0.0,
+      "net_usd": 0.0
+    },
+    "20": {
+      "trades": 0,
+      "winrate_pct": 0.0,
+      "net_usd": 0.0
+    },
+    "25": {
+      "trades": 0,
+      "winrate_pct": 0.0,
+      "net_usd": 0.0
+    },
+    "30": {
+      "trades": 0,
+      "winrate_pct": 0.0,
+      "net_usd": 0.0
+    },
+    "35": {
+      "trades": 0,
+      "winrate_pct": 0.0,
+      "net_usd": 0.0
+    },
+    "40": {
+      "trades": 0,
+      "winrate_pct": 0.0,
+      "net_usd": 0.0
+    },
+    "50": {
+      "trades": 0,
+      "winrate_pct": 0.0,
+      "net_usd": 0.0
+    },
+    "60": {
+      "trades": 0,
+      "winrate_pct": 0.0,
+      "net_usd": 0.0
+    }
+  },
+  "top_pairs": [],
+  "top_coins": []
+}

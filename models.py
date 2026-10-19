@@ -3,8 +3,58 @@ models.py - Data models for Korean Sunrise lead-lag arbitrage and momentum engin
 """
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+
+
+def normalize_exchange_ts(raw_ts: Any) -> int:
+    """Normalizes exchange timestamps into integer milliseconds (Unix epoch ms).
+    Supports nanoseconds (19 digits), microseconds (16 digits), milliseconds (13 digits),
+    and seconds (10 digits integer or float). Returns 0 on None or invalid input.
+    """
+    if raw_ts is None:
+        return 0
+    try:
+        if isinstance(raw_ts, int):
+            if raw_ts <= 0:
+                return 0
+            if raw_ts > 10**17:     # Nanoseconds (e.g. 1.7e18) -> ms
+                return raw_ts // 1_000_000
+            elif raw_ts > 10**14:   # Microseconds (e.g. 1.7e15) -> ms
+                return raw_ts // 1_000
+            elif raw_ts > 10**11:   # Milliseconds (e.g. 1.7e12) -> ms
+                return raw_ts
+            else:                  # Seconds (e.g. 1.7e9) -> ms
+                return raw_ts * 1000
+
+        s_ts = str(raw_ts).strip()
+        if "." not in s_ts and s_ts.lstrip("-").isdigit():
+            int_val = int(s_ts)
+            if int_val <= 0:
+                return 0
+            if int_val > 10**17:
+                return int_val // 1_000_000
+            elif int_val > 10**14:
+                return int_val // 1_000
+            elif int_val > 10**11:
+                return int_val
+            else:
+                return int_val * 1000
+
+        val = float(raw_ts)
+        if not math.isfinite(val) or val <= 0:
+            return 0
+        if val > 1e17:     # Nanoseconds -> ms
+            return int(val / 1e6)
+        elif val > 1e14:   # Microseconds -> ms
+            return int(val / 1e3)
+        elif val > 1e11:   # Milliseconds -> ms
+            return int(val)
+        else:              # Seconds -> ms
+            return int(val * 1000.0)
+    except (TypeError, ValueError):
+        return 0
 
 
 @dataclass(slots=True)
@@ -186,12 +236,12 @@ class SunriseSignal:
     net_exec_edge_bps: float          # Executable edge after entry taker fee
 
     # Latency & Freshness telemetry
-    leader_latency_ms: float
-    follower_latency_ms: float
-    follower_book_age_ms: float
+    leader_latency_ms: float = 0.0
+    follower_latency_ms: float = 0.0
+    follower_book_age_ms: float = 0.0
 
     # Sizing & Physical Capacity
-    suggested_size_usd: float
+    suggested_size_usd: float = 0.0
     stealth_capacity_usd: float = 0.0
     follower_entry_px: float = 0.0
     leader_recent_buys_usd: float = 0.0
@@ -209,6 +259,11 @@ class SunriseSignal:
     captured_mid_move_bps: Optional[float] = None
     captured_exec_move_bps: Optional[float] = None
     net_pnl_bps: Optional[float] = None
+
+    # Stop-Loss audit tracking
+    stop_hit: bool = False
+    stop_type: Optional[str] = None
+    stop_loss_bps: float = 0.0
 
     mfe_exec_pnl_bps: float = -999.0
     mae_exec_pnl_bps: float = 999.0

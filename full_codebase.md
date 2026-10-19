@@ -282,8 +282,13 @@ STEALTH_DEPTH_FRACTION = 0.15   # Max 15% of top 3 ask levels on follower order 
 TAKER_FEE_BPS = 5.0             # Single-leg VIP0 taker fee (bps) on Binance/Bybit
 ROUNDTRIP_FEE_BPS = 10.0        # Entry + Exit taker fee (bps) for net realized PnL
 MIN_WARMUP_SAMPLES = 30         # Minimum 1s MAD samples before firing signals
-MAX_SIGNAL_HOLD_SEC = 6.0       # Maximum holding horizon before timeout closure
-MAX_FOLLOWER_BOOK_AGE_SEC = 0.30 # Maximum 300ms staleness allowed for follower book snapshots
+MAX_SIGNAL_HOLD_SEC = 30.0      # Maximum holding horizon before timeout closure (adaptive ceiling)
+MAX_FOLLOWER_BOOK_AGE_SEC = 5.0 # Maximum staleness allowed for follower book snapshots (adaptive for alts)
+
+# Adaptive Stop-Loss Parameters
+STOP_INVALIDATION_BPS = 15.0    # Model A: Microstructure invalidation tolerance (leader premium breakdown)
+STOP_ADVERSE_PNL_BPS = 35.0     # Model B: Hard adverse PnL drawdown stop (bps)
+ALPHA_DECAY_SEC = 8.0           # Model C: Alpha decay timeout if PnL <= 0 (transmission failure)
 
 # Regex to detect multiplier prefixes on Binance/Bybit perps: 1000PEPE, 1000000MOG, etc.
 _MULT_PREFIX_RE = re.compile(r"^(1000000|100000|10000|1000|100)([A-Z0-9]+)$")
@@ -636,7 +641,10 @@ class KoreanEngine:
         roundtrip_fee_bps: float = C.ROUNDTRIP_FEE_BPS,
         warmup_samples: int = C.MIN_WARMUP_SAMPLES,
         max_hold_sec: float = C.MAX_SIGNAL_HOLD_SEC,
-        max_follower_book_age_sec: float = getattr(C, "MAX_FOLLOWER_BOOK_AGE_SEC", 0.30),
+        max_follower_book_age_sec: float = getattr(C, "MAX_FOLLOWER_BOOK_AGE_SEC", 5.0),
+        stop_invalidation_bps: float = getattr(C, "STOP_INVALIDATION_BPS", 15.0),
+        stop_adverse_pnl_bps: float = getattr(C, "STOP_ADVERSE_PNL_BPS", 35.0),
+        alpha_decay_sec: float = getattr(C, "ALPHA_DECAY_SEC", 8.0),
         require_trade_confirmation: bool = False,
         pool_state: Any = None,
         profile_manager: Any = None,
@@ -653,6 +661,9 @@ class KoreanEngine:
         self.warmup_samples = warmup_samples
         self.max_hold_sec = max_hold_sec
         self.max_follower_book_age_sec = max_follower_book_age_sec
+        self.stop_invalidation_bps = stop_invalidation_bps
+        self.stop_adverse_pnl_bps = stop_adverse_pnl_bps
+        self.alpha_decay_sec = alpha_decay_sec
         self.require_trade_confirmation = require_trade_confirmation
         self.pool_state = pool_state
         self.profile_manager = profile_manager
@@ -689,6 +700,9 @@ class KoreanEngine:
             "signals_converged": 0,
             "signals_reversed": 0,
             "signals_timeout": 0,
+            "signals_stop_loss_invalidation": 0,
+            "signals_stop_loss_adverse_pnl": 0,
+            "signals_stop_loss_decay": 0,
         }
 
         # Pair-specific calibrated execution thresholds
@@ -769,7 +783,7 @@ class KoreanEngine:
         else:
             self.counters["ticks_followers"] += 1
             upbit_snap = self._books.get(("upbit", coin))
-            if upbit_snap is not None and (now - self._recv_ts.get(("upbit", coin), 0.0)) <= 2.0:
+            if upbit_snap is not None and (now - self._recv_ts.get(("upbit", coin), 0.0)) <= 15.0:
                 st = self._get_or_create_pair_state(coin, ex)
                 if upbit_snap.mid_price > 0 and snap.mid_price > 0:
                     raw_diff_bps = (upbit_snap.mid_price - snap.mid_price) / snap.mid_price * 1e4
@@ -901,13 +915,13 @@ class KoreanEngine:
         # verify that the liquidity drop was backed by real taker buys rather than MM cancels/quote pullbacks.
         recent_buys_usd = 0.0
         if trigger_type is not None:
-            cutoff = now - 2.5
+            cutoff = now - 6.0
             recent_buys_usd, has_trades = self.get_recent_upbit_buys(coin, cutoff)
 
             should_verify_trades = self.require_trade_confirmation or has_trades
             if should_verify_trades:
-                ratio_needed = 0.40 if ask_held else 0.25
-                min_buys_needed = max(20.0, swept_usd * ratio_needed)
+                ratio_needed = 0.25 if ask_held else 0.15
+                min_buys_needed = max(15.0, swept_usd * ratio_needed)
 
                 if recent_buys_usd < min_buys_needed:
                     self.counters["cancels_blocked"] = self.counters.get("cancels_blocked", 0) + 1
@@ -924,7 +938,13 @@ class KoreanEngine:
         for follower_ex in follower_exchanges:
             f_snap = self._books.get((follower_ex, coin))
             f_recv = self._recv_ts.get((follower_ex, coin), 0.0)
-            if f_snap is None or (now - f_recv) > self.max_follower_book_age_sec:
+            if f_snap is None:
+                continue
+
+            book_age_sec = now - f_recv
+            # Decouple baseline learning from entry age guard:
+            # Baseline learning tolerates up to 15.0s, ensuring pair warms up on slow alts
+            if book_age_sec > 15.0:
                 continue
 
             st = self._get_or_create_pair_state(coin, follower_ex)
@@ -936,14 +956,20 @@ class KoreanEngine:
 
             raw_diff_bps = (upbit_mid - f_mid) / f_mid * 1e4
 
-            if trigger_type and st.open_signal is None and st.is_warmed_up:
+            # Entry check requires fresh follower book (<= max_follower_book_age_sec, default 5.0s)
+            if (
+                trigger_type
+                and st.open_signal is None
+                and st.is_warmed_up
+                and book_age_sec <= self.max_follower_book_age_sec
+            ):
                 self._check_entry(
                     coin=coin,
                     follower_ex=follower_ex,
                     st=st,
                     upbit_snap=upbit_snap,
                     f_snap=f_snap,
-                    f_book_age_ms=(now - f_recv) * 1000.0,
+                    f_book_age_ms=book_age_sec * 1000.0,
                     norm_depth=norm_depth,
                     norm_spread=norm_spread,
                     swept_usd=swept_usd,
@@ -1042,9 +1068,6 @@ class KoreanEngine:
 
         req_edge = float(pair_cfg.get("min_spread_bps", self.min_edge_bps))
         if net_edge < req_edge:
-            return
-
-        if f_snap.spread_bps >= gross_exec_edge_bps * 0.8:
             return
 
         # Initial executable PnL at t=0 (if bought at f_entry_px and immediately sold at VWAP bid)
@@ -1178,15 +1201,49 @@ class KoreanEngine:
                     round(rem_edge, 2),
                 ])
 
-            # Closure evaluation:
+            # Closure & Stop-Loss evaluation:
+            pair_cfg = self.get_pair_threshold_config(coin, follower_ex)
             hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
-            if cur_net_pnl >= (sig.net_exec_edge_bps * 0.8) and cur_net_pnl > 0.0:
+            pair_decay_sec = float(pair_cfg.get("alpha_decay_sec", self.alpha_decay_sec))
+            sigma = max(sig.pair_sigma_bps, 2.0)
+
+            # --- Model A: Microstructure Invalidation Stop ---
+            # Triggers if the Upbit leader pump breaks down (Upbit mid drops >= 1.5*sigma below entry
+            # or cross-venue basis dislocates negatively beyond invalidation tolerance)
+            upbit_drop_bps = (sig.leader_mid - upbit_snap.mid_price) / sig.leader_mid * 1e4
+            cur_dislocation_bps = cur_diff_bps - sig.kimchi_baseline_bps
+            if upbit_drop_bps >= (1.5 * sigma) or cur_dislocation_bps <= -self.stop_invalidation_bps:
+                sig.stop_hit = True
+                sig.stop_type = "invalidation"
+                sig.stop_loss_bps = round(abs(min(0.0, cur_net_pnl)), 2)
+                self._close_signal(sig, now, "stop_invalidation", f_mid_move, f_exec_move)
+                continue
+
+            # --- Model B: Hard Adverse PnL Drawdown Stop ---
+            # Triggers if follower order book experiences violent adverse excursion
+            adverse_limit = max(self.stop_adverse_pnl_bps, 2.5 * sigma)
+            if cur_net_pnl <= -adverse_limit:
+                sig.stop_hit = True
+                sig.stop_type = "adverse_pnl"
+                sig.stop_loss_bps = round(abs(cur_net_pnl), 2)
+                self._close_signal(sig, now, "stop_adverse_pnl", f_mid_move, f_exec_move)
+                continue
+
+            # --- Model C: Alpha Decay Timeout Stop ---
+            # If transmission window elapsed (dt >= pair_decay_sec) and net PnL is still non-positive,
+            # alpha has decayed -> exit to avoid adverse toxic drift
+            if dt >= pair_decay_sec and cur_net_pnl <= 0.0:
+                sig.stop_hit = True
+                sig.stop_type = "alpha_decay"
+                sig.stop_loss_bps = round(abs(cur_net_pnl), 2)
+                self._close_signal(sig, now, "stop_decay", f_mid_move, f_exec_move)
+                continue
+
+            # --- Normal Take-Profit / Edge Absorption ---
+            if cur_net_pnl >= (sig.net_exec_edge_bps * 0.75) and cur_net_pnl > 0.0:
                 self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
-            elif rem_edge <= 0.0:
-                if cur_net_pnl > 0.0:
-                    self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
-                else:
-                    self._close_signal(sig, now, "reversed", f_mid_move, f_exec_move)
+            elif rem_edge <= 0.0 and cur_net_pnl > 0.0:
+                self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
             elif dt >= hold_sec:
                 self._close_signal(sig, now, "timeout", f_mid_move, f_exec_move)
 
@@ -1208,6 +1265,12 @@ class KoreanEngine:
 
         if reason == "converged":
             self.counters["signals_converged"] += 1
+        elif reason == "stop_invalidation":
+            self.counters["signals_stop_loss_invalidation"] += 1
+        elif reason == "stop_adverse_pnl":
+            self.counters["signals_stop_loss_adverse_pnl"] += 1
+        elif reason == "stop_decay":
+            self.counters["signals_stop_loss_decay"] += 1
         elif reason == "reversed":
             self.counters["signals_reversed"] += 1
         else:
@@ -4480,8 +4543,58 @@ models.py - Data models for Korean Sunrise lead-lag arbitrage and momentum engin
 """
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+
+
+def normalize_exchange_ts(raw_ts: Any) -> int:
+    """Normalizes exchange timestamps into integer milliseconds (Unix epoch ms).
+    Supports nanoseconds (19 digits), microseconds (16 digits), milliseconds (13 digits),
+    and seconds (10 digits integer or float). Returns 0 on None or invalid input.
+    """
+    if raw_ts is None:
+        return 0
+    try:
+        if isinstance(raw_ts, int):
+            if raw_ts <= 0:
+                return 0
+            if raw_ts > 10**17:     # Nanoseconds (e.g. 1.7e18) -> ms
+                return raw_ts // 1_000_000
+            elif raw_ts > 10**14:   # Microseconds (e.g. 1.7e15) -> ms
+                return raw_ts // 1_000
+            elif raw_ts > 10**11:   # Milliseconds (e.g. 1.7e12) -> ms
+                return raw_ts
+            else:                  # Seconds (e.g. 1.7e9) -> ms
+                return raw_ts * 1000
+
+        s_ts = str(raw_ts).strip()
+        if "." not in s_ts and s_ts.lstrip("-").isdigit():
+            int_val = int(s_ts)
+            if int_val <= 0:
+                return 0
+            if int_val > 10**17:
+                return int_val // 1_000_000
+            elif int_val > 10**14:
+                return int_val // 1_000
+            elif int_val > 10**11:
+                return int_val
+            else:
+                return int_val * 1000
+
+        val = float(raw_ts)
+        if not math.isfinite(val) or val <= 0:
+            return 0
+        if val > 1e17:     # Nanoseconds -> ms
+            return int(val / 1e6)
+        elif val > 1e14:   # Microseconds -> ms
+            return int(val / 1e3)
+        elif val > 1e11:   # Milliseconds -> ms
+            return int(val)
+        else:              # Seconds -> ms
+            return int(val * 1000.0)
+    except (TypeError, ValueError):
+        return 0
 
 
 @dataclass(slots=True)
@@ -4663,12 +4776,12 @@ class SunriseSignal:
     net_exec_edge_bps: float          # Executable edge after entry taker fee
 
     # Latency & Freshness telemetry
-    leader_latency_ms: float
-    follower_latency_ms: float
-    follower_book_age_ms: float
+    leader_latency_ms: float = 0.0
+    follower_latency_ms: float = 0.0
+    follower_book_age_ms: float = 0.0
 
     # Sizing & Physical Capacity
-    suggested_size_usd: float
+    suggested_size_usd: float = 0.0
     stealth_capacity_usd: float = 0.0
     follower_entry_px: float = 0.0
     leader_recent_buys_usd: float = 0.0
@@ -4686,6 +4799,11 @@ class SunriseSignal:
     captured_mid_move_bps: Optional[float] = None
     captured_exec_move_bps: Optional[float] = None
     net_pnl_bps: Optional[float] = None
+
+    # Stop-Loss audit tracking
+    stop_hit: bool = False
+    stop_type: Optional[str] = None
+    stop_loss_bps: float = 0.0
 
     mfe_exec_pnl_bps: float = -999.0
     mae_exec_pnl_bps: float = 999.0
@@ -4759,7 +4877,7 @@ from pipeline.pool_state import PoolStateManager
 
 log = logging.getLogger("pipeline.evaluator")
 
-DEFAULT_MIN_EVENTS = 5
+DEFAULT_MIN_EVENTS = 3
 DEFAULT_MIN_PROFIT_FACTOR = 1.2
 DEFAULT_MIN_WIN_RATE = 50.0
 
@@ -4830,7 +4948,7 @@ class CoinSignalAccumulator:
             stealth_cap = round(0.15 * f_top3_ask, 2)
 
         # Discard microscopic noise where Upbit sweep was insignificant vs follower
-        if drain_ratio < 0.40 and cross_ratio < 0.50:
+        if drain_ratio < 0.30 and cross_ratio < 0.30:
             return
 
         self.valid_sweeps += 1
@@ -6383,6 +6501,405 @@ class UniverseScreener:
                     pass
 ```
 
+## tests/test_adaptive_stops_and_fixes.py
+
+```python
+"""
+tests/test_adaptive_stops_and_fixes.py - Verification suite for Korean Sunrise 7-fix overhaul:
+1. Book age tolerances (5.0s entry, 15.0s baseline learning).
+2. Holding horizons (30.0s engine default, 60.0s calibrator ceiling).
+3. Multi-second Upbit sweep trade confirmation (6.0s window).
+4. Triple Stop-Loss Models (Model A Invalidation, Model B Adverse PnL, Model C Alpha Decay).
+5. Elimination of redundant spread penalty.
+6. Upbit spot silence tolerance (15.0s).
+7. Evaluator noise filter relaxation (0.30).
+8. ReconnectPolicy and defensive order book sorting.
+"""
+from __future__ import annotations
+
+import unittest
+import time
+from typing import Dict, Any
+
+import config as C
+from models import OrderBookDepth5, SunriseSignal, normalize_exchange_ts
+from korean_engine import KoreanEngine, PairState
+from venues.base import BaseVenueStream, ReconnectPolicy, TTLCache
+from tools.calibrate_thresholds import _calc_optimal_hold
+from pipeline.evaluator import CoinSignalAccumulator, DEFAULT_MIN_EVENTS
+
+
+class TestAdaptiveStopsAndFixes(unittest.TestCase):
+
+    def setUp(self):
+        self.emitted: list = []
+        self.engine = KoreanEngine(
+            emit_callback=lambda s: self.emitted.append(s),
+            warmup_samples=5,
+            max_follower_book_age_sec=5.0,
+            max_hold_sec=30.0,
+            stop_invalidation_bps=15.0,
+            stop_adverse_pnl_bps=35.0,
+            alpha_decay_sec=8.0,
+        )
+
+    # -------------------------------------------------------------
+    # Test 1: Normalize exchange ts across ns, us, ms, s
+    # -------------------------------------------------------------
+    def test_normalize_exchange_ts(self):
+        now_ms = int(time.time() * 1000)
+        # ms
+        self.assertEqual(normalize_exchange_ts(now_ms), now_ms)
+        # seconds -> ms
+        now_s = now_ms // 1000
+        self.assertEqual(normalize_exchange_ts(now_s), now_s * 1000)
+        # ns -> ms
+        now_ns = now_ms * 1_000_000
+        self.assertEqual(normalize_exchange_ts(now_ns), now_ms)
+        # us -> ms
+        now_us = now_ms * 1_000
+        self.assertEqual(normalize_exchange_ts(now_us), now_ms)
+        # string representation
+        self.assertEqual(normalize_exchange_ts(str(now_ms)), now_ms)
+
+    # -------------------------------------------------------------
+    # Test 2: ReconnectPolicy and TTLCache
+    # -------------------------------------------------------------
+    def test_reconnect_policy_and_ttl_cache(self):
+        policy = ReconnectPolicy(base_delay=2.0, max_delay=60.0, backoff_factor=2.0)
+        # Standard error
+        d1 = policy.compute_delay(Exception("Connection reset"))
+        self.assertEqual(d1, 2.0)
+        d2 = policy.compute_delay(Exception("Connection reset"))
+        self.assertEqual(d2, 4.0)
+
+        # 429 Too Many Requests -> aggressive backoff
+        d_429 = policy.compute_delay(Exception("HTTP 429 Too Many Requests"))
+        self.assertGreaterEqual(d_429, 30.0)
+
+        # Reset
+        policy.reset()
+        self.assertEqual(policy.compute_delay(), 2.0)
+
+        # TTLCache
+        cache = TTLCache(ttl_sec=1.0)
+        cache.set("key1")
+        self.assertTrue(cache.get("key1"))
+        self.assertFalse(cache.get("key2"))
+
+    # -------------------------------------------------------------
+    # Test 3: Defensive sorting in BaseVenueStream._sanitise
+    # -------------------------------------------------------------
+    def test_defensive_orderbook_sanitise(self):
+        received = []
+        stream = BaseVenueStream("test_venue", ["BTC"], callback=lambda snap: received.append(snap))
+        # Unsorted bids and asks
+        snap = OrderBookDepth5(
+            exchange="test_venue",
+            symbol="BTC",
+            raw_symbol="BTCUSDT",
+            ts=time.time(),
+            exchange_ts=int(time.time() * 1000),
+            bids=[(100.0, 1.0), (102.0, 2.0), (101.0, 1.5)],  # Best bid is 102.0
+            asks=[(105.0, 1.0), (103.0, 2.0), (104.0, 1.5)],  # Best ask is 103.0
+        )
+        stream._sanitise(snap)
+        self.assertEqual(len(received), 1)
+        clean = received[0]
+        # Bids must be sorted descending: 102.0, 101.0, 100.0
+        self.assertEqual(clean.bids[0][0], 102.0)
+        # Asks must be sorted ascending: 103.0, 104.0, 105.0
+        self.assertEqual(clean.asks[0][0], 103.0)
+
+    # -------------------------------------------------------------
+    # Test 4: Follower baseline learning decoupled from 5.0s entry age
+    # -------------------------------------------------------------
+    def test_follower_book_age_tolerance_and_learning(self):
+        now = time.time()
+        coin = "ALT"
+        # Upbit book 1.0s ago
+        u_snap = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now - 1.0, exchange_ts=int((now - 1.0) * 1000),
+            bids=[(10.0, 100.0)], asks=[(10.1, 100.0)]
+        )
+        self.engine._books[("upbit", coin)] = u_snap
+        self.engine._recv_ts[("upbit", coin)] = now - 1.0
+
+        # Follower book arrived 3.5s ago (older than old 0.3s limit, but <= 5.0s)
+        f_snap = OrderBookDepth5(
+            exchange="binance", symbol=coin, raw_symbol=f"{coin}USDT",
+            ts=now - 3.5, exchange_ts=int((now - 3.5) * 1000),
+            bids=[(9.995, 100.0)], asks=[(10.005, 100.0)]
+        )
+        self.engine._books[("binance", coin)] = f_snap
+        self.engine._recv_ts[("binance", coin)] = now - 3.5
+
+        # Normalization and baseline state
+        self.engine._upbit_norm[coin] = {
+            "depth_ask": 500.0,
+            "best_ask_usd": 200.0,
+            "spread_bps": 10.0,
+            "t": now - 1.0,
+        }
+        st = self.engine._get_or_create_pair_state(coin, "binance")
+        # Warm it up
+        for i in range(6):
+            st.learn(10.0, (now - 20.0) + (i * 2.0))
+        self.assertTrue(st.is_warmed_up)
+
+        # Sweep on Upbit triggers lead-lag evaluation
+        u_sweep = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now, exchange_ts=int(now * 1000),
+            bids=[(10.1, 100.0)], asks=[(10.5, 100.0)]
+        )
+        self.engine.on_book_update(u_sweep)
+
+        # With 5.0s tolerance, the 3.5s follower book is accepted and signal fires!
+        self.assertEqual(len(self.engine._active_signals[coin]), 1)
+        sig = self.engine._active_signals[coin][0]
+        self.assertEqual(sig.coin, coin)
+
+    # -------------------------------------------------------------
+    # Test 5: Model A Microstructure Invalidation Stop-Loss
+    # -------------------------------------------------------------
+    def test_model_a_invalidation_stop(self):
+        now = 1000.0
+        coin = "DOGE"
+        st = self.engine._get_or_create_pair_state(coin, "binance")
+        st.baseline_bps = 0.0
+
+        sig = SunriseSignal(
+            id="test_sig_inv",
+            coin=coin,
+            leader_exchange="upbit",
+            follower_exchange="binance",
+            follower_contract="DOGEUSDT",
+            open_ts=now,
+            trigger_type="depth_drain",
+            leader_mid=100.0,
+            leader_best_ask=100.05,
+            leader_spread_bps=5.0,
+            leader_norm_spread_bps=5.0,
+            leader_top5_ask_usd=1000.0,
+            leader_norm_depth_usd=1000.0,
+            leader_swept_usd=500.0,
+            leader_imbalance_top5=0.5,
+            drain_ratio=0.5,
+            spread_blowout_ratio=1.0,
+            follower_mid=99.0,
+            follower_best_bid=98.95,
+            follower_best_ask=99.05,
+            follower_spread_bps=10.0,
+            follower_top3_ask_usd=2000.0,
+            follower_top3_bid_usd=2000.0,
+            follower_imbalance_top3=0.5,
+            kimchi_baseline_bps=0.0,
+            pair_sigma_bps=5.0,
+            raw_dislocation_bps=100.0,
+            dev_z=3.0,
+            gross_exec_edge_bps=90.0,
+            net_exec_edge_bps=80.0,
+            suggested_size_usd=100.0,
+            max_hold_sec=30.0,
+        )
+        st.open_signal = sig
+        self.engine._active_signals[coin].append(sig)
+
+        # Upbit dumps below entry (drop > 1.5 * sigma = 7.5 bps -> e.g. 15 bps drop)
+        u_dump = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now + 1.0, exchange_ts=int((now + 1.0) * 1000),
+            bids=[(99.80, 10.0)], asks=[(99.85, 10.0)]  # Mid = 99.825 (-17.5 bps from 100.0)
+        )
+        f_book = OrderBookDepth5(
+            exchange="binance", symbol=coin, raw_symbol=f"{coin}USDT",
+            ts=now + 1.0, exchange_ts=int((now + 1.0) * 1000),
+            bids=[(99.00, 10.0)], asks=[(99.05, 10.0)]
+        )
+        self.engine._books[("upbit", coin)] = u_dump
+        self.engine._books[("binance", coin)] = f_book
+
+        self.engine._track_follower_move(coin, "binance", f_book, now + 1.0)
+
+        self.assertTrue(sig.closed)
+        self.assertEqual(sig.close_reason, "stop_invalidation")
+        self.assertTrue(sig.stop_hit)
+        self.assertEqual(sig.stop_type, "invalidation")
+        self.assertGreater(self.engine.counters["signals_stop_loss_invalidation"], 0)
+
+    # -------------------------------------------------------------
+    # Test 6: Model B Hard Adverse PnL Drawdown Stop-Loss
+    # -------------------------------------------------------------
+    def test_model_b_adverse_pnl_stop(self):
+        now = 1000.0
+        coin = "PEPE"
+        st = self.engine._get_or_create_pair_state(coin, "bybit")
+        st.baseline_bps = 0.0
+
+        sig = SunriseSignal(
+            id="test_sig_adv",
+            coin=coin,
+            leader_exchange="upbit",
+            follower_exchange="bybit",
+            follower_contract="1000PEPEUSDT",
+            open_ts=now,
+            trigger_type="depth_drain",
+            leader_mid=100.0,
+            leader_best_ask=100.05,
+            leader_spread_bps=5.0,
+            leader_norm_spread_bps=5.0,
+            leader_top5_ask_usd=1000.0,
+            leader_norm_depth_usd=1000.0,
+            leader_swept_usd=500.0,
+            leader_imbalance_top5=0.5,
+            drain_ratio=0.5,
+            spread_blowout_ratio=1.0,
+            follower_mid=100.0,
+            follower_best_bid=99.95,
+            follower_best_ask=100.05,
+            follower_spread_bps=10.0,
+            follower_top3_ask_usd=2000.0,
+            follower_top3_bid_usd=2000.0,
+            follower_imbalance_top3=0.5,
+            kimchi_baseline_bps=0.0,
+            pair_sigma_bps=3.0,
+            raw_dislocation_bps=50.0,
+            dev_z=3.0,
+            gross_exec_edge_bps=40.0,
+            net_exec_edge_bps=30.0,
+            suggested_size_usd=100.0,
+            max_hold_sec=30.0,
+        )
+        st.open_signal = sig
+        self.engine._active_signals[coin].append(sig)
+
+        u_held = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now + 2.0, exchange_ts=int((now + 2.0) * 1000),
+            bids=[(100.00, 10.0)], asks=[(100.05, 10.0)]
+        )
+        # Follower crashes violently: best bid drops to 99.50 (-55 bps exec move -> net PnL = -65 bps)
+        f_crash = OrderBookDepth5(
+            exchange="bybit", symbol=coin, raw_symbol="1000PEPEUSDT",
+            ts=now + 2.0, exchange_ts=int((now + 2.0) * 1000),
+            bids=[(99.50, 10.0)], asks=[(99.55, 10.0)]
+        )
+        self.engine._books[("upbit", coin)] = u_held
+        self.engine._books[("bybit", coin)] = f_crash
+
+        self.engine._track_follower_move(coin, "bybit", f_crash, now + 2.0)
+
+        self.assertTrue(sig.closed)
+        self.assertEqual(sig.close_reason, "stop_adverse_pnl")
+        self.assertTrue(sig.stop_hit)
+        self.assertEqual(sig.stop_type, "adverse_pnl")
+        self.assertGreater(self.engine.counters["signals_stop_loss_adverse_pnl"], 0)
+
+    # -------------------------------------------------------------
+    # Test 7: Model C Alpha Decay Timeout Stop
+    # -------------------------------------------------------------
+    def test_model_c_alpha_decay_stop(self):
+        now = 1000.0
+        coin = "SHIB"
+        st = self.engine._get_or_create_pair_state(coin, "binance")
+        st.baseline_bps = 0.0
+
+        sig = SunriseSignal(
+            id="test_sig_decay",
+            coin=coin,
+            leader_exchange="upbit",
+            follower_exchange="binance",
+            follower_contract="1000SHIBUSDT",
+            open_ts=now,
+            trigger_type="depth_drain",
+            leader_mid=100.0,
+            leader_best_ask=100.05,
+            leader_spread_bps=5.0,
+            leader_norm_spread_bps=5.0,
+            leader_top5_ask_usd=1000.0,
+            leader_norm_depth_usd=1000.0,
+            leader_swept_usd=500.0,
+            leader_imbalance_top5=0.5,
+            drain_ratio=0.5,
+            spread_blowout_ratio=1.0,
+            follower_mid=100.0,
+            follower_best_bid=99.95,
+            follower_best_ask=100.05,
+            follower_spread_bps=10.0,
+            follower_top3_ask_usd=2000.0,
+            follower_top3_bid_usd=2000.0,
+            follower_imbalance_top3=0.5,
+            kimchi_baseline_bps=0.0,
+            pair_sigma_bps=2.0,
+            raw_dislocation_bps=50.0,
+            dev_z=3.0,
+            gross_exec_edge_bps=40.0,
+            net_exec_edge_bps=30.0,
+            suggested_size_usd=100.0,
+            max_hold_sec=30.0,
+        )
+        st.open_signal = sig
+        self.engine._active_signals[coin].append(sig)
+
+        # Leader stays, follower is flat, but 8.5 seconds have passed (dt >= alpha_decay_sec=8.0)
+        u_stay = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now + 8.5, exchange_ts=int((now + 8.5) * 1000),
+            bids=[(100.00, 10.0)], asks=[(100.05, 10.0)]
+        )
+        f_flat = OrderBookDepth5(
+            exchange="binance", symbol=coin, raw_symbol="1000SHIBUSDT",
+            ts=now + 8.5, exchange_ts=int((now + 8.5) * 1000),
+            bids=[(100.02, 10.0)], asks=[(100.07, 10.0)]  # Net PnL is still -7 bps due to fees
+        )
+        self.engine._books[("upbit", coin)] = u_stay
+        self.engine._books[("binance", coin)] = f_flat
+
+        self.engine._track_follower_move(coin, "binance", f_flat, now + 8.5)
+
+        self.assertTrue(sig.closed)
+        self.assertEqual(sig.close_reason, "stop_decay")
+        self.assertTrue(sig.stop_hit)
+        self.assertEqual(sig.stop_type, "alpha_decay")
+        self.assertGreater(self.engine.counters["signals_stop_loss_decay"], 0)
+
+    # -------------------------------------------------------------
+    # Test 8: Holding horizon clamping in calibrator
+    # -------------------------------------------------------------
+    def test_optimal_hold_calibrator(self):
+        # Peak at 25 seconds on a slow altcoin wave
+        t_peaks = [20.0, 24.0, 26.0, 25.0, 30.0]
+        optimal = _calc_optimal_hold(t_peaks)
+        self.assertGreater(optimal, 20.0)
+        self.assertLessEqual(optimal, 60.0)
+
+    # -------------------------------------------------------------
+    # Test 9: Evaluator noise filter relaxation to 0.30
+    # -------------------------------------------------------------
+    def test_evaluator_noise_filter(self):
+        acc = CoinSignalAccumulator("TEST")
+        # Signal with drain_ratio 0.35 and cross_ratio 0.35 (would have been dropped by 0.40/0.50)
+        acc.add_signal({
+            "follower_exchange": "binance",
+            "net_pnl_bps": 25.0,
+            "drain_ratio": 0.35,
+            "leader_swept_usd": 700.0,
+            "follower_top3_ask_usd": 2000.0,  # cross_ratio = 700/2000 = 0.35
+            "stealth_capacity_usd": 300.0,
+            "mfe_exec_pnl_bps": 30.0,
+            "time_to_peak_sec": 12.0,
+        })
+        self.assertEqual(acc.valid_sweeps, 1)
+        self.assertEqual(len(acc.net_pnls), 1)
+        self.assertEqual(DEFAULT_MIN_EVENTS, 3)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
 ## tests/test_pipeline_e2e.py
 
 ```python
@@ -6889,9 +7406,11 @@ class TestPipelineE2E(unittest.TestCase):
 
         engine._track_follower_move("SOL", "binance", f_lagging, now + 1.0)
 
-        # Must close as "reversed" because net PnL was negative!
+        # Must close as "stop_invalidation" because Upbit leader pump broke down!
         self.assertTrue(sig.closed)
-        self.assertEqual(sig.close_reason, "reversed")
+        self.assertEqual(sig.close_reason, "stop_invalidation")
+        self.assertTrue(sig.stop_hit)
+        self.assertEqual(sig.stop_type, "invalidation")
         self.assertLess(sig.net_pnl_bps, 0.0)
 
     def test_pair_state_cold_start_warmup(self):
@@ -9039,20 +9558,20 @@ BATTLE_FILE = os.path.join(PROJECT_ROOT, "live_trading_pool.json")
 
 SWEEP_THRESHOLDS = (10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 60.0)
 DEFAULT_GLOBAL_FALLBACK_BPS = 20.0
-DEFAULT_GLOBAL_HOLD_SEC = 6.0
+DEFAULT_GLOBAL_HOLD_SEC = 15.0
 DEFAULT_SPIKE_SIGMA = 2.5
 DEFAULT_MIN_DEV_Z = 1.8
 
 
 def _calc_optimal_hold(t_peaks: List[float], default_val: float = DEFAULT_GLOBAL_HOLD_SEC) -> float:
-    """Calculates personalized holding horizon: median(T_peak) + 1.5*MAD (clamped [1.5s, 12.0s])."""
+    """Calculates personalized holding horizon: median(T_peak) + 1.5*MAD (clamped [2.0s, 60.0s])."""
     if not t_peaks:
         return default_val
     med = statistics.median(t_peaks)
     abs_dev = [abs(x - med) for x in t_peaks]
     mad = statistics.median(abs_dev) if abs_dev else 0.5
     raw_hold = med + 1.5 * (1.4826 * mad)
-    return round(max(1.5, min(12.0, raw_hold)), 1)
+    return round(max(2.0, min(60.0, raw_hold)), 1)
 
 
 def _calc_spike_and_dev_z(dev_zs: List[float]) -> Tuple[float, float]:
@@ -9484,6 +10003,14 @@ def generate_daily_report(
     coins_seen: Set[str] = set()
     close_reasons = collections.Counter()
     trigger_types = collections.Counter()
+    stop_stats = {
+        "total_stops": 0,
+        "invalidation": 0,
+        "adverse_pnl": 0,
+        "alpha_decay": 0,
+        "other": 0,
+        "total_stop_pnl_usd": 0.0,
+    }
 
     def _new_bucket() -> Dict[str, Any]:
         return {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0, "gains": 0.0, "losses": 0.0}
@@ -9532,6 +10059,20 @@ def generate_daily_report(
                     trig = d.get("trigger_type", "unknown")
                     trigger_types[trig] += 1
 
+                    stop_hit = d.get("stop_hit", False)
+                    stop_type = d.get("stop_type")
+                    if not stop_hit and reason.startswith("stop_"):
+                        stop_hit = True
+                        stop_type = reason.replace("stop_", "")
+
+                    if stop_hit:
+                        stop_stats["total_stops"] += 1
+                        st_key = str(stop_type or "other").lower()
+                        if st_key in ("invalidation", "adverse_pnl", "alpha_decay"):
+                            stop_stats[st_key] += 1
+                        else:
+                            stop_stats["other"] += 1
+
                     net_pnl_bps = d.get("net_pnl_bps")
                     if net_pnl_bps is None:
                         continue
@@ -9544,6 +10085,9 @@ def generate_daily_report(
                     gross = pos_size * ((net_pnl_bps + roundtrip_fee_bps) / 10000.0)
                     net = pos_size * (net_pnl_bps / 10000.0)
                     is_win = 1 if net > 0 else 0
+
+                    if stop_hit:
+                        stop_stats["total_stop_pnl_usd"] += net
 
                     def _add_to_bucket(b: Dict[str, Any]) -> None:
                         b["count"] += 1
@@ -9563,7 +10107,7 @@ def generate_daily_report(
                     swept_usd = float(d.get("leader_swept_usd", 0.0))
                     f_top3_ask = float(d.get("follower_top3_ask_usd", 0.0))
                     cross_ratio = (swept_usd / f_top3_ask) if f_top3_ask > 0 else 0.0
-                    if drain_ratio < 0.40 and cross_ratio < 0.50:
+                    if drain_ratio < 0.30 and cross_ratio < 0.30:
                         continue
 
                     stealth_cap = float(d.get("stealth_capacity_usd", 0.0))
@@ -9721,6 +10265,15 @@ def generate_daily_report(
         },
         "close_reasons": dict(close_reasons),
         "trigger_types": dict(trigger_types),
+        "stop_loss_telemetry": {
+            "total_stops": stop_stats["total_stops"],
+            "stop_rate_pct": round((stop_stats["total_stops"] / total_signals * 100.0), 1) if total_signals else 0.0,
+            "invalidation_count": stop_stats["invalidation"],
+            "adverse_pnl_count": stop_stats["adverse_pnl"],
+            "alpha_decay_count": stop_stats["alpha_decay"],
+            "other_count": stop_stats["other"],
+            "total_stop_pnl_usd": round(stop_stats["total_stop_pnl_usd"], 2),
+        },
         "pnl_scenarios": pnl_summary,
         "venue_capacities": venue_summary,
         "sweep_thresholds": {
@@ -9759,6 +10312,8 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
     m = doc["metadata"]
     p = doc["pnl_scenarios"]
     vc = doc.get("venue_capacities", [])
+    sl = doc.get("stop_loss_telemetry", {})
+    cr = doc.get("close_reasons", {})
     lines = [
         f"# Korean Sunrise: Суточный Квантовый Отчёт ({m['report_date']})",
         f"*Сгенерирован:* `{m['generated_at']}` | *Окно:* `{m['days_analyzed']} d` | *Размер слота:* `${m['order_size_usd']}` | *Комиссия:* `{m['roundtrip_fee_bps']} bps`",
@@ -9768,7 +10323,7 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
         f"- **Активных монет с импульсами:** `{m['coins_active']}`",
         f"- **Фолловер-бирж активно:** `{len(m['venues_active'])}` ({', '.join(m['venues_active']) if m['venues_active'] else 'None'})",
         f"- **Архивов данных обработано:** `{m['total_files_scanned']}` (`{m['total_size_mb']} MB`)",
-        f"- **Причины закрытия импульсов:** `Converged: {doc['close_reasons'].get('converged', 0)}` | `Timeout: {doc['close_reasons'].get('timeout', 0)}` | `Reversed: {doc['close_reasons'].get('reversed', 0)}`",
+        f"- **Причины закрытия импульсов:** `Converged: {cr.get('converged', 0)}` | `Timeout: {cr.get('timeout', 0)}` | `Reversed: {cr.get('reversed', 0)}` | `Stops: {sl.get('total_stops', 0)}` (Inv: {sl.get('invalidation_count', 0)}, Adv: {sl.get('adverse_pnl_count', 0)}, Decay: {sl.get('alpha_decay_count', 0)})",
         f"- **Триггеры выкупа Upbit:** `Depth Drain: {doc['trigger_types'].get('depth_drain', 0)}` | `Spread Blowout: {doc['trigger_types'].get('spread_blowout', 0)}`",
         "",
         "## 2. PnL Сценарии исполнения",
@@ -9788,10 +10343,21 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
             f"${row['gross_usd']:.2f} | ${row['fee_usd']:.2f} | **${row['net_pnl_usd']:.2f}** | {row['profit_factor']} |"
         )
 
-    # Section 3: Physical order book capacity
+    # Section 3: Stop-Loss Protection Telemetry
     lines.extend([
         "",
-        "## 3. Физическая ёмкость стакана по биржам (Real Order Book Capacity)",
+        "## 3. Стоп-Лоссы и Защита от Токсичного Потока (Stop-Loss Protection)",
+        f"- **Всего сработало стоп-лоссов:** `{sl.get('total_stops', 0):,}` ({sl.get('stop_rate_pct', 0.0)}% от всех импульсов)",
+        f"- **Model A: Microstructure Invalidation:** `{sl.get('invalidation_count', 0):,}` (мгновенный сброс при сломе/откате пампа на Upbit)",
+        f"- **Model B: Hard Adverse PnL Drawdown:** `{sl.get('adverse_pnl_count', 0):,}` (жесткая отсечка при токсичном движении фолловера)",
+        f"- **Model C: Alpha Decay Timeout:** `{sl.get('alpha_decay_count', 0):,}` (сброс по истечении окна передачи импульса при PnL <= 0)",
+        f"- **Суммарный PnL по стопам:** `${sl.get('total_stop_pnl_usd', 0.0):.2f}` (контролируемые локальные риски вместо зависания в просадках)",
+    ])
+
+    # Section 4: Physical order book capacity
+    lines.extend([
+        "",
+        "## 4. Физическая ёмкость стакана по биржам (Real Order Book Capacity)",
         "| Биржа | Сигналов | Мед. Top-3 стакан ($) | Мед. 15% Ёмкость ($) | P25 Ёмкость ($) | P75 Ёмкость ($) | Мин. ($) | Макс. ($) |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ])
@@ -9807,7 +10373,7 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "## 4. Оптимизация порогов спреда (Threshold Sweep)",
+        "## 5. Оптимизация порогов спреда (Threshold Sweep)",
         "| Порог (bps) | Сигналов | Win Rate | Net PnL USD |",
         "| :---: | :---: | :---: | :---: |",
     ])
@@ -9816,7 +10382,7 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "## 5. Топ прибыльных связок (Upbit Leader <-> Perp Follower)",
+        "## 6. Топ прибыльных связок (Upbit Leader <-> Perp Follower)",
         "| Связка (Coin:Upbit-Follower) | Сделок | Win Rate | Gross USD | Net PnL USD | Мед. Top-3 ($) | Мед. 15% Ёмкость ($) |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
     ])
@@ -9832,7 +10398,7 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "## 6. Топ монет по эффективности опережения",
+        "## 7. Топ монет по эффективности опережения",
         "| Монета | Сделок | Win Rate | Net PnL USD | Мед. Top-3 ($) | Мед. 15% Ёмкость ($) | Ср. MFE (bps) | Медиана $T_{peak}$ |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ])
@@ -10587,6 +11153,301 @@ def main() -> None:
             )
         print("  [WARNING] Defective data detected. Check logs/data_quality.log for details.")
     print("=" * 80)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## tools/verify_all.py
+
+```python
+"""
+tools/verify_all.py - Complete Multi-Gate Verification Suite for Korean Sunrise.
+
+Automated 5-Gate Quality Arbiter:
+  - Gate 1: Manifest Integrity (SHA256 checksums across core files).
+  - Gate 2: Fee & Parameter Synchronization (Engine, Config, Calibrator, Models).
+  - Gate 3: Microstructure Data Contracts & Models (OrderBookDepth5, SunriseSignal, normalize_exchange_ts).
+  - Gate 4: Bytecode Compilation & Syntax Audit (all .py files in repo).
+  - Gate 5: Deep Invariant & Unit Test Suite (python -m unittest).
+
+Usage:
+  python tools/verify_all.py           # Run all 5 gates
+  python tools/verify_all.py --seal    # Reseal MANIFEST.sha256 with current clean hashes
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import hashlib
+import json
+import os
+import py_compile
+import subprocess
+import sys
+import unittest
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+MANIFEST_FILE = os.path.join(PROJECT_ROOT, "MANIFEST.sha256")
+
+CORE_FILES = [
+    "config.py",
+    "models.py",
+    "korean_engine.py",
+    "venues/base.py",
+    "venues/manager.py",
+    "pipeline/evaluator.py",
+    "pipeline/pool_state.py",
+    "pipeline/profile.py",
+    "tools/calibrate_thresholds.py",
+    "tools/full_daily_report.py",
+    "tools/pack_codebase.py",
+    "tests/test_adaptive_stops_and_fixes.py",
+    "tests/test_pipeline_e2e.py",
+]
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def seal_manifest() -> None:
+    print(f"[*] Sealing {len(CORE_FILES)} core files into MANIFEST.sha256...")
+    lines = []
+    for rel_path in sorted(CORE_FILES):
+        abs_path = os.path.join(PROJECT_ROOT, rel_path)
+        if not os.path.isfile(abs_path):
+            print(f"    [!] Skipping missing file: {rel_path}")
+            continue
+        csum = sha256_file(abs_path)
+        lines.append(f"{csum}  {rel_path.replace(os.sep, '/')}\n")
+    with open(MANIFEST_FILE, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    print(f"[OK] MANIFEST.sha256 successfully sealed ({len(lines)} entries).\n")
+
+
+def check_gate_1_manifest() -> bool:
+    print("[Gate 1] Checking Manifest Integrity (MANIFEST.sha256)...")
+    if not os.path.isfile(MANIFEST_FILE):
+        print("  [!] MANIFEST.sha256 not found. Run with --seal to initialize.")
+        return False
+
+    with open(MANIFEST_FILE, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    mismatches = []
+    checked = 0
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        expected_sha, rel_path = parts[0], parts[1].replace("/", os.sep)
+        abs_path = os.path.join(PROJECT_ROOT, rel_path)
+        if not os.path.isfile(abs_path):
+            mismatches.append(f"Missing file: {rel_path}")
+            continue
+        actual_sha = sha256_file(abs_path)
+        if actual_sha != expected_sha:
+            mismatches.append(f"Hash mismatch: {rel_path} (exp {expected_sha[:8]}..., got {actual_sha[:8]}...)")
+        checked += 1
+
+    if mismatches:
+        for m in mismatches:
+            print(f"  [FAIL] {m}")
+        return False
+    print(f"  [PASS] {checked}/{checked} core files matched manifest checksums.")
+    return True
+
+
+def check_gate_2_parameter_sync() -> bool:
+    print("[Gate 2] Checking Fee & Parameter Synchronization...")
+    import config as C
+    from korean_engine import KoreanEngine
+
+    errors = []
+    # 1. Fees
+    if C.TAKER_FEE_BPS != 5.0:
+        errors.append(f"C.TAKER_FEE_BPS expected 5.0, got {C.TAKER_FEE_BPS}")
+    if C.ROUNDTRIP_FEE_BPS != 10.0:
+        errors.append(f"C.ROUNDTRIP_FEE_BPS expected 10.0, got {C.ROUNDTRIP_FEE_BPS}")
+
+    # 2. Tolerances & Horizons
+    if C.MAX_FOLLOWER_BOOK_AGE_SEC < 5.0:
+        errors.append(f"C.MAX_FOLLOWER_BOOK_AGE_SEC expected >= 5.0s, got {C.MAX_FOLLOWER_BOOK_AGE_SEC}")
+    if C.MAX_SIGNAL_HOLD_SEC < 30.0:
+        errors.append(f"C.MAX_SIGNAL_HOLD_SEC expected >= 30.0s, got {C.MAX_SIGNAL_HOLD_SEC}")
+
+    # 3. Stop-Loss Configuration
+    if not hasattr(C, "STOP_INVALIDATION_BPS") or C.STOP_INVALIDATION_BPS <= 0:
+        errors.append("C.STOP_INVALIDATION_BPS missing or non-positive")
+    if not hasattr(C, "STOP_ADVERSE_PNL_BPS") or C.STOP_ADVERSE_PNL_BPS <= 0:
+        errors.append("C.STOP_ADVERSE_PNL_BPS missing or non-positive")
+    if not hasattr(C, "ALPHA_DECAY_SEC") or C.ALPHA_DECAY_SEC <= 0:
+        errors.append("C.ALPHA_DECAY_SEC missing or non-positive")
+
+    # 4. Engine defaults reflection
+    eng = KoreanEngine(emit_callback=lambda s: None)
+    if eng.max_follower_book_age_sec < 5.0:
+        errors.append(f"KoreanEngine.max_follower_book_age_sec expected >= 5.0s, got {eng.max_follower_book_age_sec}")
+    if eng.max_hold_sec < 30.0:
+        errors.append(f"KoreanEngine.max_hold_sec expected >= 30.0s, got {eng.max_hold_sec}")
+
+    if errors:
+        for err in errors:
+            print(f"  [FAIL] {err}")
+        return False
+    print("  [PASS] Fee and engine parameter invariants verified.")
+    return True
+
+
+def check_gate_3_event_schemas() -> bool:
+    print("[Gate 3] Checking Microstructure Data Contracts & Models...")
+    from models import OrderBookDepth5, SunriseSignal, normalize_exchange_ts
+
+    errors = []
+    # 1. normalize_exchange_ts
+    if normalize_exchange_ts(1792400000000000000) != 1792400000000:
+        errors.append("normalize_exchange_ts failed on nanoseconds")
+    if normalize_exchange_ts(1792400000000000) != 1792400000000:
+        errors.append("normalize_exchange_ts failed on microseconds")
+    if normalize_exchange_ts(1792400000000) != 1792400000000:
+        errors.append("normalize_exchange_ts failed on milliseconds")
+    if normalize_exchange_ts(1792400000) != 1792400000000:
+        errors.append("normalize_exchange_ts failed on seconds")
+
+    # 2. SunriseSignal Stop-Loss Fields
+    sig = SunriseSignal(
+        id="sun_test",
+        coin="SOL",
+        leader_exchange="upbit",
+        follower_exchange="binance",
+        follower_contract="SOLUSDT",
+        open_ts=1000.0,
+        trigger_type="depth_drain",
+        leader_mid=100.0,
+        leader_best_ask=100.05,
+        leader_spread_bps=5.0,
+        leader_norm_spread_bps=5.0,
+        leader_top5_ask_usd=1000.0,
+        leader_norm_depth_usd=1000.0,
+        leader_swept_usd=500.0,
+        leader_imbalance_top5=0.5,
+        drain_ratio=0.5,
+        spread_blowout_ratio=1.0,
+        follower_mid=100.0,
+        follower_best_bid=99.95,
+        follower_best_ask=100.05,
+        follower_spread_bps=10.0,
+        follower_top3_ask_usd=2000.0,
+        follower_top3_bid_usd=2000.0,
+        follower_imbalance_top3=0.5,
+        kimchi_baseline_bps=0.0,
+        pair_sigma_bps=2.0,
+        raw_dislocation_bps=50.0,
+        dev_z=3.0,
+        gross_exec_edge_bps=35.0,
+        net_exec_edge_bps=30.0,
+    )
+    sig_dict = sig.to_dict()
+    for field_name in ("stop_hit", "stop_type", "stop_loss_bps"):
+        if field_name not in sig_dict:
+            errors.append(f"SunriseSignal.to_dict() missing stop-loss field: {field_name}")
+
+    if errors:
+        for err in errors:
+            print(f"  [FAIL] {err}")
+        return False
+    print("  [PASS] Data contracts and schema serialization verified.")
+    return True
+
+
+def check_gate_4_compilation() -> bool:
+    print("[Gate 4] Auditing Bytecode Compilation across all Python files...")
+    py_files = sorted(glob.glob(os.path.join(PROJECT_ROOT, "**", "*.py"), recursive=True))
+    errors = []
+    compiled = 0
+    for pf in py_files:
+        if "venv" in pf or ".git" in pf:
+            continue
+        try:
+            py_compile.compile(pf, doraise=True)
+            compiled += 1
+        except py_compile.PyCompileError as e:
+            errors.append(f"Compilation error in {pf}: {e}")
+
+    if errors:
+        for err in errors:
+            print(f"  [FAIL] {err}")
+        return False
+    print(f"  [PASS] {compiled} Python files compiled with zero syntax errors.")
+    return True
+
+
+def check_gate_5_unit_tests() -> bool:
+    print("[Gate 5] Executing Complete Repository Unit Test Suite...")
+    loader = unittest.TestLoader()
+    suite = loader.discover(os.path.join(PROJECT_ROOT, "tests"), pattern="test_*.py")
+    runner = unittest.TextTestRunner(verbosity=1)
+    result = runner.run(suite)
+    if not result.wasSuccessful():
+        print(f"  [FAIL] Unit tests failed: {len(result.failures)} failures, {len(result.errors)} errors.")
+        return False
+    print(f"  [PASS] All {result.testsRun} unit tests passed successfully.")
+    return True
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Korean Sunrise Verification Arbiter.")
+    parser.add_argument("--seal", action="store_true", help="Reseal MANIFEST.sha256 with current clean hashes.")
+    args = parser.parse_args()
+
+    print("======================================================================")
+    print("      KOREAN SUNRISE - COMPREHENSIVE MULTI-GATE VERIFICATION          ")
+    print("======================================================================\n")
+
+    if args.seal:
+        seal_manifest()
+
+    gates = [
+        ("Gate 1 (Manifest Integrity)", check_gate_1_manifest),
+        ("Gate 2 (Parameter Synchronization)", check_gate_2_parameter_sync),
+        ("Gate 3 (Data Contracts & Schemas)", check_gate_3_event_schemas),
+        ("Gate 4 (Bytecode Syntax Audit)", check_gate_4_compilation),
+        ("Gate 5 (Repository Unit Tests)", check_gate_5_unit_tests),
+    ]
+
+    all_passed = True
+    for name, gate_func in gates:
+        success = gate_func()
+        print()
+        if not success:
+            all_passed = False
+            break
+
+    print("======================================================================")
+    if all_passed:
+        print("  >>> ALL 5 GATES PASSED: CODEBASE VERIFIED AND PRODUCTION-READY <<<  ")
+        print("======================================================================")
+        sys.exit(0)
+    else:
+        print("  >>> VERIFICATION FAILED: GATES REPORTED ANOMALIES <<<               ")
+        print("======================================================================")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
@@ -15891,6 +16752,70 @@ def _secs_until_daily_reconnect_for(name: str) -> float:
     return max(1.0, _secs_until_daily_reconnect() + _reconnect_jitter_sec(name))
 
 
+class ReconnectPolicy:
+    """
+    Adaptive exponential backoff policy with rate-limit and network error awareness.
+    Provides graduated backoff delays for 429 (Too Many Requests), 403 (Forbidden),
+    and DNS/network timeouts.
+    """
+    def __init__(
+        self,
+        base_delay: float = 2.0,
+        max_delay: float = 60.0,
+        backoff_factor: float = 1.5,
+    ):
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.backoff_factor = backoff_factor
+        self.attempts = 0
+
+    def reset(self) -> None:
+        self.attempts = 0
+
+    def compute_delay(self, exc: Optional[Exception] = None) -> float:
+        err_str = str(exc or "").lower()
+        if "429" in err_str or "too many requests" in err_str:
+            self.attempts += 2
+            return min(self.max_delay, max(30.0, self.base_delay * (self.backoff_factor ** self.attempts)))
+        if "403" in err_str or "forbidden" in err_str or "11001" in err_str or "getaddrinfo" in err_str:
+            self.attempts += 1
+            return min(self.max_delay, max(20.0, self.base_delay * (self.backoff_factor ** self.attempts)))
+
+        delay = min(self.max_delay, self.base_delay * (self.backoff_factor ** self.attempts))
+        self.attempts += 1
+        return delay
+
+
+class TTLCache:
+    """
+    Lightweight in-memory TTL dictionary cache for deduplicating high-frequency
+    events and tracking subscription confirmations without unbounded memory growth.
+    """
+    def __init__(self, ttl_sec: float = 60.0):
+        self.ttl_sec = ttl_sec
+        self._store: Dict[Any, float] = {}
+
+    def get(self, key: Any) -> bool:
+        now = time.time()
+        exp = self._store.get(key)
+        if exp is None:
+            return False
+        if now > exp:
+            del self._store[key]
+            return False
+        return True
+
+    def set(self, key: Any) -> None:
+        now = time.time()
+        self._store[key] = now + self.ttl_sec
+        if len(self._store) > 10000:
+            self.cleanup()
+
+    def cleanup(self) -> None:
+        now = time.time()
+        self._store = {k: exp for k, exp in self._store.items() if exp > now}
+
+
 class BaseVenueStream:
     """Base class for venue-specific WebSocket feeds."""
 
@@ -15913,12 +16838,14 @@ class BaseVenueStream:
         self._last_u: Dict[str, int] = {}
         self._last_seq: Dict[str, int] = {}
         self._first_ts = 0.0
+        self._reconnect_policy = ReconnectPolicy(base_delay=2.0, max_delay=60.0)
 
     def _note_connect(self) -> None:
         self.connected = True
         self.last_msg_ts = time.time()
         if not self._first_ts:
             self._first_ts = self.last_msg_ts
+        self._reconnect_policy.reset()
 
     def _note_symbol(self, sym: str) -> None:
         if sym:
@@ -15941,6 +16868,10 @@ class BaseVenueStream:
             if not bids or not asks:
                 self.books_dropped += 1
                 return
+
+            # Defensively sort order book levels: bids descending, asks ascending
+            bids.sort(key=lambda x: x[0], reverse=True)
+            asks.sort(key=lambda x: x[0])
 
             # Reject inverted (crossed) books
             if bids[0][0] >= asks[0][0]:
@@ -16193,9 +17124,8 @@ class BaseCEXStream(BaseVenueStream):
                 break
             except Exception as e:
                 self.connected = False
-                err_str = str(e)
-                delay = 30.0 if ("403" in err_str or "11001" in err_str or "getaddrinfo" in err_str) else 3.0
-                log.warning(f"[{self.name}] WS disconnected: {e}. Reconnecting in {delay}s...")
+                delay = self._reconnect_policy.compute_delay(e)
+                log.warning(f"[{self.name}] WS disconnected: {e}. Reconnecting in {delay:.1f}s...")
                 await asyncio.sleep(delay)
 ```
 

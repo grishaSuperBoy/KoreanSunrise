@@ -501,9 +501,11 @@ class TestPipelineE2E(unittest.TestCase):
 
         engine._track_follower_move("SOL", "binance", f_lagging, now + 1.0)
 
-        # Must close as "reversed" because net PnL was negative!
+        # Must close as "stop_invalidation" because Upbit leader pump broke down!
         self.assertTrue(sig.closed)
-        self.assertEqual(sig.close_reason, "reversed")
+        self.assertEqual(sig.close_reason, "stop_invalidation")
+        self.assertTrue(sig.stop_hit)
+        self.assertEqual(sig.stop_type, "invalidation")
         self.assertLess(sig.net_pnl_bps, 0.0)
 
     def test_pair_state_cold_start_warmup(self):

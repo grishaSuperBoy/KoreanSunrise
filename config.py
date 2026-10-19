@@ -52,8 +52,13 @@ STEALTH_DEPTH_FRACTION = 0.15   # Max 15% of top 3 ask levels on follower order 
 TAKER_FEE_BPS = 5.0             # Single-leg VIP0 taker fee (bps) on Binance/Bybit
 ROUNDTRIP_FEE_BPS = 10.0        # Entry + Exit taker fee (bps) for net realized PnL
 MIN_WARMUP_SAMPLES = 30         # Minimum 1s MAD samples before firing signals
-MAX_SIGNAL_HOLD_SEC = 6.0       # Maximum holding horizon before timeout closure
-MAX_FOLLOWER_BOOK_AGE_SEC = 0.30 # Maximum 300ms staleness allowed for follower book snapshots
+MAX_SIGNAL_HOLD_SEC = 30.0      # Maximum holding horizon before timeout closure (adaptive ceiling)
+MAX_FOLLOWER_BOOK_AGE_SEC = 5.0 # Maximum staleness allowed for follower book snapshots (adaptive for alts)
+
+# Adaptive Stop-Loss Parameters
+STOP_INVALIDATION_BPS = 15.0    # Model A: Microstructure invalidation tolerance (leader premium breakdown)
+STOP_ADVERSE_PNL_BPS = 35.0     # Model B: Hard adverse PnL drawdown stop (bps)
+ALPHA_DECAY_SEC = 8.0           # Model C: Alpha decay timeout if PnL <= 0 (transmission failure)
 
 # Regex to detect multiplier prefixes on Binance/Bybit perps: 1000PEPE, 1000000MOG, etc.
 _MULT_PREFIX_RE = re.compile(r"^(1000000|100000|10000|1000|100)([A-Z0-9]+)$")

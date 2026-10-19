@@ -32,7 +32,7 @@ from pipeline.pool_state import PoolStateManager
 
 log = logging.getLogger("pipeline.evaluator")
 
-DEFAULT_MIN_EVENTS = 5
+DEFAULT_MIN_EVENTS = 3
 DEFAULT_MIN_PROFIT_FACTOR = 1.2
 DEFAULT_MIN_WIN_RATE = 50.0
 
@@ -103,7 +103,7 @@ class CoinSignalAccumulator:
             stealth_cap = round(0.15 * f_top3_ask, 2)
 
         # Discard microscopic noise where Upbit sweep was insignificant vs follower
-        if drain_ratio < 0.40 and cross_ratio < 0.50:
+        if drain_ratio < 0.30 and cross_ratio < 0.30:
             return
 
         self.valid_sweeps += 1
