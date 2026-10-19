@@ -32,8 +32,8 @@ from pipeline.pool_state import PoolStateManager
 
 log = logging.getLogger("pipeline.evaluator")
 
-DEFAULT_MIN_EVENTS = 3
-DEFAULT_MIN_PROFIT_FACTOR = 1.2
+DEFAULT_MIN_EVENTS = 20
+DEFAULT_MIN_PROFIT_FACTOR = 1.25
 DEFAULT_MIN_WIN_RATE = 50.0
 
 
@@ -131,7 +131,13 @@ class CoinSignalAccumulator:
         losses = sum(abs(p) for p in self.net_pnls if p < 0)
 
         # Standard quantitative Profit Factor: Gains / Losses
-        profit_factor = (gains / losses) if losses > 0 else (99.0 if gains > 0 else 0.0)
+        # Capped conservatively at 5.0 when zero losses occur to prevent artificial 99.0
+        if losses > 0:
+            profit_factor = gains / losses
+        elif gains > 0:
+            profit_factor = 5.0
+        else:
+            profit_factor = 0.0
         win_count = sum(1 for p in self.net_pnls if p > 0)
         win_rate = (win_count / n) * 100.0
 
@@ -223,8 +229,8 @@ class SunriseEvaluator:
             # 2. Positive expectancy after all roundtrip fees
             if s["mean_net_pnl_bps"] <= 0.0 or s["median_net_pnl_bps"] < -2.0:
                 continue
-            # 3. Profit Factor or Winrate edge
-            if s["profit_factor"] < self.min_profit_factor and s["win_rate_pct"] < self.min_win_rate:
+            # 3. Both Profit Factor AND Win Rate must meet statistical standards
+            if s["profit_factor"] < self.min_profit_factor or s["win_rate_pct"] < self.min_win_rate:
                 continue
             # 4. Book depth supports minimum order
             if s["top3_depth_usd"] < 50.0:

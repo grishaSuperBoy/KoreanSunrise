@@ -387,7 +387,7 @@ class TestAdaptiveStopsAndFixes(unittest.TestCase):
         })
         self.assertEqual(acc.valid_sweeps, 1)
         self.assertEqual(len(acc.net_pnls), 1)
-        self.assertEqual(DEFAULT_MIN_EVENTS, 3)
+        self.assertEqual(DEFAULT_MIN_EVENTS, 20)
 
     # -------------------------------------------------------------
     # Test 10: Daily reconnect jitter never produces 1s thrashing

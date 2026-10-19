@@ -1450,7 +1450,7 @@ import logging
 import os
 import signal
 import time
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
 from batch_writer import BatchWriter
 import config as C
@@ -5007,8 +5007,8 @@ from pipeline.pool_state import PoolStateManager
 
 log = logging.getLogger("pipeline.evaluator")
 
-DEFAULT_MIN_EVENTS = 3
-DEFAULT_MIN_PROFIT_FACTOR = 1.2
+DEFAULT_MIN_EVENTS = 20
+DEFAULT_MIN_PROFIT_FACTOR = 1.25
 DEFAULT_MIN_WIN_RATE = 50.0
 
 
@@ -5106,7 +5106,13 @@ class CoinSignalAccumulator:
         losses = sum(abs(p) for p in self.net_pnls if p < 0)
 
         # Standard quantitative Profit Factor: Gains / Losses
-        profit_factor = (gains / losses) if losses > 0 else (99.0 if gains > 0 else 0.0)
+        # Capped conservatively at 5.0 when zero losses occur to prevent artificial 99.0
+        if losses > 0:
+            profit_factor = gains / losses
+        elif gains > 0:
+            profit_factor = 5.0
+        else:
+            profit_factor = 0.0
         win_count = sum(1 for p in self.net_pnls if p > 0)
         win_rate = (win_count / n) * 100.0
 
@@ -5198,8 +5204,8 @@ class SunriseEvaluator:
             # 2. Positive expectancy after all roundtrip fees
             if s["mean_net_pnl_bps"] <= 0.0 or s["median_net_pnl_bps"] < -2.0:
                 continue
-            # 3. Profit Factor or Winrate edge
-            if s["profit_factor"] < self.min_profit_factor and s["win_rate_pct"] < self.min_win_rate:
+            # 3. Both Profit Factor AND Win Rate must meet statistical standards
+            if s["profit_factor"] < self.min_profit_factor or s["win_rate_pct"] < self.min_win_rate:
                 continue
             # 4. Book depth supports minimum order
             if s["top3_depth_usd"] < 50.0:
@@ -7021,7 +7027,7 @@ class TestAdaptiveStopsAndFixes(unittest.TestCase):
         })
         self.assertEqual(acc.valid_sweeps, 1)
         self.assertEqual(len(acc.net_pnls), 1)
-        self.assertEqual(DEFAULT_MIN_EVENTS, 3)
+        self.assertEqual(DEFAULT_MIN_EVENTS, 20)
 
     # -------------------------------------------------------------
     # Test 10: Daily reconnect jitter never produces 1s thrashing
@@ -22163,6 +22169,8 @@ class APIServer:
         self._thresholds_lock = threading.Lock()
         self._pipeline_proc: Optional[subprocess.Popen] = None
         self._pipeline_lock = threading.Lock()
+        self._report_lock = threading.Lock()
+        self._calib_lock = threading.Lock()
 
     def get_thresholds_doc(self) -> Dict[str, Any]:
         """Returns cached matrix thresholds document, reloading from disk only when mtime changes."""
@@ -22495,22 +22503,32 @@ class APIServer:
                     self._send_text("Отчёт не найден.", code=404)
 
             def _handle_generate_report(self) -> None:
-                cmd = [sys.executable, os.path.join(PROJECT_ROOT, "tools", "full_daily_report.py"), "--json"]
+                if not server_ref._report_lock.acquire(blocking=False):
+                    self._send_json({"ok": False, "error": "Report generation is already running"}, code=409)
+                    return
                 try:
+                    cmd = [sys.executable, os.path.join(PROJECT_ROOT, "tools", "full_daily_report.py"), "--json"]
                     res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
                     self._send_json({"ok": res.returncode == 0, "output": res.stdout})
                 except Exception as e:
                     self._send_json({"ok": False, "error": str(e)}, code=500)
+                finally:
+                    server_ref._report_lock.release()
 
             def _handle_calibrate_thresholds(self) -> None:
-                cmd = [sys.executable, os.path.join(PROJECT_ROOT, "tools", "calibrate_thresholds.py"), "--json"]
+                if not server_ref._calib_lock.acquire(blocking=False):
+                    self._send_json({"ok": False, "error": "Thresholds calibration is already running"}, code=409)
+                    return
                 try:
+                    cmd = [sys.executable, os.path.join(PROJECT_ROOT, "tools", "calibrate_thresholds.py"), "--json"]
                     res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
                     if hasattr(server_ref.service, "engine") and server_ref.service.engine:
                         server_ref.service.engine.reload_thresholds()
                     self._send_json({"ok": res.returncode == 0, "output": res.stdout})
                 except Exception as e:
                     self._send_json({"ok": False, "error": str(e)}, code=500)
+                finally:
+                    server_ref._calib_lock.release()
 
             def _handle_trigger_pipeline(self) -> None:
                 with server_ref._pipeline_lock:
@@ -22883,7 +22901,7 @@ def render_dashboard_html(
 
     # Build Thresholds rows
     th_rows = []
-    for pk, cfg in th_items[:80]:
+    for pk, cfg in th_items:
         st = cfg.get("status", "default_baseline")
         en = cfg.get("enabled", True)
         badge_cls = "badge-green" if st == "aggressive_clean" else ("badge-blue" if st == "balanced_standard" else ("badge-yellow" if st == "high_friction" else "badge-red"))
@@ -23462,7 +23480,7 @@ def _render_battle_tags(pool_snapshot: Dict[str, Any]) -> str:
         tags.append(f"""
         <div style="background:var(--bg-2);border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:13px;display:flex;align-items:center;gap:10px;">
           <span style="color:{col};font-weight:700;">⚔️ {name}</span>
-          <button onclick="toggleCoinPool('{act_fn}', '{name}')" style="background:none;border:1px solid {btn_col};color:{btn_col};border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer;">{act_text}</button>
+          <button data-coin="{name}" data-action="{act_fn}" onclick="toggleCoinPool(this.dataset.action, this.dataset.coin)" style="background:none;border:1px solid {btn_col};color:{btn_col};border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer;">{act_text}</button>
         </div>
         """)
     return "".join(tags)

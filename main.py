@@ -9,7 +9,7 @@ import logging
 import os
 import signal
 import time
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
 from batch_writer import BatchWriter
 import config as C

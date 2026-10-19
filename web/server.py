@@ -57,6 +57,8 @@ class APIServer:
         self._thresholds_lock = threading.Lock()
         self._pipeline_proc: Optional[subprocess.Popen] = None
         self._pipeline_lock = threading.Lock()
+        self._report_lock = threading.Lock()
+        self._calib_lock = threading.Lock()
 
     def get_thresholds_doc(self) -> Dict[str, Any]:
         """Returns cached matrix thresholds document, reloading from disk only when mtime changes."""
@@ -389,22 +391,32 @@ class APIServer:
                     self._send_text("Отчёт не найден.", code=404)
 
             def _handle_generate_report(self) -> None:
-                cmd = [sys.executable, os.path.join(PROJECT_ROOT, "tools", "full_daily_report.py"), "--json"]
+                if not server_ref._report_lock.acquire(blocking=False):
+                    self._send_json({"ok": False, "error": "Report generation is already running"}, code=409)
+                    return
                 try:
+                    cmd = [sys.executable, os.path.join(PROJECT_ROOT, "tools", "full_daily_report.py"), "--json"]
                     res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
                     self._send_json({"ok": res.returncode == 0, "output": res.stdout})
                 except Exception as e:
                     self._send_json({"ok": False, "error": str(e)}, code=500)
+                finally:
+                    server_ref._report_lock.release()
 
             def _handle_calibrate_thresholds(self) -> None:
-                cmd = [sys.executable, os.path.join(PROJECT_ROOT, "tools", "calibrate_thresholds.py"), "--json"]
+                if not server_ref._calib_lock.acquire(blocking=False):
+                    self._send_json({"ok": False, "error": "Thresholds calibration is already running"}, code=409)
+                    return
                 try:
+                    cmd = [sys.executable, os.path.join(PROJECT_ROOT, "tools", "calibrate_thresholds.py"), "--json"]
                     res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
                     if hasattr(server_ref.service, "engine") and server_ref.service.engine:
                         server_ref.service.engine.reload_thresholds()
                     self._send_json({"ok": res.returncode == 0, "output": res.stdout})
                 except Exception as e:
                     self._send_json({"ok": False, "error": str(e)}, code=500)
+                finally:
+                    server_ref._calib_lock.release()
 
             def _handle_trigger_pipeline(self) -> None:
                 with server_ref._pipeline_lock:

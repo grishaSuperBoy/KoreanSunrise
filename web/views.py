@@ -234,7 +234,7 @@ def render_dashboard_html(
 
     # Build Thresholds rows
     th_rows = []
-    for pk, cfg in th_items[:80]:
+    for pk, cfg in th_items:
         st = cfg.get("status", "default_baseline")
         en = cfg.get("enabled", True)
         badge_cls = "badge-green" if st == "aggressive_clean" else ("badge-blue" if st == "balanced_standard" else ("badge-yellow" if st == "high_friction" else "badge-red"))
@@ -813,7 +813,7 @@ def _render_battle_tags(pool_snapshot: Dict[str, Any]) -> str:
         tags.append(f"""
         <div style="background:var(--bg-2);border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:13px;display:flex;align-items:center;gap:10px;">
           <span style="color:{col};font-weight:700;">⚔️ {name}</span>
-          <button onclick="toggleCoinPool('{act_fn}', '{name}')" style="background:none;border:1px solid {btn_col};color:{btn_col};border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer;">{act_text}</button>
+          <button data-coin="{name}" data-action="{act_fn}" onclick="toggleCoinPool(this.dataset.action, this.dataset.coin)" style="background:none;border:1px solid {btn_col};color:{btn_col};border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer;">{act_text}</button>
         </div>
         """)
     return "".join(tags)
