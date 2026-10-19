@@ -84,12 +84,13 @@ class GateioRestClient:
         contract = symbol if "_" in symbol else f"{normalize_symbol(symbol)}_USDT"
         url = f"{self.BASE_URL}/candlesticks?contract={contract}&interval=1m&limit={min(limit, 1000)}"
         out: Dict[int, Tuple[float, float]] = {}
+        inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
         try:
             r = self.session.get(url, timeout=6)
             if r.status_code == 200:
                 for row in r.json():
                     t_sec = (int(row.get("t", 0)) // 60) * 60
-                    close = float(row.get("c", 0.0))
+                    close = float(row.get("c", 0.0)) * inv_mult
                     vol_usd = float(row.get("sum", 0.0))
                     if t_sec > 0 and close > 0:
                         out[t_sec] = (close, vol_usd)

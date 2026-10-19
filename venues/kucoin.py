@@ -93,13 +93,15 @@ class KucoinRestClient:
         """Returns minute_ts_sec -> (close_usd, vol_usd)."""
         url = f"{self.BASE_URL}/kline/query?symbol={symbol}&granularity=1"
         out: Dict[int, Tuple[float, float]] = {}
+        inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
         try:
             r = self.session.get(url, timeout=6)
             if r.status_code == 200:
                 for row in r.json().get("data", [])[-limit:]:
                     t_sec = (int(row[0]) // 60000) * 60
-                    close = float(row[4])
-                    vol_usd = float(row[6]) if len(row) > 6 else float(row[5]) * close
+                    raw_close = float(row[4])
+                    close = raw_close * inv_mult
+                    vol_usd = float(row[6]) if len(row) > 6 else float(row[5]) * raw_close
                     if t_sec > 0 and close > 0:
                         out[t_sec] = (close, vol_usd)
         except Exception:
@@ -129,11 +131,11 @@ class KucoinStream(BaseVenueStream):
         self._venue_to_ours: Dict[str, str] = {}
         self._contract_sizes: Dict[str, float] = {k.upper(): float(v) for k, v in (contract_sizes or {}).items()}
         self._ping_sec = self.PING_FALLBACK_SEC
+        self._session = create_http_session()
 
     def _resolve_symbols(self) -> Dict[str, str]:
-        session = create_http_session()
         try:
-            r = session.get(self.CONTRACTS, timeout=8)
+            r = self._session.get(self.CONTRACTS, timeout=8)
             if r.status_code == 200:
                 for c in r.json().get("data", []):
                     sym = c.get("symbol", "").upper()
@@ -151,6 +153,15 @@ class KucoinStream(BaseVenueStream):
             log.warning(f"[kucoin] Failed to resolve contract symbols: {e}")
         return self._ours_to_venue
 
+    async def stop(self) -> None:
+        await super().stop()
+        if self._session is not None:
+            try:
+                self._session.close()
+            except Exception:
+                pass
+            self._session = None
+
     async def _run_loop(self) -> None:
         await asyncio.to_thread(self._resolve_symbols)
         target_syms = list(self._ours_to_venue.values())
@@ -160,9 +171,10 @@ class KucoinStream(BaseVenueStream):
 
         while self._running:
             try:
-                # Get dynamic bullet token
-                session = create_http_session()
-                bullet_resp = await asyncio.to_thread(session.post, self.BULLET, timeout=10)
+                # Get dynamic bullet token using persistent session
+                if self._session is None:
+                    self._session = create_http_session()
+                bullet_resp = await asyncio.to_thread(self._session.post, self.BULLET, timeout=10)
                 data = bullet_resp.json().get("data", {})
                 token = data.get("token")
                 endpoints = data.get("instanceServers", [])

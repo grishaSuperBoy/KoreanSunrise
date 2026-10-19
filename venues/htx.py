@@ -80,12 +80,13 @@ class HTXRestClient:
         code = symbol if "-" in symbol else f"{normalize_symbol(symbol)}-USDT"
         url = f"{self.BASE_URL}/linear-swap-ex/market/history/kline?contract_code={code}&period=1min&size={min(limit, 2000)}"
         out: Dict[int, Tuple[float, float]] = {}
+        inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
         try:
             r = self.session.get(url, timeout=6)
             if r.status_code == 200:
                 for row in r.json().get("data", []):
                     t_sec = int(row.get("id", 0))
-                    close = float(row.get("close", 0.0))
+                    close = float(row.get("close", 0.0)) * inv_mult
                     vol_usd = float(row.get("trade_turnover", 0.0))
                     if t_sec > 0 and close > 0:
                         out[t_sec] = (close, vol_usd)

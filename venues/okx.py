@@ -82,13 +82,15 @@ class OKXRestClient:
         inst_id = symbol if "-SWAP" in symbol else f"{normalize_symbol(symbol)}-USDT-SWAP"
         url = f"{self.BASE_URL}/market/candles?instId={inst_id}&bar=1m&limit={min(limit, 300)}"
         out: Dict[int, Tuple[float, float]] = {}
+        inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
         try:
             r = self.session.get(url, timeout=6)
             if r.status_code == 200:
                 for row in r.json().get("data", []):
                     t_sec = (int(row[0]) // 60000) * 60
-                    close = float(row[4])
-                    vol_usd = float(row[7]) if len(row) > 7 else float(row[5]) * close
+                    raw_close = float(row[4])
+                    close = raw_close * inv_mult
+                    vol_usd = float(row[7]) if len(row) > 7 else float(row[5]) * raw_close
                     if t_sec > 0 and close > 0:
                         out[t_sec] = (close, vol_usd)
         except Exception:

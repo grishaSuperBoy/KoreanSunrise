@@ -9026,13 +9026,13 @@ from typing import List
 
 from models import OrderBookDepth5
 from venues.base import BaseCEXStream
-from venues.bingx import BingXStream
-from venues.gateio import GateioStream
-from venues.htx import HTXStream
-from venues.kucoin import KucoinStream
-from venues.mexc import MEXCStream
-from venues.okx import OKXStream
-from venues.pionex import PionexStream
+from venues.bingx import BingXStream, BingXRestClient
+from venues.gateio import GateioStream, GateioRestClient
+from venues.htx import HTXStream, HTXRestClient
+from venues.kucoin import KucoinStream, KucoinRestClient
+from venues.mexc import MEXCStream, MEXCRestClient
+from venues.okx import OKXStream, OKXRestClient
+from venues.pionex import PionexStream, PionexRestClient
 from venues.asterdex import AsterdexStream, AsterdexRestClient
 from venues.hyperliquid import HyperliquidStream, HyperliquidRestClient
 
@@ -10115,6 +10115,70 @@ class TestVenuesContractSize(unittest.TestCase):
         stream._parse_message(msg2)
         self.assertEqual(len(snaps), 1)
         self.assertEqual(stream.seq_duplicates, 1)
+
+    def test_rest_klines_multiplier_normalization(self):
+        """Verifies that fetch_klines_1m across BingX, Gate.io, KuCoin normalizes close with inv_mult."""
+        from unittest.mock import MagicMock
+
+        # 1. BingX
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"data": [{"time": 1700000000000, "close": "15.0", "volume": "100.0"}]}
+        session = MagicMock()
+        session.get.return_value = mock_resp
+        bx = BingXRestClient(session=session)
+        kl = bx.fetch_klines_1m("1000PEPE-USDT", mult=1000.0)
+        self.assertIn(1700000000000 // 60000 * 60, kl)
+        close, vol = kl[1700000000000 // 60000 * 60]
+        self.assertAlmostEqual(close, 0.015)
+        self.assertAlmostEqual(vol, 1500.0)
+
+        # 2. Gate.io
+        mock_resp_g = MagicMock(status_code=200)
+        mock_resp_g.json.return_value = [{"t": 1700000000, "c": "15.0", "sum": "1500.0"}]
+        session_g = MagicMock()
+        session_g.get.return_value = mock_resp_g
+        gt = GateioRestClient()
+        gt.session = session_g
+        kl_g = gt.fetch_klines_1m("1000BONK_USDT", mult=1000.0)
+        self.assertIn(1700000000 // 60 * 60, kl_g)
+        close_g, vol_g = kl_g[1700000000 // 60 * 60]
+        self.assertAlmostEqual(close_g, 0.015)
+        self.assertAlmostEqual(vol_g, 1500.0)
+
+        # 3. KuCoin
+        mock_resp_k = MagicMock(status_code=200)
+        mock_resp_k.json.return_value = {"data": [[1700000000000, "0", "0", "0", "15.0", "100.0", "1500.0"]]}
+        session_k = MagicMock()
+        session_k.get.return_value = mock_resp_k
+        kc = KucoinRestClient(session=session_k)
+        kl_k = kc.fetch_klines_1m("PEPEUSDTM", mult=1000.0)
+        close_k, vol_k = kl_k[1700000000000 // 60000 * 60]
+        self.assertAlmostEqual(close_k, 0.015)
+        self.assertAlmostEqual(vol_k, 1500.0)
+
+    def test_kucoin_stream_session_lifecycle(self):
+        """KucoinStream: verifies session reuse across bullet calls and clean closure on stop."""
+        import asyncio
+        from unittest.mock import MagicMock
+
+        snaps: List[OrderBookDepth5] = []
+        stream = KucoinStream(["XBTUSDTM"], snaps.append)
+        self.assertIsNotNone(stream._session)
+        init_session = stream._session
+
+        # _resolve_symbols must reuse the existing session
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"data": [{"symbol": "XBTUSDTM", "multiplier": 1.0, "baseCurrency": "XBT"}]}
+        init_session.get = MagicMock(return_value=mock_resp)
+        stream._resolve_symbols()
+        self.assertIs(stream._session, init_session)
+        init_session.get.assert_called_once()
+
+        # stop() must close session and clear reference
+        init_session.close = MagicMock()
+        asyncio.run(stream.stop())
+        init_session.close.assert_called_once()
+        self.assertIsNone(stream._session)
 
 
 if __name__ == "__main__":
@@ -19101,13 +19165,15 @@ class BingXRestClient:
         sym = symbol if "-" in symbol else f"{normalize_symbol(symbol)}-USDT"
         url = f"{self.BASE_URL}/v3/quote/klines?symbol={sym}&interval=1m&limit={min(limit, 1000)}"
         out: Dict[int, Tuple[float, float]] = {}
+        inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
         try:
             r = self.session.get(url, timeout=6)
             if r.status_code == 200:
                 for row in r.json().get("data", []):
                     t_sec = (int(row.get("time", 0)) // 60000) * 60
-                    close = float(row.get("close", 0.0))
-                    vol_usd = float(row.get("volume", 0.0)) * close
+                    raw_close = float(row.get("close", 0.0))
+                    close = raw_close * inv_mult
+                    vol_usd = float(row.get("volume", 0.0)) * raw_close
                     if t_sec > 0 and close > 0:
                         out[t_sec] = (close, vol_usd)
         except Exception:
@@ -19635,12 +19701,13 @@ class GateioRestClient:
         contract = symbol if "_" in symbol else f"{normalize_symbol(symbol)}_USDT"
         url = f"{self.BASE_URL}/candlesticks?contract={contract}&interval=1m&limit={min(limit, 1000)}"
         out: Dict[int, Tuple[float, float]] = {}
+        inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
         try:
             r = self.session.get(url, timeout=6)
             if r.status_code == 200:
                 for row in r.json():
                     t_sec = (int(row.get("t", 0)) // 60) * 60
-                    close = float(row.get("c", 0.0))
+                    close = float(row.get("c", 0.0)) * inv_mult
                     vol_usd = float(row.get("sum", 0.0))
                     if t_sec > 0 and close > 0:
                         out[t_sec] = (close, vol_usd)
@@ -19906,12 +19973,13 @@ class HTXRestClient:
         code = symbol if "-" in symbol else f"{normalize_symbol(symbol)}-USDT"
         url = f"{self.BASE_URL}/linear-swap-ex/market/history/kline?contract_code={code}&period=1min&size={min(limit, 2000)}"
         out: Dict[int, Tuple[float, float]] = {}
+        inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
         try:
             r = self.session.get(url, timeout=6)
             if r.status_code == 200:
                 for row in r.json().get("data", []):
                     t_sec = int(row.get("id", 0))
-                    close = float(row.get("close", 0.0))
+                    close = float(row.get("close", 0.0)) * inv_mult
                     vol_usd = float(row.get("trade_turnover", 0.0))
                     if t_sec > 0 and close > 0:
                         out[t_sec] = (close, vol_usd)
@@ -20451,13 +20519,15 @@ class KucoinRestClient:
         """Returns minute_ts_sec -> (close_usd, vol_usd)."""
         url = f"{self.BASE_URL}/kline/query?symbol={symbol}&granularity=1"
         out: Dict[int, Tuple[float, float]] = {}
+        inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
         try:
             r = self.session.get(url, timeout=6)
             if r.status_code == 200:
                 for row in r.json().get("data", [])[-limit:]:
                     t_sec = (int(row[0]) // 60000) * 60
-                    close = float(row[4])
-                    vol_usd = float(row[6]) if len(row) > 6 else float(row[5]) * close
+                    raw_close = float(row[4])
+                    close = raw_close * inv_mult
+                    vol_usd = float(row[6]) if len(row) > 6 else float(row[5]) * raw_close
                     if t_sec > 0 and close > 0:
                         out[t_sec] = (close, vol_usd)
         except Exception:
@@ -20487,11 +20557,11 @@ class KucoinStream(BaseVenueStream):
         self._venue_to_ours: Dict[str, str] = {}
         self._contract_sizes: Dict[str, float] = {k.upper(): float(v) for k, v in (contract_sizes or {}).items()}
         self._ping_sec = self.PING_FALLBACK_SEC
+        self._session = create_http_session()
 
     def _resolve_symbols(self) -> Dict[str, str]:
-        session = create_http_session()
         try:
-            r = session.get(self.CONTRACTS, timeout=8)
+            r = self._session.get(self.CONTRACTS, timeout=8)
             if r.status_code == 200:
                 for c in r.json().get("data", []):
                     sym = c.get("symbol", "").upper()
@@ -20509,6 +20579,15 @@ class KucoinStream(BaseVenueStream):
             log.warning(f"[kucoin] Failed to resolve contract symbols: {e}")
         return self._ours_to_venue
 
+    async def stop(self) -> None:
+        await super().stop()
+        if self._session is not None:
+            try:
+                self._session.close()
+            except Exception:
+                pass
+            self._session = None
+
     async def _run_loop(self) -> None:
         await asyncio.to_thread(self._resolve_symbols)
         target_syms = list(self._ours_to_venue.values())
@@ -20518,9 +20597,10 @@ class KucoinStream(BaseVenueStream):
 
         while self._running:
             try:
-                # Get dynamic bullet token
-                session = create_http_session()
-                bullet_resp = await asyncio.to_thread(session.post, self.BULLET, timeout=10)
+                # Get dynamic bullet token using persistent session
+                if self._session is None:
+                    self._session = create_http_session()
+                bullet_resp = await asyncio.to_thread(self._session.post, self.BULLET, timeout=10)
                 data = bullet_resp.json().get("data", {})
                 token = data.get("token")
                 endpoints = data.get("instanceServers", [])
@@ -20879,6 +20959,7 @@ class MEXCRestClient:
         sym = symbol if "_" in symbol else f"{normalize_symbol(symbol)}_USDT"
         url = f"{self.BASE_URL}/kline/{sym}?interval=Min1"
         out: Dict[int, Tuple[float, float]] = {}
+        inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
         try:
             r = self.session.get(url, timeout=6)
             if r.status_code == 200:
@@ -20888,7 +20969,7 @@ class MEXCRestClient:
                 amounts = data.get("amount", [])
                 for t, c, a in zip(times[-limit:], closes[-limit:], amounts[-limit:]):
                     t_sec = (int(t) // 60) * 60
-                    close = float(c)
+                    close = float(c) * inv_mult
                     vol_usd = float(a)
                     if t_sec > 0 and close > 0:
                         out[t_sec] = (close, vol_usd)
@@ -21053,13 +21134,15 @@ class OKXRestClient:
         inst_id = symbol if "-SWAP" in symbol else f"{normalize_symbol(symbol)}-USDT-SWAP"
         url = f"{self.BASE_URL}/market/candles?instId={inst_id}&bar=1m&limit={min(limit, 300)}"
         out: Dict[int, Tuple[float, float]] = {}
+        inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
         try:
             r = self.session.get(url, timeout=6)
             if r.status_code == 200:
                 for row in r.json().get("data", []):
                     t_sec = (int(row[0]) // 60000) * 60
-                    close = float(row[4])
-                    vol_usd = float(row[7]) if len(row) > 7 else float(row[5]) * close
+                    raw_close = float(row[4])
+                    close = raw_close * inv_mult
+                    vol_usd = float(row[7]) if len(row) > 7 else float(row[5]) * raw_close
                     if t_sec > 0 and close > 0:
                         out[t_sec] = (close, vol_usd)
         except Exception:
@@ -21212,13 +21295,15 @@ class PionexRestClient:
         sym = symbol if "_PERP" in symbol else f"{normalize_symbol(symbol)}_USDT_PERP"
         url = f"{self.BASE_URL}/market/klines?symbol={sym}&interval=1M&limit={min(limit, 500)}"
         out: Dict[int, Tuple[float, float]] = {}
+        inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
         try:
             r = self.session.get(url, timeout=6)
             if r.status_code == 200:
                 for row in r.json().get("data", {}).get("klines", []):
                     t_sec = (int(row.get("time", 0)) // 60000) * 60
-                    close = float(row.get("close", 0.0))
-                    vol_usd = float(row.get("volume", 0.0)) * close
+                    raw_close = float(row.get("close", 0.0))
+                    close = raw_close * inv_mult
+                    vol_usd = float(row.get("volume", 0.0)) * raw_close
                     if t_sec > 0 and close > 0:
                         out[t_sec] = (close, vol_usd)
         except Exception:

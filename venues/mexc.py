@@ -80,6 +80,7 @@ class MEXCRestClient:
         sym = symbol if "_" in symbol else f"{normalize_symbol(symbol)}_USDT"
         url = f"{self.BASE_URL}/kline/{sym}?interval=Min1"
         out: Dict[int, Tuple[float, float]] = {}
+        inv_mult = (1.0 / mult) if mult != 1.0 else 1.0
         try:
             r = self.session.get(url, timeout=6)
             if r.status_code == 200:
@@ -89,7 +90,7 @@ class MEXCRestClient:
                 amounts = data.get("amount", [])
                 for t, c, a in zip(times[-limit:], closes[-limit:], amounts[-limit:]):
                     t_sec = (int(t) // 60) * 60
-                    close = float(c)
+                    close = float(c) * inv_mult
                     vol_usd = float(a)
                     if t_sec > 0 and close > 0:
                         out[t_sec] = (close, vol_usd)

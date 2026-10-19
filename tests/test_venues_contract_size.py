@@ -12,13 +12,13 @@ from typing import List
 
 from models import OrderBookDepth5
 from venues.base import BaseCEXStream
-from venues.bingx import BingXStream
-from venues.gateio import GateioStream
-from venues.htx import HTXStream
-from venues.kucoin import KucoinStream
-from venues.mexc import MEXCStream
-from venues.okx import OKXStream
-from venues.pionex import PionexStream
+from venues.bingx import BingXStream, BingXRestClient
+from venues.gateio import GateioStream, GateioRestClient
+from venues.htx import HTXStream, HTXRestClient
+from venues.kucoin import KucoinStream, KucoinRestClient
+from venues.mexc import MEXCStream, MEXCRestClient
+from venues.okx import OKXStream, OKXRestClient
+from venues.pionex import PionexStream, PionexRestClient
 from venues.asterdex import AsterdexStream, AsterdexRestClient
 from venues.hyperliquid import HyperliquidStream, HyperliquidRestClient
 
@@ -1101,6 +1101,70 @@ class TestVenuesContractSize(unittest.TestCase):
         stream._parse_message(msg2)
         self.assertEqual(len(snaps), 1)
         self.assertEqual(stream.seq_duplicates, 1)
+
+    def test_rest_klines_multiplier_normalization(self):
+        """Verifies that fetch_klines_1m across BingX, Gate.io, KuCoin normalizes close with inv_mult."""
+        from unittest.mock import MagicMock
+
+        # 1. BingX
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"data": [{"time": 1700000000000, "close": "15.0", "volume": "100.0"}]}
+        session = MagicMock()
+        session.get.return_value = mock_resp
+        bx = BingXRestClient(session=session)
+        kl = bx.fetch_klines_1m("1000PEPE-USDT", mult=1000.0)
+        self.assertIn(1700000000000 // 60000 * 60, kl)
+        close, vol = kl[1700000000000 // 60000 * 60]
+        self.assertAlmostEqual(close, 0.015)
+        self.assertAlmostEqual(vol, 1500.0)
+
+        # 2. Gate.io
+        mock_resp_g = MagicMock(status_code=200)
+        mock_resp_g.json.return_value = [{"t": 1700000000, "c": "15.0", "sum": "1500.0"}]
+        session_g = MagicMock()
+        session_g.get.return_value = mock_resp_g
+        gt = GateioRestClient()
+        gt.session = session_g
+        kl_g = gt.fetch_klines_1m("1000BONK_USDT", mult=1000.0)
+        self.assertIn(1700000000 // 60 * 60, kl_g)
+        close_g, vol_g = kl_g[1700000000 // 60 * 60]
+        self.assertAlmostEqual(close_g, 0.015)
+        self.assertAlmostEqual(vol_g, 1500.0)
+
+        # 3. KuCoin
+        mock_resp_k = MagicMock(status_code=200)
+        mock_resp_k.json.return_value = {"data": [[1700000000000, "0", "0", "0", "15.0", "100.0", "1500.0"]]}
+        session_k = MagicMock()
+        session_k.get.return_value = mock_resp_k
+        kc = KucoinRestClient(session=session_k)
+        kl_k = kc.fetch_klines_1m("PEPEUSDTM", mult=1000.0)
+        close_k, vol_k = kl_k[1700000000000 // 60000 * 60]
+        self.assertAlmostEqual(close_k, 0.015)
+        self.assertAlmostEqual(vol_k, 1500.0)
+
+    def test_kucoin_stream_session_lifecycle(self):
+        """KucoinStream: verifies session reuse across bullet calls and clean closure on stop."""
+        import asyncio
+        from unittest.mock import MagicMock
+
+        snaps: List[OrderBookDepth5] = []
+        stream = KucoinStream(["XBTUSDTM"], snaps.append)
+        self.assertIsNotNone(stream._session)
+        init_session = stream._session
+
+        # _resolve_symbols must reuse the existing session
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"data": [{"symbol": "XBTUSDTM", "multiplier": 1.0, "baseCurrency": "XBT"}]}
+        init_session.get = MagicMock(return_value=mock_resp)
+        stream._resolve_symbols()
+        self.assertIs(stream._session, init_session)
+        init_session.get.assert_called_once()
+
+        # stop() must close session and clear reference
+        init_session.close = MagicMock()
+        asyncio.run(stream.stop())
+        init_session.close.assert_called_once()
+        self.assertIsNone(stream._session)
 
 
 if __name__ == "__main__":
