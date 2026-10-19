@@ -143,7 +143,7 @@ class HyperliquidRestClient:
                 candles = r.json()
                 if isinstance(candles, list):
                     for c in candles:
-                        t_sec = int(c.get("t", 0)) // 1000
+                        t_sec = (int(c.get("t", 0)) // 60000) * 60
                         close = float(c.get("c", 0.0)) * inv_mult
                         vol = float(c.get("v", 0.0)) * close * effective_mult
                         if t_sec > 0 and close > 0:

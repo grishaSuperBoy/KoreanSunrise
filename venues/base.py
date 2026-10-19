@@ -160,7 +160,16 @@ def _reconnect_jitter_sec(name: str) -> float:
 
 
 def _secs_until_daily_reconnect_for(name: str) -> float:
-    return max(1.0, _secs_until_daily_reconnect() + _reconnect_jitter_sec(name))
+    now = datetime.now(timezone.utc)
+    base_target = now.replace(
+        hour=_DAILY_RECONNECT_HOUR, minute=_DAILY_RECONNECT_MINUTE,
+        second=0, microsecond=0,
+    )
+    jitter = _reconnect_jitter_sec(name)
+    target = base_target + timedelta(seconds=jitter)
+    if target <= now:
+        target += timedelta(days=1)
+    return max(60.0, (target - now).total_seconds())
 
 
 class ReconnectPolicy:

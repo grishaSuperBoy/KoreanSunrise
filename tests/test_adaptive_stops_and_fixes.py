@@ -389,6 +389,66 @@ class TestAdaptiveStopsAndFixes(unittest.TestCase):
         self.assertEqual(len(acc.net_pnls), 1)
         self.assertEqual(DEFAULT_MIN_EVENTS, 3)
 
+    # -------------------------------------------------------------
+    # Test 10: Daily reconnect jitter never produces 1s thrashing
+    # -------------------------------------------------------------
+    def test_daily_reconnect_jitter_no_thrash(self):
+        from venues.base import _secs_until_daily_reconnect_for
+        # Test for various venue names, result must always be >= 60.0
+        for name in ("binance_0", "bybit", "gateio", "okx", "upbit", "hyperliquid"):
+            secs = _secs_until_daily_reconnect_for(name)
+            self.assertGreaterEqual(secs, 60.0, f"Jittered reconnect too small for {name}: {secs}")
+            self.assertLessEqual(secs, 86400.0 + 500.0)
+
+    # -------------------------------------------------------------
+    # Test 11: Inactive venue rejected by KoreanEngine._check_entry
+    # -------------------------------------------------------------
+    def test_inactive_venue_rejected_by_engine(self):
+        from unittest.mock import MagicMock
+        mock_profile = MagicMock()
+        mock_profile.is_venue_active.return_value = False  # Venue is disabled!
+        self.engine.profile_manager = mock_profile
+
+        now = time.time()
+        coin = "SOL"
+        st = self.engine._get_or_create_pair_state(coin, "bybit")
+        for i in range(6):
+            st.learn(0.0, now - 30.0 + i * 2.0)
+
+        self.engine._upbit_norm[coin] = {
+            "depth_ask": 1000.0,
+            "best_ask_usd": 100.0,
+            "spread_bps": 2.0,
+            "t": now - 1.0,
+        }
+        f_snap = OrderBookDepth5(
+            exchange="bybit", symbol=coin, raw_symbol="SOLUSDT",
+            ts=now, exchange_ts=int(now * 1000),
+            bids=[(99.95, 10.0)],
+            asks=[(100.00, 10.0), (100.05, 10.0), (100.10, 10.0)],
+        )
+        self.engine._books[("bybit", coin)] = f_snap
+        self.engine._recv_ts[("bybit", coin)] = now
+
+        u_prev = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now - 0.1, exchange_ts=int((now - 0.1) * 1000),
+            bids=[(99.95, 5.0)],
+            asks=[(100.00, 10.0), (100.05, 5.0), (100.50, 20.0)],
+        )
+        self.engine._books[("upbit", coin)] = u_prev
+
+        u_curr = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now, exchange_ts=int(now * 1000),
+            bids=[(100.00, 5.0)],
+            asks=[(100.50, 20.0)],
+        )
+        self.engine.on_book_update(u_curr)
+
+        # Signal must NOT be emitted because bybit is inactive in profile
+        self.assertIsNone(st.open_signal)
+
 
 if __name__ == "__main__":
     unittest.main()

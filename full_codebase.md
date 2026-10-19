@@ -1152,7 +1152,11 @@ class KoreanEngine:
 
         # Calculate dynamic stealth order size
         if self.profile_manager:
+            if not self.profile_manager.is_venue_active(follower_ex):
+                return
             sized = self.profile_manager.calculate_stealth_order_size(follower_ex, top3_ask_depth_usd)
+            if is_battle and sized is None:
+                return
             suggested_size_usd = sized if sized is not None else min(
                 self.max_position_budget_usd,
                 stealth_capacity_usd,
@@ -6401,7 +6405,8 @@ class UniverseScreener:
                 base = val[0]
                 mult = float(val[1]) if len(val) > 1 else 1.0
                 c_size = float(val[2]) if len(val) > 2 else 1.0
-                b_map[base] = (raw, mult, c_size)
+                if base not in b_map or mult == 1.0:
+                    b_map[base] = (raw, mult, c_size)
             venue_base_maps[v] = b_map
 
         # Stage 1 Matching and Fast Volume + Namesake Price Sanity Filter
@@ -7017,6 +7022,66 @@ class TestAdaptiveStopsAndFixes(unittest.TestCase):
         self.assertEqual(acc.valid_sweeps, 1)
         self.assertEqual(len(acc.net_pnls), 1)
         self.assertEqual(DEFAULT_MIN_EVENTS, 3)
+
+    # -------------------------------------------------------------
+    # Test 10: Daily reconnect jitter never produces 1s thrashing
+    # -------------------------------------------------------------
+    def test_daily_reconnect_jitter_no_thrash(self):
+        from venues.base import _secs_until_daily_reconnect_for
+        # Test for various venue names, result must always be >= 60.0
+        for name in ("binance_0", "bybit", "gateio", "okx", "upbit", "hyperliquid"):
+            secs = _secs_until_daily_reconnect_for(name)
+            self.assertGreaterEqual(secs, 60.0, f"Jittered reconnect too small for {name}: {secs}")
+            self.assertLessEqual(secs, 86400.0 + 500.0)
+
+    # -------------------------------------------------------------
+    # Test 11: Inactive venue rejected by KoreanEngine._check_entry
+    # -------------------------------------------------------------
+    def test_inactive_venue_rejected_by_engine(self):
+        from unittest.mock import MagicMock
+        mock_profile = MagicMock()
+        mock_profile.is_venue_active.return_value = False  # Venue is disabled!
+        self.engine.profile_manager = mock_profile
+
+        now = time.time()
+        coin = "SOL"
+        st = self.engine._get_or_create_pair_state(coin, "bybit")
+        for i in range(6):
+            st.learn(0.0, now - 30.0 + i * 2.0)
+
+        self.engine._upbit_norm[coin] = {
+            "depth_ask": 1000.0,
+            "best_ask_usd": 100.0,
+            "spread_bps": 2.0,
+            "t": now - 1.0,
+        }
+        f_snap = OrderBookDepth5(
+            exchange="bybit", symbol=coin, raw_symbol="SOLUSDT",
+            ts=now, exchange_ts=int(now * 1000),
+            bids=[(99.95, 10.0)],
+            asks=[(100.00, 10.0), (100.05, 10.0), (100.10, 10.0)],
+        )
+        self.engine._books[("bybit", coin)] = f_snap
+        self.engine._recv_ts[("bybit", coin)] = now
+
+        u_prev = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now - 0.1, exchange_ts=int((now - 0.1) * 1000),
+            bids=[(99.95, 5.0)],
+            asks=[(100.00, 10.0), (100.05, 5.0), (100.50, 20.0)],
+        )
+        self.engine._books[("upbit", coin)] = u_prev
+
+        u_curr = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now, exchange_ts=int(now * 1000),
+            bids=[(100.00, 5.0)],
+            asks=[(100.50, 20.0)],
+        )
+        self.engine.on_book_update(u_curr)
+
+        # Signal must NOT be emitted because bybit is inactive in profile
+        self.assertIsNone(st.open_signal)
 
 
 if __name__ == "__main__":
@@ -18338,7 +18403,16 @@ def _reconnect_jitter_sec(name: str) -> float:
 
 
 def _secs_until_daily_reconnect_for(name: str) -> float:
-    return max(1.0, _secs_until_daily_reconnect() + _reconnect_jitter_sec(name))
+    now = datetime.now(timezone.utc)
+    base_target = now.replace(
+        hour=_DAILY_RECONNECT_HOUR, minute=_DAILY_RECONNECT_MINUTE,
+        second=0, microsecond=0,
+    )
+    jitter = _reconnect_jitter_sec(name)
+    target = base_target + timedelta(seconds=jitter)
+    if target <= now:
+        target += timedelta(days=1)
+    return max(60.0, (target - now).total_seconds())
 
 
 class ReconnectPolicy:
@@ -20251,7 +20325,7 @@ class HyperliquidRestClient:
                 candles = r.json()
                 if isinstance(candles, list):
                     for c in candles:
-                        t_sec = int(c.get("t", 0)) // 1000
+                        t_sec = (int(c.get("t", 0)) // 60000) * 60
                         close = float(c.get("c", 0.0)) * inv_mult
                         vol = float(c.get("v", 0.0)) * close * effective_mult
                         if t_sec > 0 and close > 0:
@@ -20719,6 +20793,13 @@ class KucoinStream(BaseVenueStream):
                     f"(attempt {self._reconnect_policy.consecutive_failures})..."
                 )
                 await asyncio.sleep(delay)
+
+        if self._session is not None:
+            try:
+                self._session.close()
+            except Exception:
+                pass
+            self._session = None
 
     def _parse_message(self, raw_msg: str | bytes) -> None:
         try:
@@ -22080,6 +22161,8 @@ class APIServer:
         self._cached_thresholds: Dict[str, Any] = {}
         self._thresholds_mtime: float = 0.0
         self._thresholds_lock = threading.Lock()
+        self._pipeline_proc: Optional[subprocess.Popen] = None
+        self._pipeline_lock = threading.Lock()
 
     def get_thresholds_doc(self) -> Dict[str, Any]:
         """Returns cached matrix thresholds document, reloading from disk only when mtime changes."""
@@ -22305,6 +22388,7 @@ class APIServer:
                         self.end_headers()
                         self.wfile.write(b)
                 else:
+                    time.sleep(0.5)
                     if is_form or "text/html" in self.headers.get("Accept", ""):
                         self._send_login(error="Неверный ключ авторизации")
                     else:
@@ -22429,8 +22513,12 @@ class APIServer:
                     self._send_json({"ok": False, "error": str(e)}, code=500)
 
             def _handle_trigger_pipeline(self) -> None:
-                cmd = [sys.executable, os.path.join(PROJECT_ROOT, "tools", "run_daily_pipeline.py")]
-                subprocess.Popen(cmd)
+                with server_ref._pipeline_lock:
+                    if server_ref._pipeline_proc is not None and server_ref._pipeline_proc.poll() is None:
+                        self._send_json({"ok": False, "error": "Daily pipeline is already running in background"}, code=409)
+                        return
+                    cmd = [sys.executable, os.path.join(PROJECT_ROOT, "tools", "run_daily_pipeline.py")]
+                    server_ref._pipeline_proc = subprocess.Popen(cmd)
                 self._send_json({"ok": True, "message": "Master 24h pipeline started in background"})
 
             def _handle_pool_toggle(self, path: str, body_bytes: bytes) -> None:
@@ -22714,9 +22802,8 @@ def render_dashboard_html(
     thresholds_doc: Dict[str, Any],
     reports_cards: List[Dict[str, Any]],
     csrf_token: str = "",
-    auth_token: str = "",
 ) -> str:
-    effective_csrf = csrf_token or auth_token
+    effective_csrf = csrf_token
     summary = pool_snapshot.get("summary", {})
     counters = service_status.get("counters", {})
     streams = service_status.get("streams", {})
@@ -23095,11 +23182,11 @@ body {{
     <div class="rate-badge">KRW/USDT: {krw_rate:.1f}</div>
   </div>
   <div class="tabs">
-    <button class="tab-btn active" onclick="switchTab('dashboard')">Мониторинг</button>
-    <button class="tab-btn" onclick="switchTab('reports')">Суточная отчётность</button>
-    <button class="tab-btn" onclick="switchTab('thresholds')">Матрица спредов ({len(th_items)})</button>
-    <button class="tab-btn" onclick="switchTab('profile')">Депозит и слоты</button>
-    <button class="tab-btn" onclick="switchTab('controls')">Управление</button>
+    <button class="tab-btn active" onclick="switchTab('dashboard', this)">Мониторинг</button>
+    <button class="tab-btn" onclick="switchTab('reports', this)">Суточная отчётность</button>
+    <button class="tab-btn" onclick="switchTab('thresholds', this)">Матрица спредов ({len(th_items)})</button>
+    <button class="tab-btn" onclick="switchTab('profile', this)">Депозит и слоты</button>
+    <button class="tab-btn" onclick="switchTab('controls', this)">Управление</button>
     <form method="POST" action="/logout" style="margin:0;display:inline;">
       <input type="hidden" name="csrf_token" value="{effective_csrf}">
       <button type="submit" class="tab-btn" style="color:var(--red);" title="Завершить сеанс">Выйти 🚪</button>
@@ -23230,15 +23317,18 @@ body {{
 <script>
 const CSRF_TOKEN = "{effective_csrf}";
 
-function switchTab(name) {{
+function switchTab(name, btn) {{
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
   const target = document.getElementById('tab-' + name);
   if (target) {{
     target.classList.add('active');
   }}
-  if (window.event && window.event.target && window.event.target.classList.contains('tab-btn')) {{
-    window.event.target.classList.add('active');
+  if (btn && btn.classList) {{
+    btn.classList.add('active');
+  }} else {{
+    const el = document.querySelector(`.tab-btn[onclick*="'${{name}}'"]`);
+    if (el) el.classList.add('active');
   }}
 }}
 

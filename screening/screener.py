@@ -140,7 +140,8 @@ class UniverseScreener:
                 base = val[0]
                 mult = float(val[1]) if len(val) > 1 else 1.0
                 c_size = float(val[2]) if len(val) > 2 else 1.0
-                b_map[base] = (raw, mult, c_size)
+                if base not in b_map or mult == 1.0:
+                    b_map[base] = (raw, mult, c_size)
             venue_base_maps[v] = b_map
 
         # Stage 1 Matching and Fast Volume + Namesake Price Sanity Filter

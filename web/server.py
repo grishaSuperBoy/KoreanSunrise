@@ -55,6 +55,8 @@ class APIServer:
         self._cached_thresholds: Dict[str, Any] = {}
         self._thresholds_mtime: float = 0.0
         self._thresholds_lock = threading.Lock()
+        self._pipeline_proc: Optional[subprocess.Popen] = None
+        self._pipeline_lock = threading.Lock()
 
     def get_thresholds_doc(self) -> Dict[str, Any]:
         """Returns cached matrix thresholds document, reloading from disk only when mtime changes."""
@@ -280,6 +282,7 @@ class APIServer:
                         self.end_headers()
                         self.wfile.write(b)
                 else:
+                    time.sleep(0.5)
                     if is_form or "text/html" in self.headers.get("Accept", ""):
                         self._send_login(error="Неверный ключ авторизации")
                     else:
@@ -404,8 +407,12 @@ class APIServer:
                     self._send_json({"ok": False, "error": str(e)}, code=500)
 
             def _handle_trigger_pipeline(self) -> None:
-                cmd = [sys.executable, os.path.join(PROJECT_ROOT, "tools", "run_daily_pipeline.py")]
-                subprocess.Popen(cmd)
+                with server_ref._pipeline_lock:
+                    if server_ref._pipeline_proc is not None and server_ref._pipeline_proc.poll() is None:
+                        self._send_json({"ok": False, "error": "Daily pipeline is already running in background"}, code=409)
+                        return
+                    cmd = [sys.executable, os.path.join(PROJECT_ROOT, "tools", "run_daily_pipeline.py")]
+                    server_ref._pipeline_proc = subprocess.Popen(cmd)
                 self._send_json({"ok": True, "message": "Master 24h pipeline started in background"})
 
             def _handle_pool_toggle(self, path: str, body_bytes: bytes) -> None:

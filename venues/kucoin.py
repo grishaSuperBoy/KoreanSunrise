@@ -253,6 +253,13 @@ class KucoinStream(BaseVenueStream):
                 )
                 await asyncio.sleep(delay)
 
+        if self._session is not None:
+            try:
+                self._session.close()
+            except Exception:
+                pass
+            self._session = None
+
     def _parse_message(self, raw_msg: str | bytes) -> None:
         try:
             if isinstance(raw_msg, bytes):

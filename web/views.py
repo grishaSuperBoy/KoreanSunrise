@@ -153,9 +153,8 @@ def render_dashboard_html(
     thresholds_doc: Dict[str, Any],
     reports_cards: List[Dict[str, Any]],
     csrf_token: str = "",
-    auth_token: str = "",
 ) -> str:
-    effective_csrf = csrf_token or auth_token
+    effective_csrf = csrf_token
     summary = pool_snapshot.get("summary", {})
     counters = service_status.get("counters", {})
     streams = service_status.get("streams", {})
@@ -534,11 +533,11 @@ body {{
     <div class="rate-badge">KRW/USDT: {krw_rate:.1f}</div>
   </div>
   <div class="tabs">
-    <button class="tab-btn active" onclick="switchTab('dashboard')">Мониторинг</button>
-    <button class="tab-btn" onclick="switchTab('reports')">Суточная отчётность</button>
-    <button class="tab-btn" onclick="switchTab('thresholds')">Матрица спредов ({len(th_items)})</button>
-    <button class="tab-btn" onclick="switchTab('profile')">Депозит и слоты</button>
-    <button class="tab-btn" onclick="switchTab('controls')">Управление</button>
+    <button class="tab-btn active" onclick="switchTab('dashboard', this)">Мониторинг</button>
+    <button class="tab-btn" onclick="switchTab('reports', this)">Суточная отчётность</button>
+    <button class="tab-btn" onclick="switchTab('thresholds', this)">Матрица спредов ({len(th_items)})</button>
+    <button class="tab-btn" onclick="switchTab('profile', this)">Депозит и слоты</button>
+    <button class="tab-btn" onclick="switchTab('controls', this)">Управление</button>
     <form method="POST" action="/logout" style="margin:0;display:inline;">
       <input type="hidden" name="csrf_token" value="{effective_csrf}">
       <button type="submit" class="tab-btn" style="color:var(--red);" title="Завершить сеанс">Выйти 🚪</button>
@@ -669,15 +668,18 @@ body {{
 <script>
 const CSRF_TOKEN = "{effective_csrf}";
 
-function switchTab(name) {{
+function switchTab(name, btn) {{
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
   const target = document.getElementById('tab-' + name);
   if (target) {{
     target.classList.add('active');
   }}
-  if (window.event && window.event.target && window.event.target.classList.contains('tab-btn')) {{
-    window.event.target.classList.add('active');
+  if (btn && btn.classList) {{
+    btn.classList.add('active');
+  }} else {{
+    const el = document.querySelector(`.tab-btn[onclick*="'${{name}}'"]`);
+    if (el) el.classList.add('active');
   }}
 }}
 

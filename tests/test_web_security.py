@@ -191,6 +191,41 @@ class TestWebSecurity(unittest.TestCase):
         doc2 = self.server.get_thresholds_doc()
         self.assertIs(doc1, doc2, "Cached thresholds doc should return the identical in-memory dict instance")
 
+    def test_login_invalid_token_delayed(self) -> None:
+        """Verify invalid login triggers anti-bruteforce delay (>= 0.4s)."""
+        import time
+        t0 = time.time()
+        req = urllib.request.Request(
+            f"{self.base_url}/login",
+            data=json.dumps({"token": "wrong_password_attempt"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req)
+        elapsed = time.time() - t0
+        self.assertEqual(ctx.exception.code, 401)
+        self.assertGreaterEqual(elapsed, 0.45)
+
+    def test_pipeline_concurrent_trigger_blocked(self) -> None:
+        """Verify triggering pipeline while running returns 409 Conflict."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None  # Process is still running
+        self.server._pipeline_proc = mock_proc
+        try:
+            req = urllib.request.Request(
+                f"{self.base_url}/api/daily-pipeline",
+                data=b"",
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Content-Type": "application/json",
+                }
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req)
+            self.assertEqual(ctx.exception.code, 409)
+        finally:
+            self.server._pipeline_proc = None
+
 
 if __name__ == "__main__":
     unittest.main()

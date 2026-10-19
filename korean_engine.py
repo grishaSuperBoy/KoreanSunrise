@@ -642,7 +642,11 @@ class KoreanEngine:
 
         # Calculate dynamic stealth order size
         if self.profile_manager:
+            if not self.profile_manager.is_venue_active(follower_ex):
+                return
             sized = self.profile_manager.calculate_stealth_order_size(follower_ex, top3_ask_depth_usd)
+            if is_battle and sized is None:
+                return
             suggested_size_usd = sized if sized is not None else min(
                 self.max_position_budget_usd,
                 stealth_capacity_usd,
