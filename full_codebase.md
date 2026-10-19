@@ -8560,6 +8560,57 @@ class TestPipelineE2E(unittest.TestCase):
                 "close_reason": "converged",
                 "trigger_type": "depth_drain",
             },
+            {
+                "coin": "SOL",
+                "follower_exchange": "binance",
+                "drain_ratio": 0.60,
+                "leader_swept_usd": 3000.0,
+                "follower_top3_ask_usd": 2500.0,
+                "stealth_capacity_usd": 375.0,
+                "net_pnl_bps": -15.0,
+                "gross_exec_edge_bps": 20.0,
+                "mfe_exec_pnl_bps": -5.0,
+                "time_to_peak_sec": 0.2,
+                "close_reason": "stop_invalidation",
+                "stop_hit": True,
+                "stop_type": "invalidation",
+                "stop_loss_bps": 15.0,
+                "trigger_type": "depth_drain",
+            },
+            {
+                "coin": "DOGE",
+                "follower_exchange": "bybit",
+                "drain_ratio": 0.50,
+                "leader_swept_usd": 2000.0,
+                "follower_top3_ask_usd": 1000.0,
+                "stealth_capacity_usd": 150.0,
+                "net_pnl_bps": -35.0,
+                "gross_exec_edge_bps": 15.0,
+                "mfe_exec_pnl_bps": -10.0,
+                "time_to_peak_sec": 0.1,
+                "close_reason": "stop_adverse_pnl",
+                "stop_hit": True,
+                "stop_type": "adverse_pnl",
+                "stop_loss_bps": 35.0,
+                "trigger_type": "depth_drain",
+            },
+            {
+                "coin": "DOGE",
+                "follower_exchange": "bybit",
+                "drain_ratio": 0.50,
+                "leader_swept_usd": 2000.0,
+                "follower_top3_ask_usd": 1000.0,
+                "stealth_capacity_usd": 150.0,
+                "net_pnl_bps": -10.0,
+                "gross_exec_edge_bps": 15.0,
+                "mfe_exec_pnl_bps": 0.0,
+                "time_to_peak_sec": 0.0,
+                "close_reason": "stop_decay",
+                "stop_hit": True,
+                "stop_type": "alpha_decay",
+                "stop_loss_bps": 10.0,
+                "trigger_type": "depth_drain",
+            },
         ]
         with gzip.open(sig_file, "wt", encoding="utf-8") as f:
             for s in mock_signals:
@@ -8570,24 +8621,30 @@ class TestPipelineE2E(unittest.TestCase):
             doc = fdr.generate_daily_report(days_back=1.0, as_json=True)
 
         self.assertIn("venue_capacities", doc)
-        self.assertEqual(len(doc["venue_capacities"]), 1)
-        v_binance = doc["venue_capacities"][0]
-        self.assertEqual(v_binance["venue"], "binance")
-        self.assertEqual(v_binance["signals"], 2)
-        # Median of 2000 and 3000 is 2500
+        self.assertEqual(len(doc["venue_capacities"]), 2)
+        v_binance = next(v for v in doc["venue_capacities"] if v["venue"] == "binance")
+        self.assertEqual(v_binance["signals"], 3)
         self.assertAlmostEqual(v_binance["med_top3_depth_usd"], 2500.0, places=1)
-        # Median of 300 and 450 is 375
         self.assertAlmostEqual(v_binance["med_stealth_cap_usd"], 375.0, places=1)
+
+        # Verify stop loss telemetry section
+        self.assertIn("stop_loss_telemetry", doc)
+        sl = doc["stop_loss_telemetry"]
+        self.assertEqual(sl["total_stops"], 3)
+        self.assertEqual(sl["invalidation_count"], 1)
+        self.assertEqual(sl["adverse_pnl_count"], 1)
+        self.assertEqual(sl["alpha_decay_count"], 1)
+        self.assertLess(sl["total_stop_pnl_usd"], 0.0)
 
         # Check top_coins
         self.assertGreater(len(doc["top_coins"]), 0)
-        c_sol = doc["top_coins"][0]
+        c_sol = next(c for c in doc["top_coins"] if c["coin"] == "SOL")
         self.assertEqual(c_sol["coin"], "SOL")
         self.assertAlmostEqual(c_sol["med_stealth_cap_usd"], 375.0, places=1)
 
         # Check top_pairs
         self.assertGreater(len(doc["top_pairs"]), 0)
-        p_sol = doc["top_pairs"][0]
+        p_sol = next(p for p in doc["top_pairs"] if "SOL" in p["pair"])
         self.assertAlmostEqual(p_sol["med_stealth_cap_usd"], 375.0, places=1)
 
     def test_orderbook_vwap_and_true_roundtrip_math(self):
