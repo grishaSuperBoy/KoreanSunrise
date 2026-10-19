@@ -449,6 +449,65 @@ class TestAdaptiveStopsAndFixes(unittest.TestCase):
         # Signal must NOT be emitted because bybit is inactive in profile
         self.assertIsNone(st.open_signal)
 
+    # -------------------------------------------------------------
+    # Test 12: BatchWriter with deterministic now timestamp
+    # -------------------------------------------------------------
+    def test_batch_writer_deterministic_now(self):
+        from batch_writer import BatchWriter
+        import tempfile
+        import shutil
+        import os
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            bw = BatchWriter(data_root=tmp_dir, flush_interval_sec=1.0)
+            bw.add({"sig": "test_now"})
+            # Flush using a specific fixed epoch timestamp: 2026-05-15 12:00:00 UTC = 1778846400
+            test_ts = 1778846400.0
+            bw.flush(now=test_ts)
+            expected_day_dir = os.path.join(tmp_dir, "signals", "2026-05-15")
+            self.assertTrue(os.path.isdir(expected_day_dir))
+            files = os.listdir(expected_day_dir)
+            self.assertEqual(len(files), 1)
+            self.assertTrue(files[0].startswith("sunrise_signals_20260515_120000_"))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # -------------------------------------------------------------
+    # Test 13: PoolStateManager restores stealth_capacity_usd
+    # -------------------------------------------------------------
+    def test_pool_state_restores_stealth_capacity(self):
+        from pipeline.pool_state import PoolStateManager
+        import tempfile
+        import shutil
+        import json
+        import os
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            u_path = os.path.join(tmp_dir, "universe_live.json")
+            b_path = os.path.join(tmp_dir, "battle_pool.json")
+            with open(u_path, "w", encoding="utf-8") as f:
+                json.dump({"pairs": {"PEPE": {"venues": ["binance"]}}}, f)
+            with open(b_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "coins": {
+                        "PEPE": {
+                            "venues": ["binance"],
+                            "top3_depth_usd": 10000.0,
+                            "stealth_capacity_usd": 777.5,
+                            "mean_net_pnl_bps": 25.0,
+                        }
+                    }
+                }, f)
+            mgr = PoolStateManager(universe_file=u_path, battle_pool_file=b_path, overrides_file=os.path.join(tmp_dir, "ov.json"))
+            mgr.reload()
+            entry = mgr.get_coin_entry("PEPE")
+            self.assertIsNotNone(entry)
+            self.assertEqual(entry.stealth_capacity_usd, 777.5)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

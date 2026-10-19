@@ -266,7 +266,6 @@ def render_dashboard_html(
   --bg-2: #171f30;
   --bg-3: #1f2a40;
   --border: rgba(255, 255, 255, 0.08);
-  --border-focus: #38bdf8;
   --primary: #38bdf8;
   --accent: #f59e0b;
   --green: #10b981;

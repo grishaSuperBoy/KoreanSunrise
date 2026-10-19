@@ -142,13 +142,13 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 log = logging.getLogger("writer")
 
 
-def _utc_day() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def _utc_day(dt: Optional[datetime] = None) -> str:
+    return (dt or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
 
 
 class BatchWriter:
@@ -183,16 +183,17 @@ class BatchWriter:
         with self._lock:
             need_flush = (now - self._last_flush >= self.flush_interval_sec) and bool(self._lines)
         if need_flush:
-            self.flush()
+            self.flush(now)
 
-    def flush(self) -> None:
+    def flush(self, now: float = 0.0) -> None:
         """Compresses all buffered lines in a single batch and writes atomically to disk."""
+        flush_time = now if now > 0.0 else time.time()
         with self._lock:
             if not self._lines:
                 return
             batch_lines = self._lines
             self._lines = []
-            self._last_flush = time.time()
+            self._last_flush = flush_time
             self._flush_seq += 1
             seq = self._flush_seq
 
@@ -201,11 +202,12 @@ class BatchWriter:
             raw_bytes = "".join(batch_lines).encode("utf-8")
             compressed_data = gzip.compress(raw_bytes, compresslevel=6)
 
-            day = _utc_day()
+            dt = datetime.fromtimestamp(flush_time, tz=timezone.utc)
+            day = _utc_day(dt)
             target_dir = os.path.join(self.data_root, "signals", day)
             os.makedirs(target_dir, exist_ok=True)
 
-            ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            ts_str = dt.strftime("%Y%m%d_%H%M%S")
             filename = f"sunrise_signals_{ts_str}_{seq:04d}.jsonl.gz"
             tmp_path = os.path.join(target_dir, f"{filename}.tmp")
             final_path = os.path.join(target_dir, filename)
@@ -236,12 +238,9 @@ active USDT Linear Perpetuals on Binance and Bybit (including 1000x/1M prefixes)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import json
 import logging
 import os
-import re
-import urllib.request
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Tuple
 
 log = logging.getLogger("config")
 
@@ -291,9 +290,6 @@ STOP_INVALIDATION_BPS = 15.0    # Model A: Microstructure invalidation tolerance
 STOP_ADVERSE_PNL_BPS = 35.0     # Model B: Hard adverse PnL drawdown stop (bps)
 ALPHA_DECAY_SEC = 8.0           # Model C: Alpha decay timeout if PnL <= 0 (transmission failure)
 
-# Regex to detect multiplier prefixes on Binance/Bybit perps: 1000PEPE, 1000000MOG, etc.
-_MULT_PREFIX_RE = re.compile(r"^(1000000|100000|10000|1000|100)([A-Z0-9]+)$")
-
 ALL_SUPPORTED_VENUES = [
     "binance",
     "bybit",
@@ -342,132 +338,6 @@ class MatchedUniverse:
                 for k, val in self.bybit_sym_map.items()
             }
         return {}
-
-
-def _http_get_json(url: str, timeout: float = 12.0):
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; KoreanSunrise/2.0)"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def _match_perp_base(perp_base: str, upbit_bases: Set[str]) -> Optional[Tuple[str, float]]:
-    """
-    Matches a Binance/Bybit perp base asset (e.g. 'SAND' or '1000PEPE')
-    to an Upbit KRW base coin.
-    Returns (upbit_coin, multiplier) or None.
-    """
-    # 1. Direct 1:1 match
-    if perp_base in upbit_bases:
-        return perp_base, 1.0
-
-    # 2. Check reverse alias (if Upbit has old name and perp has new name)
-    for up_coin, alias_target in TICKER_ALIASES.items():
-        if perp_base == alias_target and up_coin in upbit_bases:
-            return up_coin, 1.0
-
-    # 3. Multiplier prefix match (e.g. 1000PEPE -> PEPE with mult=1000.0)
-    m = _MULT_PREFIX_RE.match(perp_base)
-    if m:
-        mult_str, stripped_base = m.group(1), m.group(2)
-        mult = float(mult_str)
-        if stripped_base in upbit_bases:
-            return stripped_base, mult
-        for up_coin, alias_target in TICKER_ALIASES.items():
-            if stripped_base == alias_target and up_coin in upbit_bases:
-                return up_coin, mult
-
-    return None
-
-
-def discover_universe() -> MatchedUniverse:
-    """
-    Queries Upbit, Binance Futures, and Bybit Linear REST APIs to build
-    an exact, real-time intersection of all Korean KRW altcoins/shitcoins
-    and their corresponding USDT perpetual contracts.
-    """
-    # 1. Fetch all Upbit KRW spot markets
-    upbit_data = _http_get_json("https://api.upbit.com/v1/market/all?isDetails=true")
-    upbit_bases: Set[str] = set()
-    for item in upbit_data:
-        mkt = item.get("market", "")
-        if mkt.startswith("KRW-"):
-            coin = mkt.split("-", 1)[1].upper()
-            if coin and coin not in EXCLUDED_COINS:
-                upbit_bases.add(coin)
-
-    if not upbit_bases:
-        raise RuntimeError("Failed to discover any KRW markets from Upbit REST API")
-
-    # 2. Fetch all active Binance USDT Linear Perpetuals
-    binance_sym_map: Dict[str, Tuple[str, float]] = {}
-    try:
-        b_data = _http_get_json("https://fapi.binance.com/fapi/v1/exchangeInfo")
-        for s in b_data.get("symbols", []):
-            if (
-                s.get("contractType") == "PERPETUAL"
-                and s.get("status") == "TRADING"
-                and s.get("quoteAsset") == "USDT"
-            ):
-                raw_sym = s["symbol"].upper()
-                base_asset = s.get("baseAsset", "").upper()
-                matched = _match_perp_base(base_asset, upbit_bases)
-                if matched:
-                    binance_sym_map[raw_sym] = matched
-    except Exception as e:
-        log.error(f"[discovery] Binance Futures exchangeInfo failed: {e}")
-
-    # 3. Fetch all active Bybit USDT Linear Perpetuals
-    bybit_sym_map: Dict[str, Tuple[str, float]] = {}
-    try:
-        cursor = ""
-        while True:
-            url = "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
-            if cursor:
-                url += f"&cursor={cursor}"
-            by_data = _http_get_json(url)
-            res = by_data.get("result", {})
-            for item in res.get("list", []):
-                if (
-                    item.get("status") == "Trading"
-                    and item.get("quoteCoin") == "USDT"
-                    and item.get("contractType") == "LinearPerpetual"
-                ):
-                    raw_sym = item["symbol"].upper()
-                    base_coin = item.get("baseCoin", "").upper()
-                    matched = _match_perp_base(base_coin, upbit_bases)
-                    if matched:
-                        bybit_sym_map[raw_sym] = matched
-            cursor = res.get("nextPageCursor", "")
-            if not cursor:
-                break
-    except Exception as e:
-        log.error(f"[discovery] Bybit instruments-info failed: {e}")
-
-    # 4. Keep only Upbit coins that have at least one active perp on Binance or Bybit
-    matched_coins: Set[str] = set()
-    for coin, _ in binance_sym_map.values():
-        matched_coins.add(coin)
-    for coin, _ in bybit_sym_map.values():
-        matched_coins.add(coin)
-
-    sorted_coins = sorted(matched_coins)
-    upbit_krw_to_coin = {f"KRW-{c}": c for c in sorted_coins}
-
-    log.info(
-        f"[discovery] Upbit KRW alts: {len(upbit_bases)} | "
-        f"Matched active alts: {len(sorted_coins)} "
-        f"(Binance perps: {len(binance_sym_map)}, Bybit perps: {len(bybit_sym_map)})"
-    )
-
-    return MatchedUniverse(
-        coins=sorted_coins,
-        upbit_krw_to_coin=upbit_krw_to_coin,
-        binance_sym_map=binance_sym_map,
-        bybit_sym_map=bybit_sym_map,
-    )
 ```
 
 ## docs/explanations.md
@@ -522,7 +392,7 @@ import os
 import threading
 import time
 from collections import defaultdict, deque
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 
 import config as C
@@ -5706,6 +5576,10 @@ class PoolStateManager:
             entry.basket = "battle"
             entry.venues = meta.get("venues", entry.venues)
             entry.top3_depth_usd = float(meta.get("top3_depth_usd", 0.0))
+            if "stealth_capacity_usd" in meta:
+                entry.stealth_capacity_usd = float(meta["stealth_capacity_usd"])
+            else:
+                entry.stealth_capacity_usd = round(entry.top3_depth_usd * DEFAULT_STEALTH_FRAC, 2)
             entry.mean_net_pnl_bps = float(meta.get("mean_net_pnl_bps", 0.0))
             entry.median_net_pnl_bps = float(meta.get("median_net_pnl_bps", 0.0))
             entry.win_rate_pct = float(meta.get("win_rate_pct", 0.0))
@@ -6283,7 +6157,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from config import EXCLUDED_COINS, TICKER_ALIASES
 from screening.metrics import evaluate_pair_klines
@@ -6372,7 +6246,7 @@ class UniverseScreener:
         log.info("[Stage 1/2] Fetching 24h market tickers & exchange metadata across venues...")
         
         # Parallel fetch for all venue instruments and 24h tickers
-        venue_perps: Dict[str, Dict[str, Tuple[str, float]]] = {}
+        venue_perps: Dict[str, Dict[str, Tuple[Any, ...]]] = {}
         venue_ticks: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
         def _fetch_venue_metadata(venue: str):
@@ -7088,6 +6962,65 @@ class TestAdaptiveStopsAndFixes(unittest.TestCase):
 
         # Signal must NOT be emitted because bybit is inactive in profile
         self.assertIsNone(st.open_signal)
+
+    # -------------------------------------------------------------
+    # Test 12: BatchWriter with deterministic now timestamp
+    # -------------------------------------------------------------
+    def test_batch_writer_deterministic_now(self):
+        from batch_writer import BatchWriter
+        import tempfile
+        import shutil
+        import os
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            bw = BatchWriter(data_root=tmp_dir, flush_interval_sec=1.0)
+            bw.add({"sig": "test_now"})
+            # Flush using a specific fixed epoch timestamp: 2026-05-15 12:00:00 UTC = 1778846400
+            test_ts = 1778846400.0
+            bw.flush(now=test_ts)
+            expected_day_dir = os.path.join(tmp_dir, "signals", "2026-05-15")
+            self.assertTrue(os.path.isdir(expected_day_dir))
+            files = os.listdir(expected_day_dir)
+            self.assertEqual(len(files), 1)
+            self.assertTrue(files[0].startswith("sunrise_signals_20260515_120000_"))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # -------------------------------------------------------------
+    # Test 13: PoolStateManager restores stealth_capacity_usd
+    # -------------------------------------------------------------
+    def test_pool_state_restores_stealth_capacity(self):
+        from pipeline.pool_state import PoolStateManager
+        import tempfile
+        import shutil
+        import json
+        import os
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            u_path = os.path.join(tmp_dir, "universe_live.json")
+            b_path = os.path.join(tmp_dir, "battle_pool.json")
+            with open(u_path, "w", encoding="utf-8") as f:
+                json.dump({"pairs": {"PEPE": {"venues": ["binance"]}}}, f)
+            with open(b_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "coins": {
+                        "PEPE": {
+                            "venues": ["binance"],
+                            "top3_depth_usd": 10000.0,
+                            "stealth_capacity_usd": 777.5,
+                            "mean_net_pnl_bps": 25.0,
+                        }
+                    }
+                }, f)
+            mgr = PoolStateManager(universe_file=u_path, battle_pool_file=b_path, overrides_file=os.path.join(tmp_dir, "ov.json"))
+            mgr.reload()
+            entry = mgr.get_coin_entry("PEPE")
+            self.assertIsNotNone(entry)
+            self.assertEqual(entry.stealth_capacity_usd, 777.5)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
@@ -18300,8 +18233,6 @@ _SCALE_PREFIX_MAP: List[Tuple[re.Pattern, float]] = [
     (re.compile(r"^100([A-Z0-9]+)$"), 100.0),
 ]
 
-_MULT_PREFIX_RE = re.compile(r"^(1000000|100000|10000|1000|100)([A-Z0-9]+)$")
-
 
 def parse_symbol_and_mult(raw: str) -> Tuple[str, float]:
     """
@@ -22117,7 +22048,6 @@ and hardened security (zero-token URL leaks, SameSite HttpOnly cookies, and anti
 """
 from __future__ import annotations
 
-import datetime
 import hashlib
 import hmac
 import http.server
@@ -22563,9 +22493,11 @@ class APIServer:
                 if target_file:
                     fp = os.path.join(PROJECT_ROOT, "reports", "daily", target_file)
                     if os.path.isfile(fp):
+                        file_size = os.path.getsize(fp)
                         self.send_response(200)
                         self.send_header("Content-Type", "application/octet-stream")
                         self.send_header("Content-Disposition", f"attachment; filename=\"{target_file}\"")
+                        self.send_header("Content-Length", str(file_size))
                         self.end_headers()
                         with open(fp, "rb") as f:
                             shutil.copyfileobj(f, self.wfile)
@@ -22597,9 +22529,11 @@ class APIServer:
                                         rel_p = os.path.relpath(full_p, PROJECT_ROOT)
                                         z.write(full_p, arcname=rel_p)
 
+                    zip_size = os.path.getsize(tmp.name)
                     self.send_response(200)
                     self.send_header("Content-Type", "application/zip")
                     self.send_header("Content-Disposition", "attachment; filename=\"korean_sunrise_export.zip\"")
+                    self.send_header("Content-Length", str(zip_size))
                     self.end_headers()
                     with open(tmp.name, "rb") as f:
                         shutil.copyfileobj(f, self.wfile)
@@ -22933,7 +22867,6 @@ def render_dashboard_html(
   --bg-2: #171f30;
   --bg-3: #1f2a40;
   --border: rgba(255, 255, 255, 0.08);
-  --border-focus: #38bdf8;
   --primary: #38bdf8;
   --accent: #f59e0b;
   --green: #10b981;

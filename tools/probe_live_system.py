@@ -50,7 +50,7 @@ from models import OrderBookDepth5
 from venues.base import create_http_session
 from venues.binance import BinanceFuturesStream
 from venues.bybit import BybitPerpStream
-from venues.okx import OKXStream
+from venues.okx import OKXRestClient, OKXStream
 from venues.upbit import UpbitRestClient, UpbitSpotStream
 
 
@@ -190,7 +190,7 @@ class SystemProbe:
                 # 3. Dollar depth sanity check (multiplier corruption detector)
                 # For major coins, top-3 ask depth should be between $10 and $50M.
                 top3_ask = snap.top_n_ask_depth_usd(3)
-                if top3_ask > 50_000_000.0 or (top3_ask < 5.0 and snap.coin in ("BTC", "ETH")):
+                if top3_ask > 50_000_000.0 or (top3_ask < 5.0 and snap.symbol in ("BTC", "ETH")):
                     st["mult_errors"] += 1
 
             return _cb
@@ -199,12 +199,16 @@ class SystemProbe:
         upbit_krw_map = {f"KRW-{c}": c for c in test_coins}
         binance_syms = {f"{c}USDT": (c, 1.0) for c in test_coins}
         bybit_syms = {f"{c}USDT": (c, 1.0) for c in test_coins}
-        okx_syms = {f"{c}-USDT-SWAP": (c, 1.0) for c in test_coins}
+        okx_sizes = OKXRestClient(session=self.session).fetch_contract_sizes()
+        okx_syms = {
+            f"{c}-USDT-SWAP": (c, 1.0, okx_sizes.get(f"{c}-USDT-SWAP", 1.0))
+            for c in test_coins
+        }
 
         upbit_stream = UpbitSpotStream(krw_to_coin=upbit_krw_map, callback=make_callback("upbit"))
         binance_stream = BinanceFuturesStream(sym_map=binance_syms, callback=make_callback("binance"))
         bybit_stream = BybitPerpStream(sym_map=bybit_syms, callback=make_callback("bybit"))
-        okx_stream = OKXStream(symbols=okx_syms, callback=make_callback("okx"))
+        okx_stream = OKXStream(symbols=okx_syms, callback=make_callback("okx"), contract_sizes=okx_sizes)
 
         streams = [
             ("Upbit (Leader)", upbit_stream),

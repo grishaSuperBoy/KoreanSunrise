@@ -51,8 +51,6 @@ _SCALE_PREFIX_MAP: List[Tuple[re.Pattern, float]] = [
     (re.compile(r"^100([A-Z0-9]+)$"), 100.0),
 ]
 
-_MULT_PREFIX_RE = re.compile(r"^(1000000|100000|10000|1000|100)([A-Z0-9]+)$")
-
 
 def parse_symbol_and_mult(raw: str) -> Tuple[str, float]:
     """

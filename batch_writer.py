@@ -11,13 +11,13 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 log = logging.getLogger("writer")
 
 
-def _utc_day() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def _utc_day(dt: Optional[datetime] = None) -> str:
+    return (dt or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
 
 
 class BatchWriter:
@@ -52,16 +52,17 @@ class BatchWriter:
         with self._lock:
             need_flush = (now - self._last_flush >= self.flush_interval_sec) and bool(self._lines)
         if need_flush:
-            self.flush()
+            self.flush(now)
 
-    def flush(self) -> None:
+    def flush(self, now: float = 0.0) -> None:
         """Compresses all buffered lines in a single batch and writes atomically to disk."""
+        flush_time = now if now > 0.0 else time.time()
         with self._lock:
             if not self._lines:
                 return
             batch_lines = self._lines
             self._lines = []
-            self._last_flush = time.time()
+            self._last_flush = flush_time
             self._flush_seq += 1
             seq = self._flush_seq
 
@@ -70,11 +71,12 @@ class BatchWriter:
             raw_bytes = "".join(batch_lines).encode("utf-8")
             compressed_data = gzip.compress(raw_bytes, compresslevel=6)
 
-            day = _utc_day()
+            dt = datetime.fromtimestamp(flush_time, tz=timezone.utc)
+            day = _utc_day(dt)
             target_dir = os.path.join(self.data_root, "signals", day)
             os.makedirs(target_dir, exist_ok=True)
 
-            ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            ts_str = dt.strftime("%Y%m%d_%H%M%S")
             filename = f"sunrise_signals_{ts_str}_{seq:04d}.jsonl.gz"
             tmp_path = os.path.join(target_dir, f"{filename}.tmp")
             final_path = os.path.join(target_dir, filename)

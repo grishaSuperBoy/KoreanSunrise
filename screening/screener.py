@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from config import EXCLUDED_COINS, TICKER_ALIASES
 from screening.metrics import evaluate_pair_klines
@@ -101,7 +101,7 @@ class UniverseScreener:
         log.info("[Stage 1/2] Fetching 24h market tickers & exchange metadata across venues...")
         
         # Parallel fetch for all venue instruments and 24h tickers
-        venue_perps: Dict[str, Dict[str, Tuple[str, float]]] = {}
+        venue_perps: Dict[str, Dict[str, Tuple[Any, ...]]] = {}
         venue_ticks: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
         def _fetch_venue_metadata(venue: str):

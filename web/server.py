@@ -5,7 +5,6 @@ and hardened security (zero-token URL leaks, SameSite HttpOnly cookies, and anti
 """
 from __future__ import annotations
 
-import datetime
 import hashlib
 import hmac
 import http.server
@@ -451,9 +450,11 @@ class APIServer:
                 if target_file:
                     fp = os.path.join(PROJECT_ROOT, "reports", "daily", target_file)
                     if os.path.isfile(fp):
+                        file_size = os.path.getsize(fp)
                         self.send_response(200)
                         self.send_header("Content-Type", "application/octet-stream")
                         self.send_header("Content-Disposition", f"attachment; filename=\"{target_file}\"")
+                        self.send_header("Content-Length", str(file_size))
                         self.end_headers()
                         with open(fp, "rb") as f:
                             shutil.copyfileobj(f, self.wfile)
@@ -485,9 +486,11 @@ class APIServer:
                                         rel_p = os.path.relpath(full_p, PROJECT_ROOT)
                                         z.write(full_p, arcname=rel_p)
 
+                    zip_size = os.path.getsize(tmp.name)
                     self.send_response(200)
                     self.send_header("Content-Type", "application/zip")
                     self.send_header("Content-Disposition", "attachment; filename=\"korean_sunrise_export.zip\"")
+                    self.send_header("Content-Length", str(zip_size))
                     self.end_headers()
                     with open(tmp.name, "rb") as f:
                         shutil.copyfileobj(f, self.wfile)

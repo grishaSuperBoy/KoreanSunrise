@@ -12,7 +12,7 @@ import os
 import threading
 import time
 from collections import defaultdict, deque
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 
 import config as C

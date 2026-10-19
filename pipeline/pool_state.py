@@ -467,6 +467,10 @@ class PoolStateManager:
             entry.basket = "battle"
             entry.venues = meta.get("venues", entry.venues)
             entry.top3_depth_usd = float(meta.get("top3_depth_usd", 0.0))
+            if "stealth_capacity_usd" in meta:
+                entry.stealth_capacity_usd = float(meta["stealth_capacity_usd"])
+            else:
+                entry.stealth_capacity_usd = round(entry.top3_depth_usd * DEFAULT_STEALTH_FRAC, 2)
             entry.mean_net_pnl_bps = float(meta.get("mean_net_pnl_bps", 0.0))
             entry.median_net_pnl_bps = float(meta.get("median_net_pnl_bps", 0.0))
             entry.win_rate_pct = float(meta.get("win_rate_pct", 0.0))
