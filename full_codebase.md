@@ -240,7 +240,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import logging
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 log = logging.getLogger("config")
 
@@ -4553,7 +4553,7 @@ def normalize_exchange_ts(raw_ts: Any) -> int:
     Supports nanoseconds (19 digits), microseconds (16 digits), milliseconds (13 digits),
     and seconds (10 digits integer or float). Returns 0 on None or invalid input.
     """
-    if raw_ts is None:
+    if raw_ts is None or isinstance(raw_ts, bool):
         return 0
     try:
         if isinstance(raw_ts, int):
@@ -5131,7 +5131,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 log = logging.getLogger("pipeline.pool_state")
 
@@ -7021,6 +7021,25 @@ class TestAdaptiveStopsAndFixes(unittest.TestCase):
             self.assertEqual(entry.stealth_capacity_usd, 777.5)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # -------------------------------------------------------------
+    # Test 14: normalize_exchange_ts rejects booleans
+    # -------------------------------------------------------------
+    def test_normalize_exchange_ts_bool_guard(self):
+        from models import normalize_exchange_ts
+        self.assertEqual(normalize_exchange_ts(True), 0)
+        self.assertEqual(normalize_exchange_ts(False), 0)
+        self.assertEqual(normalize_exchange_ts(None), 0)
+        self.assertEqual(normalize_exchange_ts(1710000000000), 1710000000000)
+
+    # -------------------------------------------------------------
+    # Test 15: config EXCLUDED_COINS Set type annotation
+    # -------------------------------------------------------------
+    def test_config_set_annotation(self):
+        import config
+        from typing import get_type_hints
+        hints = get_type_hints(config)
+        self.assertIn("EXCLUDED_COINS", hints)
 
 
 if __name__ == "__main__":
@@ -12772,10 +12791,8 @@ from __future__ import annotations
 import argparse
 import glob
 import hashlib
-import json
 import os
 import py_compile
-import subprocess
 import sys
 import unittest
 

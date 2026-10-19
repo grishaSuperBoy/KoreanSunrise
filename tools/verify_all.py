@@ -17,10 +17,8 @@ from __future__ import annotations
 import argparse
 import glob
 import hashlib
-import json
 import os
 import py_compile
-import subprocess
 import sys
 import unittest
 

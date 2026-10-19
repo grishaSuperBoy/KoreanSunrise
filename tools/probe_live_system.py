@@ -32,7 +32,6 @@ import os
 import shutil
 import sys
 import time
-import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -164,8 +163,6 @@ class SystemProbe:
             "bybit": {"ticks": 0, "crossed": 0, "zero_px": 0, "mult_errors": 0, "latencies": []},
             "okx": {"ticks": 0, "crossed": 0, "zero_px": 0, "mult_errors": 0, "latencies": []},
         }
-
-        now_base = time.time()
 
         def make_callback(venue_key: str):
             def _cb(snap: OrderBookDepth5):

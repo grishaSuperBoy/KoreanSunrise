@@ -22,7 +22,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 log = logging.getLogger("pipeline.pool_state")
 

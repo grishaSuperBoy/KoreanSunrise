@@ -13,7 +13,7 @@ def normalize_exchange_ts(raw_ts: Any) -> int:
     Supports nanoseconds (19 digits), microseconds (16 digits), milliseconds (13 digits),
     and seconds (10 digits integer or float). Returns 0 on None or invalid input.
     """
-    if raw_ts is None:
+    if raw_ts is None or isinstance(raw_ts, bool):
         return 0
     try:
         if isinstance(raw_ts, int):
