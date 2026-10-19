@@ -12,8 +12,8 @@ import os
 import threading
 import time
 from collections import defaultdict, deque
-from dataclasses import asdict
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+from dataclasses import asdict, dataclass
+from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 
 import config as C
 from models import OrderBookDepth5, SunriseSignal
@@ -35,8 +35,86 @@ def _base(symbol: str) -> str:
     return s
 
 
+@dataclass(slots=True)
+class UpbitNormState:
+    """EWMA normalized depth, spread, and top-level liquidity for Upbit spot."""
+    depth_ask: float
+    best_ask_usd: float
+    spread_bps: float
+    t: float
+
+    def __getitem__(self, key: str) -> float:
+        return getattr(self, key)
+
+    def __setitem__(self, key: str, value: float) -> None:
+        setattr(self, key, value)
+
+
+def evaluate_exit_reason(
+    cur_net_pnl: float,
+    net_exec_edge_bps: float,
+    rem_edge: float,
+    dt: float,
+    hold_sec: float,
+    pair_decay_sec: float,
+    sigma: float,
+    upbit_drop_bps: float,
+    cur_dislocation_bps: float,
+    stop_invalidation_bps: float,
+    stop_adverse_pnl_bps: float,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Pure mathematical evaluator for signal exit and stop-loss conditions in strict priority:
+    1. Take-Profit: 75% net edge captured or basis fully absorbed in profit.
+    2. Model A: Microstructure Invalidation Stop.
+    3. Model B: Hard Adverse PnL Drawdown Stop.
+    4. Model C: Alpha Decay Timeout Stop.
+    5. Max Hold Horizon Timeout.
+    Returns (close_reason, stop_type).
+    """
+    # 1. Normal Take-Profit / Edge Absorption
+    if cur_net_pnl >= (net_exec_edge_bps * 0.75) and cur_net_pnl > 0.0:
+        return "converged", None
+    if rem_edge <= 0.0 and cur_net_pnl > 0.0:
+        return "converged", None
+
+    # 2. Model A: Microstructure Invalidation Stop
+    if upbit_drop_bps >= (1.5 * sigma) or cur_dislocation_bps <= -stop_invalidation_bps:
+        return "stop_invalidation", "invalidation"
+
+    # 3. Model B: Hard Adverse PnL Drawdown Stop
+    adverse_limit = max(stop_adverse_pnl_bps, 2.5 * sigma)
+    if cur_net_pnl <= -adverse_limit:
+        return "stop_adverse_pnl", "adverse_pnl"
+
+    # 4. Model C: Alpha Decay Timeout Stop
+    if dt >= pair_decay_sec and cur_net_pnl <= 0.0:
+        return "stop_decay", "alpha_decay"
+
+    # 5. Max Hold Horizon Timeout
+    if dt >= hold_sec:
+        return "timeout", None
+
+    return None, None
+
+
 class PairState:
     """State of an (Upbit, Follower) pair for a single coin."""
+
+    __slots__ = (
+        "coin",
+        "follower_ex",
+        "warmup_samples",
+        "spike_sigma",
+        "baseline_bps",
+        "n_obs",
+        "t_last",
+        "dev_window",
+        "dev_ts",
+        "cached_sigma",
+        "cached_sigma_ts",
+        "open_signal",
+    )
 
     def __init__(
         self,
@@ -163,6 +241,9 @@ class KoreanEngine:
         self._books: Dict[Tuple[str, str], OrderBookDepth5] = {}
         self._recv_ts: Dict[Tuple[str, str], float] = {}
 
+        # O(1) follower lookup index: coin -> set of follower exchanges
+        self._coin_followers: Dict[str, Set[str]] = defaultdict(set)
+
         # Upbit recent taker buys: coin -> deque of (ts, trade_usd)
         self._buys_lock = threading.Lock()
         self._upbit_recent_buys: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=200))
@@ -272,6 +353,7 @@ class KoreanEngine:
             self._update_upbit_norm(coin, snap, now)
             self._track_active_signals_for_coin(coin, now)
         else:
+            self._coin_followers[coin].add(ex)
             self.counters["ticks_followers"] += 1
             upbit_snap = self._books.get(("upbit", coin))
             if upbit_snap is not None and (now - self._recv_ts.get(("upbit", coin), 0.0)) <= 15.0:
@@ -321,25 +403,33 @@ class KoreanEngine:
         cur_spread = snap.spread_bps
 
         if nrm is None:
-            self._upbit_norm[coin] = {
-                "depth_ask": max(cur_depth, 100.0),
-                "best_ask_usd": max(cur_best_ask_usd, 50.0),
-                "spread_bps": max(cur_spread, 1.0),
-                "t": now,
-            }
+            self._upbit_norm[coin] = UpbitNormState(
+                depth_ask=max(cur_depth, 100.0),
+                best_ask_usd=max(cur_best_ask_usd, 50.0),
+                spread_bps=max(cur_spread, 1.0),
+                t=now,
+            )
             return
 
-        dt = max(0.0, now - nrm["t"])
-        nrm["t"] = now
+        if isinstance(nrm, dict):
+            nrm = self._upbit_norm[coin] = UpbitNormState(
+                depth_ask=float(nrm["depth_ask"]),
+                best_ask_usd=float(nrm["best_ask_usd"]),
+                spread_bps=float(nrm["spread_bps"]),
+                t=float(nrm["t"]),
+            )
+
+        dt = max(0.0, now - nrm.t)
+        nrm.t = now
         a = 1.0 - math.exp(-dt / NORM_TAU)
 
-        clamped_spread = min(cur_spread, nrm["spread_bps"] * 5.0)
-        clamped_depth = min(cur_depth, nrm["depth_ask"] * 5.0)
-        clamped_best_ask = min(cur_best_ask_usd, nrm["best_ask_usd"] * 5.0)
+        clamped_spread = min(cur_spread, nrm.spread_bps * 5.0)
+        clamped_depth = min(cur_depth, nrm.depth_ask * 5.0)
+        clamped_best_ask = min(cur_best_ask_usd, nrm.best_ask_usd * 5.0)
 
-        nrm["depth_ask"] = max((1.0 - a) * nrm["depth_ask"] + a * clamped_depth, 100.0)
-        nrm["best_ask_usd"] = max((1.0 - a) * nrm["best_ask_usd"] + a * clamped_best_ask, 50.0)
-        nrm["spread_bps"] = max((1.0 - a) * nrm["spread_bps"] + a * clamped_spread, 0.5)
+        nrm.depth_ask = max((1.0 - a) * nrm.depth_ask + a * clamped_depth, 100.0)
+        nrm.best_ask_usd = max((1.0 - a) * nrm.best_ask_usd + a * clamped_best_ask, 50.0)
+        nrm.spread_bps = max((1.0 - a) * nrm.spread_bps + a * clamped_spread, 0.5)
 
     # ----------------------------------------------------------- Signal Logic
     def _eval_lead_lag(
@@ -433,7 +523,12 @@ class KoreanEngine:
                     swept_usd = 0.0
                     drain_ratio = 0.0
 
-        follower_exchanges = [ex for (ex, c) in self._books.keys() if ex != "upbit" and c == coin]
+        follower_exchanges = self._coin_followers.get(coin)
+        if not follower_exchanges:
+            follower_exchanges = {ex for (ex, c) in self._books.keys() if ex != "upbit" and c == coin}
+            if follower_exchanges:
+                self._coin_followers[coin] = follower_exchanges
+
         for follower_ex in follower_exchanges:
             f_snap = self._books.get((follower_ex, coin))
             f_recv = self._recv_ts.get((follower_ex, coin), 0.0)
@@ -718,54 +813,34 @@ class KoreanEngine:
             pair_decay_sec = float(pair_cfg.get("alpha_decay_sec", self.alpha_decay_sec))
             sigma = max(sig.pair_sigma_bps, 2.0)
 
-            # --- 1. Normal Take-Profit / Edge Absorption ---
-            # If follower moved profitably and captured 75% of net edge, or basis fully converged in profit
-            if cur_net_pnl >= (sig.net_exec_edge_bps * 0.75) and cur_net_pnl > 0.0:
-                self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
-                continue
-            elif rem_edge <= 0.0 and cur_net_pnl > 0.0:
-                self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
-                continue
-
-            # --- 2. Model A: Microstructure Invalidation Stop ---
-            # Triggers if the Upbit leader pump breaks down (Upbit mid drops >= 1.5*sigma below entry
-            # or cross-venue basis dislocates negatively beyond invalidation tolerance)
             upbit_drop_bps = (
                 (sig.leader_mid - upbit_snap.mid_price) / sig.leader_mid * 1e4
                 if sig.leader_mid > 0
                 else 0.0
             )
             cur_dislocation_bps = cur_diff_bps - sig.kimchi_baseline_bps
-            if upbit_drop_bps >= (1.5 * sigma) or cur_dislocation_bps <= -self.stop_invalidation_bps:
-                sig.stop_hit = True
-                sig.stop_type = "invalidation"
-                sig.stop_loss_bps = round(abs(min(0.0, cur_net_pnl)), 2)
-                self._close_signal(sig, now, "stop_invalidation", f_mid_move, f_exec_move)
-                continue
 
-            # --- 3. Model B: Hard Adverse PnL Drawdown Stop ---
-            # Triggers if follower order book experiences violent adverse excursion
-            adverse_limit = max(self.stop_adverse_pnl_bps, 2.5 * sigma)
-            if cur_net_pnl <= -adverse_limit:
-                sig.stop_hit = True
-                sig.stop_type = "adverse_pnl"
-                sig.stop_loss_bps = round(abs(cur_net_pnl), 2)
-                self._close_signal(sig, now, "stop_adverse_pnl", f_mid_move, f_exec_move)
-                continue
+            close_reason, stop_type = evaluate_exit_reason(
+                cur_net_pnl=cur_net_pnl,
+                net_exec_edge_bps=sig.net_exec_edge_bps,
+                rem_edge=rem_edge,
+                dt=dt,
+                hold_sec=hold_sec,
+                pair_decay_sec=pair_decay_sec,
+                sigma=sigma,
+                upbit_drop_bps=upbit_drop_bps,
+                cur_dislocation_bps=cur_dislocation_bps,
+                stop_invalidation_bps=self.stop_invalidation_bps,
+                stop_adverse_pnl_bps=self.stop_adverse_pnl_bps,
+            )
 
-            # --- 4. Model C: Alpha Decay Timeout Stop ---
-            # If transmission window elapsed (dt >= pair_decay_sec) and net PnL is still non-positive,
-            # alpha has decayed -> exit to avoid adverse toxic drift
-            if dt >= pair_decay_sec and cur_net_pnl <= 0.0:
-                sig.stop_hit = True
-                sig.stop_type = "alpha_decay"
-                sig.stop_loss_bps = round(abs(cur_net_pnl), 2)
-                self._close_signal(sig, now, "stop_decay", f_mid_move, f_exec_move)
-                continue
-
-            # --- 5. Max Hold Horizon Timeout ---
-            if dt >= hold_sec:
-                self._close_signal(sig, now, "timeout", f_mid_move, f_exec_move)
+            if close_reason is not None:
+                if stop_type is not None:
+                    sig.stop_hit = True
+                    sig.stop_type = stop_type
+                    loss = abs(min(0.0, cur_net_pnl)) if stop_type == "invalidation" else abs(cur_net_pnl)
+                    sig.stop_loss_bps = round(loss, 2)
+                self._close_signal(sig, now, close_reason, f_mid_move, f_exec_move)
                 continue
 
     def _close_signal(

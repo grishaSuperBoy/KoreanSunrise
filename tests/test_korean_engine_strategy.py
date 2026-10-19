@@ -21,7 +21,7 @@ import time
 from typing import List, Dict, Any
 
 from models import OrderBookDepth5, SunriseSignal
-from korean_engine import KoreanEngine, PairState
+from korean_engine import KoreanEngine, PairState, UpbitNormState, evaluate_exit_reason
 
 
 class TestKoreanEngineStrategy(unittest.TestCase):
@@ -678,6 +678,106 @@ class TestKoreanEngineStrategy(unittest.TestCase):
         # Must be rejected because pair was pruned/disabled in portfolio thresholds
         self.assertIsNone(st.open_signal)
         self.assertEqual(len(self.engine._active_signals.get(coin, [])), 0)
+
+    # -------------------------------------------------------------------------
+    # 12. Pure Exit Evaluator Parametric Verification
+    # -------------------------------------------------------------------------
+    def test_evaluate_exit_reason_pure_function(self):
+        # 1. Take-Profit: 75% edge
+        reason, stype = evaluate_exit_reason(
+            cur_net_pnl=30.0, net_exec_edge_bps=40.0, rem_edge=10.0,
+            dt=2.0, hold_sec=15.0, pair_decay_sec=8.0, sigma=3.0,
+            upbit_drop_bps=0.0, cur_dislocation_bps=20.0,
+            stop_invalidation_bps=15.0, stop_adverse_pnl_bps=35.0,
+        )
+        self.assertEqual(reason, "converged")
+        self.assertIsNone(stype)
+
+        # 2. Take-Profit: basis fully absorbed in profit
+        reason, stype = evaluate_exit_reason(
+            cur_net_pnl=15.0, net_exec_edge_bps=40.0, rem_edge=-2.0,
+            dt=2.0, hold_sec=15.0, pair_decay_sec=8.0, sigma=3.0,
+            upbit_drop_bps=0.0, cur_dislocation_bps=-5.0,
+            stop_invalidation_bps=15.0, stop_adverse_pnl_bps=35.0,
+        )
+        self.assertEqual(reason, "converged")
+        self.assertIsNone(stype)
+
+        # 3. Model A Invalidation: Upbit dump >= 1.5 * sigma (4.5 bps)
+        reason, stype = evaluate_exit_reason(
+            cur_net_pnl=-5.0, net_exec_edge_bps=40.0, rem_edge=20.0,
+            dt=2.0, hold_sec=15.0, pair_decay_sec=8.0, sigma=3.0,
+            upbit_drop_bps=5.0, cur_dislocation_bps=10.0,
+            stop_invalidation_bps=15.0, stop_adverse_pnl_bps=35.0,
+        )
+        self.assertEqual(reason, "stop_invalidation")
+        self.assertEqual(stype, "invalidation")
+
+        # 4. Model A Invalidation: dislocation <= -stop_invalidation_bps (-15.0 bps)
+        reason, stype = evaluate_exit_reason(
+            cur_net_pnl=-5.0, net_exec_edge_bps=40.0, rem_edge=0.0,
+            dt=2.0, hold_sec=15.0, pair_decay_sec=8.0, sigma=3.0,
+            upbit_drop_bps=0.0, cur_dislocation_bps=-16.0,
+            stop_invalidation_bps=15.0, stop_adverse_pnl_bps=35.0,
+        )
+        self.assertEqual(reason, "stop_invalidation")
+        self.assertEqual(stype, "invalidation")
+
+        # 5. Model B Adverse PnL: cur_net_pnl <= -35.0 bps
+        reason, stype = evaluate_exit_reason(
+            cur_net_pnl=-36.0, net_exec_edge_bps=40.0, rem_edge=20.0,
+            dt=2.0, hold_sec=15.0, pair_decay_sec=8.0, sigma=3.0,
+            upbit_drop_bps=0.0, cur_dislocation_bps=10.0,
+            stop_invalidation_bps=15.0, stop_adverse_pnl_bps=35.0,
+        )
+        self.assertEqual(reason, "stop_adverse_pnl")
+        self.assertEqual(stype, "adverse_pnl")
+
+        # 6. Model C Alpha Decay: dt >= 8.0s and PnL <= 0
+        reason, stype = evaluate_exit_reason(
+            cur_net_pnl=-2.0, net_exec_edge_bps=40.0, rem_edge=10.0,
+            dt=8.5, hold_sec=15.0, pair_decay_sec=8.0, sigma=3.0,
+            upbit_drop_bps=0.0, cur_dislocation_bps=10.0,
+            stop_invalidation_bps=15.0, stop_adverse_pnl_bps=35.0,
+        )
+        self.assertEqual(reason, "stop_decay")
+        self.assertEqual(stype, "alpha_decay")
+
+        # 7. Max Hold Horizon: dt >= 15.0s
+        reason, stype = evaluate_exit_reason(
+            cur_net_pnl=5.0, net_exec_edge_bps=40.0, rem_edge=10.0,
+            dt=15.5, hold_sec=15.0, pair_decay_sec=8.0, sigma=3.0,
+            upbit_drop_bps=0.0, cur_dislocation_bps=10.0,
+            stop_invalidation_bps=15.0, stop_adverse_pnl_bps=35.0,
+        )
+        self.assertEqual(reason, "timeout")
+        self.assertIsNone(stype)
+
+        # 8. Normal open state: no exit
+        reason, stype = evaluate_exit_reason(
+            cur_net_pnl=5.0, net_exec_edge_bps=40.0, rem_edge=10.0,
+            dt=3.0, hold_sec=15.0, pair_decay_sec=8.0, sigma=3.0,
+            upbit_drop_bps=0.0, cur_dislocation_bps=10.0,
+            stop_invalidation_bps=15.0, stop_adverse_pnl_bps=35.0,
+        )
+        self.assertIsNone(reason)
+        self.assertIsNone(stype)
+
+    # -------------------------------------------------------------------------
+    # 13. UpbitNormState Slots and Dict Compatibility
+    # -------------------------------------------------------------------------
+    def test_upbit_norm_state_slots_and_dict_compatibility(self):
+        norm = UpbitNormState(depth_ask=1200.0, best_ask_usd=300.0, spread_bps=4.5, t=100.0)
+        # Attribute access
+        self.assertEqual(norm.depth_ask, 1200.0)
+        self.assertEqual(norm.best_ask_usd, 300.0)
+        self.assertEqual(norm.spread_bps, 4.5)
+        self.assertEqual(norm.t, 100.0)
+
+        # Dict-like __getitem__ and __setitem__ compatibility
+        self.assertEqual(norm["depth_ask"], 1200.0)
+        norm["depth_ask"] = 1500.0
+        self.assertEqual(norm.depth_ask, 1500.0)
 
 
 if __name__ == "__main__":
