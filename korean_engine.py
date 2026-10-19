@@ -353,6 +353,14 @@ class KoreanEngine:
         if not nrm or prev_upbit_snap is None:
             return
 
+        if (
+            upbit_snap.best_ask <= 0
+            or upbit_snap.best_bid <= 0
+            or prev_upbit_snap.best_ask <= 0
+            or prev_upbit_snap.best_bid <= 0
+        ):
+            return
+
         norm_depth = nrm["depth_ask"]
         norm_best_ask_usd = nrm["best_ask_usd"]
         norm_spread = nrm["spread_bps"]
@@ -661,13 +669,21 @@ class KoreanEngine:
             dt = round(now - sig.open_ts, 3)
 
             # 1. Mid-to-Mid move on follower and leader (bps)
-            f_mid_move = (f_snap.mid_price - sig.follower_mid) / sig.follower_mid * 1e4
-            up_mid_move = (upbit_snap.mid_price - sig.leader_mid) / sig.leader_mid * 1e4
+            f_mid_move = (
+                (f_snap.mid_price - sig.follower_mid) / sig.follower_mid * 1e4
+                if sig.follower_mid > 0
+                else 0.0
+            )
+            up_mid_move = (
+                (upbit_snap.mid_price - sig.leader_mid) / sig.leader_mid * 1e4
+                if sig.leader_mid > 0
+                else 0.0
+            )
 
             # 2. True executable move on follower: Entry at VWAP ask -> Exit at current VWAP bid (bps)
             entry_px = getattr(sig, "follower_entry_px", 0.0) or sig.follower_best_ask
             exit_px = f_snap.vwap_bid_usd(sig.suggested_size_usd) if sig.suggested_size_usd > 0 else f_snap.best_bid
-            f_exec_move = (exit_px - entry_px) / entry_px * 1e4
+            f_exec_move = (exit_px - entry_px) / entry_px * 1e4 if entry_px > 0 else 0.0
             cur_net_pnl = round(f_exec_move - self.roundtrip_fee_bps, 2)
 
             # 3. Update MFE / MAE excursion metrics
@@ -680,7 +696,11 @@ class KoreanEngine:
                 sig.mfe_mid_move_bps = round(f_mid_move, 2)
 
             # 4. Remaining dislocation edge
-            cur_diff_bps = (upbit_snap.mid_price - f_snap.mid_price) / f_snap.mid_price * 1e4
+            cur_diff_bps = (
+                (upbit_snap.mid_price - f_snap.mid_price) / f_snap.mid_price * 1e4
+                if f_snap.mid_price > 0
+                else 0.0
+            )
             rem_edge = (cur_diff_bps - sig.kimchi_baseline_bps) - self.taker_fee_bps
 
             if not sig.path or dt > sig.path[-1][0]:
@@ -698,10 +718,23 @@ class KoreanEngine:
             pair_decay_sec = float(pair_cfg.get("alpha_decay_sec", self.alpha_decay_sec))
             sigma = max(sig.pair_sigma_bps, 2.0)
 
-            # --- Model A: Microstructure Invalidation Stop ---
+            # --- 1. Normal Take-Profit / Edge Absorption ---
+            # If follower moved profitably and captured 75% of net edge, or basis fully converged in profit
+            if cur_net_pnl >= (sig.net_exec_edge_bps * 0.75) and cur_net_pnl > 0.0:
+                self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
+                continue
+            elif rem_edge <= 0.0 and cur_net_pnl > 0.0:
+                self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
+                continue
+
+            # --- 2. Model A: Microstructure Invalidation Stop ---
             # Triggers if the Upbit leader pump breaks down (Upbit mid drops >= 1.5*sigma below entry
             # or cross-venue basis dislocates negatively beyond invalidation tolerance)
-            upbit_drop_bps = (sig.leader_mid - upbit_snap.mid_price) / sig.leader_mid * 1e4
+            upbit_drop_bps = (
+                (sig.leader_mid - upbit_snap.mid_price) / sig.leader_mid * 1e4
+                if sig.leader_mid > 0
+                else 0.0
+            )
             cur_dislocation_bps = cur_diff_bps - sig.kimchi_baseline_bps
             if upbit_drop_bps >= (1.5 * sigma) or cur_dislocation_bps <= -self.stop_invalidation_bps:
                 sig.stop_hit = True
@@ -710,7 +743,7 @@ class KoreanEngine:
                 self._close_signal(sig, now, "stop_invalidation", f_mid_move, f_exec_move)
                 continue
 
-            # --- Model B: Hard Adverse PnL Drawdown Stop ---
+            # --- 3. Model B: Hard Adverse PnL Drawdown Stop ---
             # Triggers if follower order book experiences violent adverse excursion
             adverse_limit = max(self.stop_adverse_pnl_bps, 2.5 * sigma)
             if cur_net_pnl <= -adverse_limit:
@@ -720,7 +753,7 @@ class KoreanEngine:
                 self._close_signal(sig, now, "stop_adverse_pnl", f_mid_move, f_exec_move)
                 continue
 
-            # --- Model C: Alpha Decay Timeout Stop ---
+            # --- 4. Model C: Alpha Decay Timeout Stop ---
             # If transmission window elapsed (dt >= pair_decay_sec) and net PnL is still non-positive,
             # alpha has decayed -> exit to avoid adverse toxic drift
             if dt >= pair_decay_sec and cur_net_pnl <= 0.0:
@@ -730,13 +763,10 @@ class KoreanEngine:
                 self._close_signal(sig, now, "stop_decay", f_mid_move, f_exec_move)
                 continue
 
-            # --- Normal Take-Profit / Edge Absorption ---
-            if cur_net_pnl >= (sig.net_exec_edge_bps * 0.75) and cur_net_pnl > 0.0:
-                self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
-            elif rem_edge <= 0.0 and cur_net_pnl > 0.0:
-                self._close_signal(sig, now, "converged", f_mid_move, f_exec_move)
-            elif dt >= hold_sec:
+            # --- 5. Max Hold Horizon Timeout ---
+            if dt >= hold_sec:
                 self._close_signal(sig, now, "timeout", f_mid_move, f_exec_move)
+                continue
 
     def _close_signal(
         self,
@@ -791,10 +821,14 @@ class KoreanEngine:
                 if not sig.closed and (now - sig.open_ts) >= hold_sec:
                     f_snap = self._books.get((sig.follower_exchange, coin))
                     if f_snap:
-                        f_mid_move = (f_snap.mid_price - sig.follower_mid) / sig.follower_mid * 1e4
+                        f_mid_move = (
+                            (f_snap.mid_price - sig.follower_mid) / sig.follower_mid * 1e4
+                            if sig.follower_mid > 0
+                            else 0.0
+                        )
                         entry_px = getattr(sig, "follower_entry_px", 0.0) or sig.follower_best_ask
                         exit_px = f_snap.vwap_bid_usd(sig.suggested_size_usd) if sig.suggested_size_usd > 0 else f_snap.best_bid
-                        f_exec_move = (exit_px - entry_px) / entry_px * 1e4
+                        f_exec_move = (exit_px - entry_px) / entry_px * 1e4 if entry_px > 0 else 0.0
                     else:
                         f_mid_move = 0.0
                         f_exec_move = 0.0
