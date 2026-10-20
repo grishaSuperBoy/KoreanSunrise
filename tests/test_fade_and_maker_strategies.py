@@ -457,6 +457,85 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
             finally:
                 fdr.DATA_ROOT, fdr.REPORTS_DIR = old_data, old_rep
 
+    # -------------------------------------------------------------------------
+    # 5. Physics Calibration & Anti-Machinegun Verification Tests
+    # -------------------------------------------------------------------------
+    def test_fade_filters_reject_large_sweeps_and_tight_spreads(self):
+        """Microstructure rule: Only micro-sweeps on wide spreads are fakeouts. Majors are rejected."""
+        # 1. Large sweep ($10,000 / $33,000 like FIL or DOT) must NEVER be faded
+        is_fake, _ = self.fade_strat.is_fakeout_pattern(
+            is_cancel_blocked=True,
+            swept_usd=10000.0,
+            upbit_spread_bps=50.0,
+        )
+        self.assertFalse(is_fake)
+
+        # 2. Tight spread (< 35 bps) on liquid majors must NEVER be faded
+        is_fake, _ = self.fade_strat.is_fakeout_pattern(
+            is_cancel_blocked=True,
+            swept_usd=1000.0,
+            upbit_spread_bps=15.0,
+        )
+        self.assertFalse(is_fake)
+
+        # 3. Genuine micro-sweep on illiquid gap qualifies
+        is_fake, reason = self.fade_strat.is_fakeout_pattern(
+            is_cancel_blocked=False,
+            swept_usd=1200.0,
+            upbit_spread_bps=55.0,
+        )
+        self.assertTrue(is_fake)
+        self.assertEqual(reason, "micro_sweep_exhaustion")
+
+    def test_fade_cooldown_and_thick_depth_guard(self):
+        """Guard against machine-gun spam and liquid venue thick order books."""
+        now = time.time()
+        coin = "TREE"
+        upbit_snap = make_snap("upbit", coin, [(0.10, 1000.0)], [(0.101, 500.0)], now)
+
+        # 1. Thick follower depth ($25,000) is rejected
+        f_thick = make_snap("binance", coin, [(0.10, 250000.0)], [(0.1005, 250000.0)], now, "TREEUSDT")
+        opened_thick = self.fade_strat.on_fakeout_detected(
+            coin=coin, trigger_type="depth_drain", swept_usd=1000.0,
+            upbit_snap=upbit_snap, follower_snaps={"binance": f_thick}, now=now,
+            fade_reason="micro_sweep_exhaustion"
+        )
+        self.assertEqual(len(opened_thick), 0)
+
+        # 2. Thin follower depth ($2,000) opens cleanly
+        f_thin = make_snap("binance", coin, [(0.10, 20000.0)], [(0.1005, 20000.0)], now, "TREEUSDT")
+        opened = self.fade_strat.on_fakeout_detected(
+            coin=coin, trigger_type="depth_drain", swept_usd=1000.0,
+            upbit_snap=upbit_snap, follower_snaps={"binance": f_thin}, now=now,
+            fade_reason="micro_sweep_exhaustion"
+        )
+        self.assertEqual(len(opened), 1)
+
+        # 3. Subsequent fade within cooldown (<30s) is blocked
+        opened_cooldown = self.fade_strat.on_fakeout_detected(
+            coin=coin, trigger_type="depth_drain", swept_usd=1000.0,
+            upbit_snap=upbit_snap, follower_snaps={"binance": f_thin}, now=now + 5.0,
+            fade_reason="micro_sweep_exhaustion"
+        )
+        self.assertEqual(len(opened_cooldown), 0)
+
+    def test_maker_void_rejects_toxic_dex_spreads(self):
+        """AsterDex / toxic DEX safeguard: spreads > max_spread_bps (120 bps) are rejected."""
+        now = time.time()
+        coin = "WAL"
+        # 250 bps synthetic spread on AsterDex
+        f_toxic = make_snap("asterdex", coin, [(1.00, 1000.0)], [(1.025, 1000.0)], now, "WALUSDT")
+
+        void = self.maker_strat.check_void_opportunity(
+            follower_ex="asterdex",
+            coin=coin,
+            f_snap=f_toxic,
+            upbit_snap=None,
+            now=now,
+            norm_spread_bps=20.0,
+        )
+        self.assertIsNone(void)
+
 
 if __name__ == "__main__":
     unittest.main()

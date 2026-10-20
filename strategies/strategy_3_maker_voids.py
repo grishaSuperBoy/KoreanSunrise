@@ -74,6 +74,7 @@ class MakerVoidStrategy:
         max_hold_sec: float = 10.0,
         stop_invalidation_bps: float = 15.0,
         stop_adverse_pnl_bps: float = 25.0,
+        max_spread_bps: float = 120.0,
     ):
         self.emit = emit_callback
         self.min_order_usd = min_order_usd
@@ -87,6 +88,7 @@ class MakerVoidStrategy:
         self.max_hold_sec = max_hold_sec
         self.stop_invalidation_bps = stop_invalidation_bps
         self.stop_adverse_pnl_bps = stop_adverse_pnl_bps
+        self.max_spread_bps = max_spread_bps
 
         # (follower_ex, coin, side) -> ActiveMakerVoid
         self._open_voids: Dict[Tuple[str, str, str], ActiveMakerVoid] = {}
@@ -121,6 +123,10 @@ class MakerVoidStrategy:
 
             # Spread must be blown out (>= 25 bps AND >= 1.4x baseline spread)
             if f_spread < max(self.min_spread_bps, norm_spread_bps * 1.4):
+                return None
+
+            # Toxic pool / broken book safety ceiling (reject DEX spreads > max_spread_bps)
+            if f_spread > self.max_spread_bps:
                 return None
 
             upbit_mid = float(getattr(upbit_snap, "mid_price", 0.0) or 0.0) if upbit_snap else 0.0

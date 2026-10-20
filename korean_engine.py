@@ -165,6 +165,10 @@ class KoreanEngine:
             min_order_usd=self.min_order_usd,
             max_position_budget_usd=self.max_position_budget_usd,
             stealth_depth_fraction=self.stealth_fraction,
+            max_fade_swept_usd=getattr(C, "MAX_FADE_SWEPT_USD", 2000.0),
+            min_upbit_spread_bps=getattr(C, "MIN_FADE_SPREAD_BPS", 35.0),
+            max_follower_depth_usd=getattr(C, "MAX_FADE_FOLLOWER_DEPTH_USD", 3500.0),
+            cooldown_sec=getattr(C, "FADE_COOLDOWN_SEC", 30.0),
         )
 
         # Strategy 3: Maker Liquidity Harvesting (Passive Maker Post-Only on Widened Spreads)
@@ -174,6 +178,7 @@ class KoreanEngine:
             max_position_budget_usd=self.max_position_budget_usd,
             stealth_depth_fraction=self.stealth_fraction,
             taker_fee_bps=self.taker_fee_bps,
+            max_spread_bps=getattr(C, "MAX_MAKER_SPREAD_BPS", 120.0),
         )
 
         # Pair-specific calibrated execution thresholds

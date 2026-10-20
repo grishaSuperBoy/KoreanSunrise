@@ -68,12 +68,16 @@ class FadeFakeoutStrategy:
         min_order_usd: float = 10.0,
         max_position_budget_usd: float = 500.0,
         stealth_depth_fraction: float = 0.15,
-        max_hold_sec: float = 7.5,
+        max_hold_sec: float = 6.0,
         max_follower_book_age_sec: float = 1.5,
-        stop_invalidation_bps: float = 20.0,
-        target_fade_bps: float = 12.0,
-        min_conviction_usd: float = 3500.0,
-        max_upbit_spread_bps: float = 45.0,
+        stop_invalidation_bps: float = 30.0,
+        target_fade_bps: float = 15.0,
+        min_conviction_usd: float = 2500.0,
+        max_upbit_spread_bps: Optional[float] = None,
+        min_upbit_spread_bps: float = 35.0,
+        max_fade_swept_usd: float = 2500.0,
+        max_follower_depth_usd: float = 5000.0,
+        cooldown_sec: float = 30.0,
     ):
         self.emit = emit_callback
         self.roundtrip_fee_bps = roundtrip_fee_bps
@@ -85,9 +89,18 @@ class FadeFakeoutStrategy:
         self.stop_invalidation_bps = stop_invalidation_bps
         self.target_fade_bps = target_fade_bps
         self.min_conviction_usd = min_conviction_usd
-        self.max_upbit_spread_bps = max_upbit_spread_bps
+        self.max_fade_swept_usd = max_fade_swept_usd
+        self.max_follower_depth_usd = max_follower_depth_usd
+        self.cooldown_sec = cooldown_sec
+
+        if max_upbit_spread_bps is not None:
+            self.min_upbit_spread_bps = max_upbit_spread_bps
+        else:
+            self.min_upbit_spread_bps = min_upbit_spread_bps
+        self.max_upbit_spread_bps = self.min_upbit_spread_bps
 
         self._active: Dict[str, List[ActiveFadePosition]] = {}
+        self._last_fade_ts: Dict[Tuple[str, str], float] = {}
         self._seq = itertools.count(1)
         self._lock = threading.RLock()
         self.counters = {
@@ -106,15 +119,22 @@ class FadeFakeoutStrategy:
     ) -> Tuple[bool, str]:
         """
         Detects if an observed Upbit sweep event fits the fakeout pattern.
-        Evaluates instantaneous Upbit spread (not EWMA) against max_upbit_spread_bps.
+        Microstructure Rules:
+        1. Swept USD must be a micro-sweep (<= max_fade_swept_usd). NEVER fade large sweeps!
+        2. Upbit spread must be wide (>= min_upbit_spread_bps), indicating an illiquid gap.
+        3. Separates true MM quote cancellations from retail exhaustion.
         """
+        # Hard gate: volume ceiling. Large sweeps are momentum, not fakeouts.
+        if swept_usd > self.max_fade_swept_usd or swept_usd <= 0.0:
+            return False, ""
+
+        # Hard gate: spread floor. Tight spreads indicate liquid majors, not illiquid alts.
+        if upbit_spread_bps < self.min_upbit_spread_bps:
+            return False, ""
+
         if is_cancel_blocked:
             return True, "mm_quote_cancel"
-        if swept_usd < self.min_conviction_usd:
-            return True, "micro_sweep_exhaustion"
-        if upbit_spread_bps >= self.max_upbit_spread_bps:
-            return True, "wide_spread_liquidity_gap"
-        return False, ""
+        return True, "micro_sweep_exhaustion"
 
     def on_fakeout_detected(
         self,
@@ -141,13 +161,18 @@ class FadeFakeoutStrategy:
                 if follower_ex == "upbit" or f_snap is None:
                     continue
 
-                # 1. Staleness Guard: book must be fresh (< max_follower_book_age_sec)
+                # 1. Cooldown Guard: at least cooldown_sec between fades on same (coin, follower_ex)
+                pair_key = (coin, follower_ex)
+                if (now - self._last_fade_ts.get(pair_key, 0.0)) < self.cooldown_sec:
+                    continue
+
+                # 2. Staleness Guard: book must be fresh (< max_follower_book_age_sec)
                 if recv_ts_map:
                     f_recv = recv_ts_map.get((follower_ex, coin), 0.0)
                     if (now - f_recv) > self.max_follower_book_age_sec:
                         continue
 
-                # 2. Stability Guard: only fade when pre-existing pair baseline is stable
+                # 3. Stability Guard: only fade when pre-existing pair baseline is stable
                 if is_stable_pair_fn and not is_stable_pair_fn(coin, follower_ex, now):
                     continue
 
@@ -162,7 +187,11 @@ class FadeFakeoutStrategy:
                 if existing:
                     continue
 
+                # 4. Thin Depth Guard: Follower book must be illiquid (top3 depth <= max_follower_depth_usd)
                 top3_bid_usd = float(f_snap.top_n_bid_depth_usd(3) if hasattr(f_snap, "top_n_bid_depth_usd") else 0.0)
+                if top3_bid_usd > self.max_follower_depth_usd:
+                    continue
+
                 stealth_size = min(self.max_position_budget_usd, round(top3_bid_usd * self.stealth_depth_fraction, 2))
                 if stealth_size < self.min_order_usd:
                     continue
@@ -197,6 +226,7 @@ class FadeFakeoutStrategy:
                 if coin not in self._active:
                     self._active[coin] = []
                 self._active[coin].append(pos)
+                self._last_fade_ts[pair_key] = now
                 opened.append(pos)
                 self.counters["fade_signals_triggered"] += 1
                 log.info(
@@ -257,8 +287,8 @@ class FadeFakeoutStrategy:
                 if net_pnl_bps >= pos.target_fade_bps or (lead_move <= -15.0 and net_pnl_bps > 0.0):
                     close_reason = "converged"
                     self.counters["fade_signals_converged"] += 1
-                # 2. Invalidation Stop: follower price moved up against our short by >= stop_invalidation_bps
-                elif foll_move >= pos.stop_invalidation_bps or net_pnl_bps <= -pos.stop_invalidation_bps:
+                # 2. Invalidation Stop: follower price moved up against our short by >= stop_invalidation_bps or severe drawdown
+                elif foll_move >= pos.stop_invalidation_bps or net_pnl_bps <= -max(pos.stop_invalidation_bps + pos.roundtrip_fee_bps + 15.0, 45.0):
                     close_reason = "stop_invalidation"
                     self.counters["fade_signals_stopped"] += 1
                 # 3. Timeout / Decay

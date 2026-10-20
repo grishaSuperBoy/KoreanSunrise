@@ -60,6 +60,15 @@ STOP_INVALIDATION_BPS = 15.0    # Model A: Microstructure invalidation tolerance
 STOP_ADVERSE_PNL_BPS = 35.0     # Model B: Hard adverse PnL drawdown stop (bps)
 ALPHA_DECAY_SEC = 15.0          # Model C: Alpha decay timeout if PnL <= 0 (fallback if not in matrix)
 
+# Strategy 2: Fade the Fakeout (Short on Micro-Sweeps & Gaps)
+MAX_FADE_SWEPT_USD = float(os.getenv("MAX_FADE_SWEPT_USD", "2000.0"))        # Max Upbit sweep volume ($2,000) to consider a micro-sweep
+MIN_FADE_SPREAD_BPS = float(os.getenv("MIN_FADE_SPREAD_BPS", "35.0"))        # Min Upbit spread (35 bps) to confirm an illiquid gap
+MAX_FADE_FOLLOWER_DEPTH_USD = float(os.getenv("MAX_FADE_FOLLOWER_DEPTH_USD", "3500.0")) # Max follower depth ($3,500) to ensure thin book
+FADE_COOLDOWN_SEC = float(os.getenv("FADE_COOLDOWN_SEC", "30.0"))            # Anti-machinegun cooldown per pair (sec)
+
+# Strategy 3: Maker Liquidity Harvesting
+MAX_MAKER_SPREAD_BPS = float(os.getenv("MAX_MAKER_SPREAD_BPS", "120.0"))     # Max spread ceiling to reject toxic/dead DEX pools
+
 ALL_SUPPORTED_VENUES = [
     "binance",
     "bybit",
