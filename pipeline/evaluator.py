@@ -81,6 +81,11 @@ class CoinSignalAccumulator:
         self.total_signals: int = 0
 
     def add_signal(self, row: Dict[str, Any]) -> None:
+        # Only evaluate Strategy 1 (Lead-Lag Sweep) for Upbit Sweep Battle Pool promotion
+        strat = row.get("strategy")
+        if strat and strat != "lead_lag":
+            return
+
         self.total_signals += 1
 
         follower_ex = str(row.get("follower_exchange", "")).lower()

@@ -274,6 +274,8 @@ class SunriseSignal:
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
+        # Explicit strategy tag for multi-strategy reporting and analytics
+        d["strategy"] = "lead_lag"
         # Compatibility aliases required by validate_data.py & analytical tools
         d["dislocation_bps"] = self.raw_dislocation_bps
         d["entry_ts"] = self.open_ts

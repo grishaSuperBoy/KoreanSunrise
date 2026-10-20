@@ -22,7 +22,7 @@ import urllib.parse
 import zipfile
 from typing import Any, Dict, List, Optional, Tuple
 
-from web.reports_manager import list_available_reports, get_report_content
+from web.reports_manager import list_available_reports, get_report_content, get_report_json
 from web.views import render_dashboard_html, render_login_html
 
 log = logging.getLogger("api_server")
@@ -266,10 +266,14 @@ class APIServer:
                     self._handle_thresholds()
                 elif path in ("/api/report", "/report"):
                     self._handle_reports_list()
+                elif path in ("/api/report/latest", "/report/latest"):
+                    self._handle_report_latest_json()
+                elif path in ("/api/report/json", "/report/json"):
+                    self._handle_report_json(q)
+                elif path in ("/api/report/content", "/api/report/markdown", "/report/markdown"):
+                    self._handle_report_content(q)
                 elif path in ("/api/benchmark", "/benchmark"):
                     self._handle_benchmark(q)
-                elif path == "/api/report/content":
-                    self._handle_report_content(q)
                 elif path == "/download":
                     self._handle_download(q)
                 else:
@@ -471,8 +475,23 @@ class APIServer:
             def _handle_reports_list(self) -> None:
                 self._send_json(list_available_reports())
 
+            def _handle_report_latest_json(self) -> None:
+                doc = get_report_json("latest")
+                if doc:
+                    self._send_json(doc)
+                else:
+                    self._send_json({"error": "No daily reports found"}, code=404)
+
+            def _handle_report_json(self, q: Dict[str, List[str]]) -> None:
+                rep_id = q.get("id", [""])[0] or q.get("date", [""])[0] or "latest"
+                doc = get_report_json(rep_id)
+                if doc:
+                    self._send_json(doc)
+                else:
+                    self._send_json({"error": f"Report '{rep_id}' not found"}, code=404)
+
             def _handle_report_content(self, q: Dict[str, List[str]]) -> None:
-                rep_id = q.get("id", [""])[0]
+                rep_id = q.get("id", [""])[0] or q.get("date", [""])[0] or "latest"
                 content = get_report_content(rep_id)
                 if content:
                     self._send_text(content)

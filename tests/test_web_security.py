@@ -258,6 +258,39 @@ class TestWebSecurity(unittest.TestCase):
         finally:
             server.stop()
 
+    def test_report_endpoints_multi_strategy(self) -> None:
+        """Verifies /api/report, /api/report/latest, and /api/report/content endpoints."""
+        # 1. /api/report returns report cards list
+        req = urllib.request.Request(
+            f"{self.base_url}/api/report",
+            headers={"Authorization": f"Bearer {self.token}"}
+        )
+        with urllib.request.urlopen(req) as resp:
+            self.assertEqual(resp.status, 200)
+            cards = json.loads(resp.read().decode("utf-8"))
+            self.assertIsInstance(cards, list)
+
+        # 2. /api/report/latest returns full JSON report doc
+        req_latest = urllib.request.Request(
+            f"{self.base_url}/api/report/latest",
+            headers={"Authorization": f"Bearer {self.token}"}
+        )
+        with urllib.request.urlopen(req_latest) as resp:
+            self.assertEqual(resp.status, 200)
+            doc = json.loads(resp.read().decode("utf-8"))
+            self.assertIn("metadata", doc)
+            self.assertIn("strategies_breakdown", doc)
+
+        # 3. /api/report/content?id=latest returns Markdown
+        req_md = urllib.request.Request(
+            f"{self.base_url}/api/report/content?id=latest",
+            headers={"Authorization": f"Bearer {self.token}"}
+        )
+        with urllib.request.urlopen(req_md) as resp:
+            self.assertEqual(resp.status, 200)
+            md_text = resp.read().decode("utf-8")
+            self.assertIn("# Korean Sunrise", md_text)
+
 
 if __name__ == "__main__":
     unittest.main()

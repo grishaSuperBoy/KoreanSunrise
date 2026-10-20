@@ -197,8 +197,10 @@ class KoreanSunriseService:
             f"[HEARTBEAT] KRW/USDT: {krw_rate:.1f} | "
             f"Pool: Inc {summary['incubator']} | Battle {summary['battle']} (Active: {summary['battle_active']}) | "
             f"Ticks: Up {c['ticks_upbit']} (Trades: {c.get('trades_upbit', 0)}) / Foll {c['ticks_followers']} | "
-            f"Cancels Blocked: {c.get('cancels_blocked', 0)} | "
-            f"Sigs: {c['signals_triggered']} (⚔️Battle: {c.get('signals_battle', 0)}, 🧪Inc: {c.get('signals_incubator', 0)}) | "
+            f"Cancels: {c.get('cancels_blocked', 0)} | "
+            f"S1(LeadLag): {c['signals_triggered']} (⚔️{c.get('signals_battle', 0)}/🧪{c.get('signals_incubator', 0)}) | "
+            f"S2(Fade): {c.get('fade_signals_triggered', 0)} (🎯{c.get('fade_signals_converged', 0)}) | "
+            f"S3(Maker): {c.get('maker_voids_triggered', 0)} (🧲{c.get('maker_voids_filled', 0)}) | "
             f"Streams: [{conn_str}]"
         )
 
