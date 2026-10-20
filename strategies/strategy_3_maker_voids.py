@@ -78,6 +78,7 @@ class MakerVoidStrategy:
         target_pnl_bps: float = 15.0,
         cooldown_sec: float = 30.0,
         allow_asterdex_maker: bool = False,
+        counters: Optional[Dict[str, int]] = None,
     ):
         self.emit = emit_callback
         self.min_order_usd = min_order_usd
@@ -101,13 +102,19 @@ class MakerVoidStrategy:
         self._last_void_ts: Dict[Tuple[str, str], float] = {}
         self._seq = itertools.count(1)
         self._lock = threading.RLock()
-        self.counters = {
+        default_counters = {
             "maker_voids_triggered": 0,
             "maker_voids_filled": 0,
             "maker_voids_restored": 0,
             "maker_voids_unfilled": 0,
             "maker_voids_stopped": 0,
         }
+        if counters is not None:
+            for k, v in default_counters.items():
+                counters.setdefault(k, v)
+            self.counters = counters
+        else:
+            self.counters = default_counters
 
     def check_void_opportunity(
         self,

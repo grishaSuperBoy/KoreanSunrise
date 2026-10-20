@@ -169,6 +169,7 @@ class KoreanEngine:
             min_upbit_spread_bps=getattr(C, "MIN_FADE_SPREAD_BPS", 35.0),
             max_follower_depth_usd=getattr(C, "MAX_FADE_FOLLOWER_DEPTH_USD", 3500.0),
             cooldown_sec=getattr(C, "FADE_COOLDOWN_SEC", 30.0),
+            counters=self.counters,
         )
 
         # Strategy 3: Maker Liquidity Harvesting (Passive Maker Post-Only on Widened Spreads)
@@ -180,6 +181,7 @@ class KoreanEngine:
             taker_fee_bps=self.taker_fee_bps,
             max_spread_bps=getattr(C, "MAX_MAKER_SPREAD_BPS", 120.0),
             allow_asterdex_maker=getattr(C, "ASTERDEX_MAKER_ENABLED", False),
+            counters=self.counters,
         )
 
         # Pair-specific calibrated execution thresholds
@@ -190,28 +192,7 @@ class KoreanEngine:
         self.reload_thresholds(force=True)
 
     def _on_strategy_emit(self, rec: Dict[str, Any]) -> None:
-        """Centralized telemetry accumulator for multi-strategy execution before routing to writer."""
-        strat = rec.get("strategy")
-        reason = str(rec.get("close_reason", ""))
-        if strat == "fade_fakeout":
-            self.counters["fade_signals_triggered"] = self.counters.get("fade_signals_triggered", 0) + 1
-            if reason == "target_fade_reached":
-                self.counters["fade_signals_converged"] = self.counters.get("fade_signals_converged", 0) + 1
-            elif "stop" in reason:
-                self.counters["fade_signals_stopped"] = self.counters.get("fade_signals_stopped", 0) + 1
-            elif "timeout" in reason:
-                self.counters["fade_signals_timeout"] = self.counters.get("fade_signals_timeout", 0) + 1
-        elif strat == "maker_void":
-            self.counters["maker_voids_triggered"] = self.counters.get("maker_voids_triggered", 0) + 1
-            if rec.get("maker_filled"):
-                self.counters["maker_voids_filled"] = self.counters.get("maker_voids_filled", 0) + 1
-            if reason == "spread_restored":
-                self.counters["maker_voids_restored"] = self.counters.get("maker_voids_restored", 0) + 1
-            elif "stop" in reason:
-                self.counters["maker_voids_stopped"] = self.counters.get("maker_voids_stopped", 0) + 1
-            elif "unfilled" in reason or "timeout" in reason:
-                self.counters["maker_voids_unfilled"] = self.counters.get("maker_voids_unfilled", 0) + 1
-
+        """Centralized emitter for multi-strategy execution before routing to writer callback."""
         try:
             self.emit(rec)
         except Exception as e:
@@ -495,7 +476,6 @@ class KoreanEngine:
                 is_cancel_blocked=is_cancel_blocked,
                 swept_usd=fade_swept,
                 upbit_spread_bps=cur_spread,
-                recent_buys_usd=recent_buys_usd,
             )
             if is_fake:
                 f_snaps = {f_ex: self._books.get((f_ex, coin)) for f_ex in follower_exchanges if self._books.get((f_ex, coin)) is not None}

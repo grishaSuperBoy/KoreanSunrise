@@ -72,12 +72,13 @@ class FadeFakeoutStrategy:
         max_follower_book_age_sec: float = 1.5,
         stop_invalidation_bps: float = 30.0,
         target_fade_bps: float = 15.0,
-        min_conviction_usd: float = 2500.0,
+        min_conviction_usd: Optional[float] = None,
         max_upbit_spread_bps: Optional[float] = None,
         min_upbit_spread_bps: float = 35.0,
-        max_fade_swept_usd: float = 2500.0,
-        max_follower_depth_usd: float = 5000.0,
+        max_fade_swept_usd: float = 2000.0,
+        max_follower_depth_usd: float = 3500.0,
         cooldown_sec: float = 30.0,
+        counters: Optional[Dict[str, int]] = None,
     ):
         self.emit = emit_callback
         self.roundtrip_fee_bps = roundtrip_fee_bps
@@ -103,19 +104,25 @@ class FadeFakeoutStrategy:
         self._last_fade_ts: Dict[Tuple[str, str], float] = {}
         self._seq = itertools.count(1)
         self._lock = threading.RLock()
-        self.counters = {
+        default_counters = {
             "fade_signals_triggered": 0,
             "fade_signals_converged": 0,
             "fade_signals_stopped": 0,
             "fade_signals_timeout": 0,
         }
+        if counters is not None:
+            for k, v in default_counters.items():
+                counters.setdefault(k, v)
+            self.counters = counters
+        else:
+            self.counters = default_counters
 
     def is_fakeout_pattern(
         self,
         is_cancel_blocked: bool,
         swept_usd: float,
         upbit_spread_bps: float,
-        recent_buys_usd: float = 0.0,
+        recent_buys_usd: Optional[float] = None,
     ) -> Tuple[bool, str]:
         """
         Detects if an observed Upbit sweep event fits the fakeout pattern.

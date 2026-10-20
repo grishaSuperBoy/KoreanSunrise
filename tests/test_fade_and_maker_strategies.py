@@ -61,7 +61,7 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
         coin = "GTC"
 
         upbit_snap = make_snap("upbit", "GTC", [(1.00, 1000.0)], [(1.006, 500.0)], now)
-        f_snap = make_snap("binance", "GTC", [(1.00, 5000.0)], [(1.0005, 5000.0)], now, "GTCUSDT")
+        f_snap = make_snap("binance", "GTC", [(1.00, 2000.0)], [(1.0005, 2000.0)], now, "GTCUSDT")
 
         opened = self.fade_strat.on_fakeout_detected(
             coin=coin,
@@ -80,7 +80,7 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
         self.assertEqual(pos.entry_px, 1.00)
 
         # Subsequent tick: Upbit mean-reverts down by 30 bps, follower price drops
-        f_snap2 = make_snap("binance", "GTC", [(0.997, 5000.0)], [(0.9975, 5000.0)], now + 1.0, "GTCUSDT")
+        f_snap2 = make_snap("binance", "GTC", [(0.997, 2000.0)], [(0.9975, 2000.0)], now + 1.0, "GTCUSDT")
 
         self.fade_strat.on_follower_tick(
             ex="binance",
@@ -254,7 +254,7 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
         now = time.time()
         coin = "GTC"
         upbit_snap = make_snap("upbit", "GTC", [(1.00, 1000.0)], [(1.006, 500.0)], now)
-        f_snap = make_snap("binance", "GTC", [(1.00, 5000.0)], [(1.0005, 5000.0)], now, "GTCUSDT")
+        f_snap = make_snap("binance", "GTC", [(1.00, 2000.0)], [(1.0005, 2000.0)], now, "GTCUSDT")
 
         # Stale follower quote (received 3.0s ago)
         opened_stale = self.fade_strat.on_fakeout_detected(
@@ -568,6 +568,71 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
         )
         self.assertIsNotNone(sig_tight)
         self.assertEqual(sig_tight.follower_exchange, "asterdex")
+
+    def test_strategy_counters_shared_and_no_double_counting(self):
+        shared_counters: Dict[str, int] = {}
+        now = time.time()
+        coin = "GTC"
+
+        fade_strat = FadeFakeoutStrategy(
+            emit_callback=lambda sig: None,
+            max_fade_swept_usd=2000.0,
+            min_upbit_spread_bps=35.0,
+            max_follower_depth_usd=3500.0,
+            counters=shared_counters,
+        )
+        maker_strat = MakerVoidStrategy(
+            emit_callback=lambda sig: None,
+            min_spread_bps=25.0,
+            counters=shared_counters,
+        )
+
+        # 1. Fade signal trigger
+        upbit_snap = make_snap("upbit", coin, [(1.00, 1000.0)], [(1.006, 500.0)], now)
+        f_snap = make_snap("binance", coin, [(1.00, 2000.0)], [(1.0005, 2000.0)], now, "GTCUSDT")
+
+        opened = fade_strat.on_fakeout_detected(
+            coin=coin,
+            trigger_type="depth_drain",
+            swept_usd=1200.0,
+            upbit_snap=upbit_snap,
+            follower_snaps={"binance": f_snap},
+            now=now,
+            fade_reason="micro_sweep_exhaustion",
+        )
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(shared_counters["fade_signals_triggered"], 1)
+
+        # Close fade on convergence
+        f_snap_revert = make_snap("binance", coin, [(0.997, 2000.0)], [(0.9975, 2000.0)], now + 1.0, "GTCUSDT")
+        fade_strat.on_follower_tick("binance", coin, f_snap_revert, now + 1.0, cur_upbit_mid=0.997)
+        self.assertEqual(shared_counters["fade_signals_triggered"], 1)
+        self.assertEqual(shared_counters["fade_signals_converged"], 1)
+
+        # 2. Maker void trigger
+        f_wide = make_snap("binance", coin, [(10.00, 5000.0)], [(10.06, 5000.0)], now, "GTCUSDT")
+        upbit_snap2 = make_snap("upbit", coin, [(10.05, 1000.0)], [(10.07, 1000.0)], now)
+        placed = maker_strat.check_void_opportunity(
+            follower_ex="binance",
+            coin=coin,
+            f_snap=f_wide,
+            upbit_snap=upbit_snap2,
+            now=now,
+            norm_spread_bps=15.0,
+        )
+        self.assertIsNotNone(placed)
+        self.assertEqual(shared_counters["maker_voids_triggered"], 1)
+
+        # Fill maker order
+        f_fill = make_snap("binance", coin, [(10.03, 5000.0)], [(10.04, 5000.0)], now + 0.3, "GTCUSDT")
+        maker_strat.on_follower_tick("binance", coin, f_fill, now + 0.3, norm_spread_bps=15.0)
+        self.assertEqual(shared_counters["maker_voids_filled"], 1)
+
+        # Restore spread / take profit
+        f_tight = make_snap("binance", coin, [(10.01, 5000.0)], [(10.02, 5000.0)], now + 1.0, "GTCUSDT")
+        maker_strat.on_follower_tick("binance", coin, f_tight, now + 1.0, norm_spread_bps=15.0)
+        self.assertEqual(shared_counters["maker_voids_triggered"], 1)
+        self.assertEqual(shared_counters["maker_voids_restored"], 1)
 
 
 if __name__ == "__main__":
