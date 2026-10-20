@@ -12,9 +12,9 @@ def evaluate_pair_klines(
     kl_upbit: Dict[int, Tuple[float, float]],
     kl_perp: Dict[int, Tuple[float, float]],
     usdt_krw_rate: float,
-    min_corr: float = 0.70,
-    min_both_trade: float = 0.20,
-    min_dev_bps: float = 10.0,
+    min_corr: float = 0.50,
+    min_both_trade: float = 0.05,
+    min_dev_bps: float = 6.0,
     max_price_diff_pct: float = 15.0,
     min_samples: int = 30,
 ) -> Dict[str, float]:
@@ -74,18 +74,33 @@ def evaluate_pair_klines(
             "passed": 0.0,
         }
 
-    # 2. Correlation of minute log-returns
-    r_up = np.diff(np.log(p_up_usd))
-    r_perp = np.diff(np.log(p_perp_usd))
+    # 2. Multi-scale correlation of log-returns (recovers true co-movement suppressed by Epps effect on alts)
+    r_up_1m = np.diff(np.log(p_up_usd))
+    r_perp_1m = np.diff(np.log(p_perp_usd))
 
-    std_up = float(np.std(r_up))
-    std_perp = float(np.std(r_perp))
+    corr_1m = 0.0
+    std_up_1m = float(np.std(r_up_1m))
+    std_perp_1m = float(np.std(r_perp_1m))
+    if std_up_1m >= 1e-9 and std_perp_1m >= 1e-9:
+        c1 = float(np.corrcoef(r_up_1m, r_perp_1m)[0, 1])
+        corr_1m = c1 if np.isfinite(c1) else 0.0
 
-    if std_up < 1e-9 or std_perp < 1e-9:
-        corr = 0.0
-    else:
-        c_val = float(np.corrcoef(r_up, r_perp)[0, 1])
-        corr = c_val if np.isfinite(c_val) else 0.0
+    # Multi-scale aggregation (e.g. 15-minute or adaptive k-step) for asynchronous trading
+    corr_multi = 0.0
+    k = 15 if len(p_up_usd) >= 30 else max(3, len(p_up_usd) // 3)
+    if len(p_up_usd) >= 2 * k:
+        p_up_sub = p_up_usd[::k]
+        p_perp_sub = p_perp_usd[::k]
+        r_up_multi = np.diff(np.log(p_up_sub))
+        r_perp_multi = np.diff(np.log(p_perp_sub))
+        if len(r_up_multi) >= 2:
+            std_up_m = float(np.std(r_up_multi))
+            std_perp_m = float(np.std(r_perp_multi))
+            if std_up_m >= 1e-9 and std_perp_m >= 1e-9:
+                cm = float(np.corrcoef(r_up_multi, r_perp_multi)[0, 1])
+                corr_multi = cm if np.isfinite(cm) else 0.0
+
+    corr = max(corr_1m, corr_multi)
 
     # 3. Active trading minutes on both sides
     both_trade = float(np.mean((v_up_usd > 0) & (v_perp_usd > 0)))

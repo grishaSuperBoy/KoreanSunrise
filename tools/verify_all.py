@@ -45,6 +45,7 @@ CORE_FILES = [
     "tools/full_daily_report.py",
     "tools/pack_codebase.py",
     "tests/test_adaptive_stops_and_fixes.py",
+    "tests/test_cargo_cult_audit.py",
     "tests/test_korean_engine_strategy.py",
     "tests/test_pipeline_e2e.py",
     "tests/test_venues_streams_resilience.py",
@@ -123,10 +124,14 @@ def check_gate_2_parameter_sync() -> bool:
         errors.append(f"C.ROUNDTRIP_FEE_BPS expected 10.0, got {C.ROUNDTRIP_FEE_BPS}")
 
     # 2. Tolerances & Horizons
-    if C.MAX_FOLLOWER_BOOK_AGE_SEC < 5.0:
-        errors.append(f"C.MAX_FOLLOWER_BOOK_AGE_SEC expected >= 5.0s, got {C.MAX_FOLLOWER_BOOK_AGE_SEC}")
+    if C.MAX_FOLLOWER_BOOK_AGE_SEC > 0.50 or C.MAX_FOLLOWER_BOOK_AGE_SEC <= 0:
+        errors.append(f"C.MAX_FOLLOWER_BOOK_AGE_SEC expected <= 0.50s (sub-second HFT quote freshness), got {C.MAX_FOLLOWER_BOOK_AGE_SEC}")
     if C.MAX_SIGNAL_HOLD_SEC < 30.0:
         errors.append(f"C.MAX_SIGNAL_HOLD_SEC expected >= 30.0s, got {C.MAX_SIGNAL_HOLD_SEC}")
+    if C.MIN_ORDER_USD != 10.0:
+        errors.append(f"C.MIN_ORDER_USD expected 10.0, got {C.MIN_ORDER_USD}")
+    if getattr(C, "TRADE_CONFIRM_LOOKBACK_SEC", 15.0) > 2.0:
+        errors.append(f"C.TRADE_CONFIRM_LOOKBACK_SEC expected <= 2.0s, got {getattr(C, 'TRADE_CONFIRM_LOOKBACK_SEC', 15.0)}")
 
     # 3. Stop-Loss Configuration
     if not hasattr(C, "STOP_INVALIDATION_BPS") or C.STOP_INVALIDATION_BPS <= 0:
@@ -138,10 +143,14 @@ def check_gate_2_parameter_sync() -> bool:
 
     # 4. Engine defaults reflection
     eng = KoreanEngine(emit_callback=lambda s: None)
-    if eng.max_follower_book_age_sec < 5.0:
-        errors.append(f"KoreanEngine.max_follower_book_age_sec expected >= 5.0s, got {eng.max_follower_book_age_sec}")
+    if eng.max_follower_book_age_sec > 0.50 or eng.max_follower_book_age_sec <= 0:
+        errors.append(f"KoreanEngine.max_follower_book_age_sec expected <= 0.50s, got {eng.max_follower_book_age_sec}")
     if eng.max_hold_sec < 30.0:
         errors.append(f"KoreanEngine.max_hold_sec expected >= 30.0s, got {eng.max_hold_sec}")
+    if eng.min_order_usd != 10.0:
+        errors.append(f"KoreanEngine.min_order_usd expected 10.0, got {eng.min_order_usd}")
+    if eng.trade_confirm_lookback_sec > 2.0:
+        errors.append(f"KoreanEngine.trade_confirm_lookback_sec expected <= 2.0s, got {eng.trade_confirm_lookback_sec}")
 
     if errors:
         for err in errors:

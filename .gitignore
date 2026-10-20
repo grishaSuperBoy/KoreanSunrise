@@ -13,4 +13,5 @@ data/
 test_data/
 logs/*.log
 logs/*.gz
+logs/*.json
 !logs/.gitkeep

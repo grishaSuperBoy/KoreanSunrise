@@ -22,7 +22,9 @@ log = logging.getLogger("engine")
 
 DEV_SAMPLE_DT = 1.0     # Fixed 1s time grid for robust MAD window
 NORM_TAU = 600.0        # EWMA time constant for Upbit depth and spread normalization (sec)
-BASELINE_TAU = 3600.0   # EWMA time constant for cross-venue basis baseline (sec)
+BASELINE_TAU = 600.0    # EWMA time constant for cross-venue basis baseline (sec, 10 minutes)
+DEPTH_FLOOR_USD = 5.0   # Numerical stability floor for depth normalization ($5 for low-cap alts)
+BEST_ASK_FLOOR_USD = 2.5 # Numerical stability floor for best ask ($2.50 for low-cap alts)
 
 
 @dataclass(slots=True)
@@ -104,6 +106,8 @@ class PairState:
         "cached_sigma",
         "cached_sigma_ts",
         "open_signal",
+        "_initial_diffs",
+        "t_last_diff",
     )
 
     def __init__(
@@ -122,6 +126,8 @@ class PairState:
         self.baseline_bps: float = 0.0
         self.n_obs: int = 0
         self.t_last: float = 0.0
+        self.t_last_diff: float = 0.0
+        self._initial_diffs: List[float] = []
 
         # Robust MAD window sampled on fixed 1s grid
         self.dev_window: Deque[float] = deque(maxlen=300)
@@ -134,11 +140,23 @@ class PairState:
 
     @property
     def is_warmed_up(self) -> bool:
-        return len(self.dev_window) >= self.warmup_samples and self.n_obs >= self.warmup_samples
+        """Determines if sufficient observation samples have been collected."""
+        return self.n_obs >= self.warmup_samples and len(self.dev_window) >= self.warmup_samples
+
+    def is_stable(self, now: float) -> bool:
+        """Separate gate: verifies pair baseline is not in a pre-existing severe dislocation."""
+        if not self.is_warmed_up:
+            return False
+        if self.warmup_samples < 10 or self.n_obs < 10:
+            return True
+        cur_sig = self.sigma(now)
+        return abs(self.t_last_diff - self.baseline_bps) <= max(2.5 * cur_sig, 25.0)
 
     def learn(self, raw_diff_bps: float, now: float) -> None:
+        self.t_last_diff = raw_diff_bps
         if self.n_obs == 0:
             self.baseline_bps = raw_diff_bps
+            self._initial_diffs = [raw_diff_bps]
             self.n_obs = 1
             self.t_last = now
             self.dev_ts = now
@@ -146,13 +164,22 @@ class PairState:
 
         dt = max(0.0, now - self.t_last)
         self.t_last = now
+
+        # Cold-start robustness: for the first 10 samples, anchor baseline to the median of observed diffs
+        # so that a wild spike on tick 0 or 1 does not poison the baseline for hours.
+        if len(self._initial_diffs) < 10:
+            self._initial_diffs.append(raw_diff_bps)
+            if len(self._initial_diffs) >= 3:
+                s_diffs = sorted(self._initial_diffs)
+                self.baseline_bps = s_diffs[len(s_diffs) // 2]
+
         deviation = raw_diff_bps - self.baseline_bps
 
         # Spike gating: if a massive pump/dislocation is currently happening (> spike_sigma),
         # slow down baseline adaptation by 20x so the baseline doesn't chase the pump.
         cur_sig = self.sigma(now)
         is_spike = self.is_warmed_up and abs(deviation) > (self.spike_sigma * cur_sig)
-        eff_tau = 10.0 if not self.is_warmed_up else (BASELINE_TAU * 20.0 if is_spike else BASELINE_TAU)
+        eff_tau = 5.0 if not self.is_warmed_up else (BASELINE_TAU * 20.0 if is_spike else BASELINE_TAU)
 
         a = 1.0 - math.exp(-dt / eff_tau) if eff_tau > 0 else 0.001
         self.baseline_bps += a * deviation
@@ -201,10 +228,12 @@ class KoreanEngine:
         roundtrip_fee_bps: float = C.ROUNDTRIP_FEE_BPS,
         warmup_samples: int = C.MIN_WARMUP_SAMPLES,
         max_hold_sec: float = C.MAX_SIGNAL_HOLD_SEC,
-        max_follower_book_age_sec: float = getattr(C, "MAX_FOLLOWER_BOOK_AGE_SEC", 5.0),
+        max_follower_book_age_sec: float = getattr(C, "MAX_FOLLOWER_BOOK_AGE_SEC", 0.50),
         stop_invalidation_bps: float = getattr(C, "STOP_INVALIDATION_BPS", 15.0),
         stop_adverse_pnl_bps: float = getattr(C, "STOP_ADVERSE_PNL_BPS", 35.0),
-        alpha_decay_sec: float = getattr(C, "ALPHA_DECAY_SEC", 8.0),
+        alpha_decay_sec: float = getattr(C, "ALPHA_DECAY_SEC", 15.0),
+        trade_confirm_lookback_sec: float = getattr(C, "TRADE_CONFIRM_LOOKBACK_SEC", 2.0),
+        min_trade_confirm_floor_usd: float = 5.0,
         require_trade_confirmation: bool = False,
         pool_state: Any = None,
         profile_manager: Any = None,
@@ -225,6 +254,8 @@ class KoreanEngine:
         self.stop_invalidation_bps = stop_invalidation_bps
         self.stop_adverse_pnl_bps = stop_adverse_pnl_bps
         self.alpha_decay_sec = alpha_decay_sec
+        self.trade_confirm_lookback_sec = trade_confirm_lookback_sec
+        self.min_trade_confirm_floor_usd = min_trade_confirm_floor_usd
         self.require_trade_confirmation = require_trade_confirmation
         self.pool_state = pool_state
         self.profile_manager = profile_manager
@@ -348,7 +379,7 @@ class KoreanEngine:
             self._coin_followers[coin].add(ex)
             self.counters["ticks_followers"] += 1
             upbit_snap = self._books.get(("upbit", coin))
-            if upbit_snap is not None and (now - self._recv_ts.get(("upbit", coin), 0.0)) <= 15.0:
+            if upbit_snap is not None and (now - self._recv_ts.get(("upbit", coin), 0.0)) <= 2.0:
                 st = self._get_or_create_pair_state(coin, ex)
                 if upbit_snap.mid_price > 0 and snap.mid_price > 0:
                     raw_diff_bps = (upbit_snap.mid_price - snap.mid_price) / snap.mid_price * 1e4
@@ -396,8 +427,8 @@ class KoreanEngine:
 
         if nrm is None:
             self._upbit_norm[coin] = UpbitNormState(
-                depth_ask=max(cur_depth, 100.0),
-                best_ask_usd=max(cur_best_ask_usd, 50.0),
+                depth_ask=max(cur_depth, DEPTH_FLOOR_USD),
+                best_ask_usd=max(cur_best_ask_usd, BEST_ASK_FLOOR_USD),
                 spread_bps=max(cur_spread, 1.0),
                 t=now,
             )
@@ -419,8 +450,8 @@ class KoreanEngine:
         clamped_depth = min(cur_depth, nrm.depth_ask * 5.0)
         clamped_best_ask = min(cur_best_ask_usd, nrm.best_ask_usd * 5.0)
 
-        nrm.depth_ask = max((1.0 - a) * nrm.depth_ask + a * clamped_depth, 100.0)
-        nrm.best_ask_usd = max((1.0 - a) * nrm.best_ask_usd + a * clamped_best_ask, 50.0)
+        nrm.depth_ask = max((1.0 - a) * nrm.depth_ask + a * clamped_depth, DEPTH_FLOOR_USD)
+        nrm.best_ask_usd = max((1.0 - a) * nrm.best_ask_usd + a * clamped_best_ask, BEST_ASK_FLOOR_USD)
         nrm.spread_bps = max((1.0 - a) * nrm.spread_bps + a * clamped_spread, 0.5)
 
     # ----------------------------------------------------------- Signal Logic
@@ -465,8 +496,8 @@ class KoreanEngine:
             top5_loss = max(0.0, prev_upbit_snap.depth_ask_usd - cur_depth)
             swept_usd = max(top5_loss, swept_top_level)
             drain_ratio = max(
-                swept_usd / max(norm_depth, 100.0),
-                swept_top_level / max(norm_best_ask_usd * 2.0, 100.0),
+                swept_usd / max(norm_depth, DEPTH_FLOOR_USD),
+                swept_top_level / max(norm_best_ask_usd * 2.0, DEPTH_FLOOR_USD),
             )
             if drain_ratio >= self.drain_threshold:
                 trigger_type = "depth_drain"
@@ -477,7 +508,7 @@ class KoreanEngine:
             if best_ask_loss > 0 and top5_loss > 0:
                 if best_ask_loss >= 0.5 * top5_loss:
                     swept_usd = top5_loss
-                    drain_ratio = top5_loss / max(norm_depth, 100.0)
+                    drain_ratio = top5_loss / max(norm_depth, DEPTH_FLOOR_USD)
                     if drain_ratio >= self.drain_threshold:
                         trigger_type = "depth_drain"
 
@@ -496,13 +527,13 @@ class KoreanEngine:
         # verify that the liquidity drop was backed by real taker buys rather than MM cancels/quote pullbacks.
         recent_buys_usd = 0.0
         if trigger_type is not None:
-            cutoff = now - 6.0
+            cutoff = now - getattr(self, "trade_confirm_lookback_sec", 2.0)
             recent_buys_usd, has_trades = self.get_recent_upbit_buys(coin, cutoff)
 
             should_verify_trades = self.require_trade_confirmation or has_trades
             if should_verify_trades:
                 ratio_needed = 0.25 if ask_held else 0.15
-                min_buys_needed = max(15.0, swept_usd * ratio_needed)
+                min_buys_needed = max(getattr(self, "min_trade_confirm_floor_usd", 5.0), swept_usd * ratio_needed)
 
                 if recent_buys_usd < min_buys_needed:
                     self.counters["cancels_blocked"] = self.counters.get("cancels_blocked", 0) + 1
@@ -529,8 +560,8 @@ class KoreanEngine:
 
             book_age_sec = now - f_recv
             # Decouple baseline learning from entry age guard:
-            # Baseline learning tolerates up to 15.0s, ensuring pair warms up on slow alts
-            if book_age_sec > 15.0:
+            # Baseline learning requires reasonably contemporaneous quotes (<= 2.0s)
+            if book_age_sec > 2.0:
                 continue
 
             st = self._get_or_create_pair_state(coin, follower_ex)
@@ -542,13 +573,8 @@ class KoreanEngine:
 
             raw_diff_bps = (upbit_mid - f_mid) / f_mid * 1e4
 
-            # Entry check requires fresh follower book (<= max_follower_book_age_sec, default 5.0s)
-            if (
-                trigger_type
-                and st.open_signal is None
-                and st.is_warmed_up
-                and book_age_sec <= self.max_follower_book_age_sec
-            ):
+            # Entry check delegated to _check_entry (single gatekeeper for HFT staleness)
+            if trigger_type and st.open_signal is None and st.is_stable(now):
                 self._check_entry(
                     coin=coin,
                     follower_ex=follower_ex,
@@ -619,7 +645,8 @@ class KoreanEngine:
         pair_hold_sec = float(pair_cfg.get("max_hold_sec", self.max_hold_sec))
 
         top3_ask_depth_usd = f_snap.top_n_ask_depth_usd(3)
-        if top3_ask_depth_usd < 50.0:
+        min_depth_needed = self.min_order_usd / max(self.stealth_fraction, 0.01)
+        if top3_ask_depth_usd < min_depth_needed:
             return
 
         # Physical 15% order book capacity (independent of current wallet budget)
@@ -660,9 +687,17 @@ class KoreanEngine:
         gross_exec_edge_bps = f_ask_diff_bps - st.baseline_bps
         net_edge = gross_exec_edge_bps - self.roundtrip_fee_bps
 
-        req_edge = float(pair_cfg.get("min_spread_bps", self.min_edge_bps))
-        if net_edge < req_edge:
-            return
+        # Check pair-specific calibrated threshold (calibrated on gross spread)
+        # or fallback to self.min_edge_bps (which represents net edge)
+        if "min_spread_bps" in pair_cfg:
+            req_spread = float(pair_cfg["min_spread_bps"])
+            if gross_exec_edge_bps < req_spread:
+                return
+            if net_edge <= 0.0:
+                return
+        else:
+            if net_edge < self.min_edge_bps:
+                return
 
         # Initial executable PnL at t=0 (if bought at f_entry_px and immediately sold at VWAP bid)
         init_exit_px = f_snap.vwap_bid_usd(suggested_size_usd)
@@ -741,107 +776,115 @@ class KoreanEngine:
         signals = self._active_signals.get(coin)
         if not signals:
             return
+        upbit_snap = self._books.get(("upbit", coin))
+        if not upbit_snap:
+            return
         for sig in list(signals):
             if sig.closed:
                 continue
             f_snap = self._books.get((sig.follower_exchange, coin))
             if f_snap is not None:
-                self._track_follower_move(coin, sig.follower_exchange, f_snap, now)
+                self._track_one_signal(sig, upbit_snap, f_snap, now)
 
     def _track_follower_move(self, coin: str, follower_ex: str, f_snap: OrderBookDepth5, now: float) -> None:
         signals = self._active_signals.get(coin)
         if not signals:
             return
-
         upbit_snap = self._books.get(("upbit", coin))
         if not upbit_snap:
             return
-
         for sig in list(signals):
-            if sig.follower_exchange != follower_ex or sig.closed:
-                continue
+            if sig.follower_exchange == follower_ex and not sig.closed:
+                self._track_one_signal(sig, upbit_snap, f_snap, now)
 
-            dt = round(now - sig.open_ts, 3)
+    def _track_one_signal(
+        self,
+        sig: SunriseSignal,
+        upbit_snap: OrderBookDepth5,
+        f_snap: OrderBookDepth5,
+        now: float,
+    ) -> None:
+        dt = round(now - sig.open_ts, 3)
 
-            # 1. Mid-to-Mid move on follower and leader (bps)
-            f_mid_move = (
-                (f_snap.mid_price - sig.follower_mid) / sig.follower_mid * 1e4
-                if sig.follower_mid > 0
-                else 0.0
-            )
-            up_mid_move = (
-                (upbit_snap.mid_price - sig.leader_mid) / sig.leader_mid * 1e4
-                if sig.leader_mid > 0
-                else 0.0
-            )
+        # 1. Mid-to-Mid move on follower and leader (bps)
+        f_mid_move = (
+            (f_snap.mid_price - sig.follower_mid) / sig.follower_mid * 1e4
+            if sig.follower_mid > 0
+            else 0.0
+        )
+        up_mid_move = (
+            (upbit_snap.mid_price - sig.leader_mid) / sig.leader_mid * 1e4
+            if sig.leader_mid > 0
+            else 0.0
+        )
 
-            # 2. True executable move on follower: Entry at VWAP ask -> Exit at current VWAP bid (bps)
-            entry_px = getattr(sig, "follower_entry_px", 0.0) or sig.follower_best_ask
-            exit_px = f_snap.vwap_bid_usd(sig.suggested_size_usd) if sig.suggested_size_usd > 0 else f_snap.best_bid
-            f_exec_move = (exit_px - entry_px) / entry_px * 1e4 if entry_px > 0 else 0.0
-            cur_net_pnl = round(f_exec_move - self.roundtrip_fee_bps, 2)
+        # 2. True executable move on follower: Entry at VWAP ask -> Exit at current VWAP bid (bps)
+        entry_px = getattr(sig, "follower_entry_px", 0.0) or sig.follower_best_ask
+        exit_px = f_snap.vwap_bid_usd(sig.suggested_size_usd) if sig.suggested_size_usd > 0 else f_snap.best_bid
+        f_exec_move = (exit_px - entry_px) / entry_px * 1e4 if entry_px > 0 else 0.0
+        cur_net_pnl = round(f_exec_move - self.roundtrip_fee_bps, 2)
 
-            # 3. Update MFE / MAE excursion metrics
-            if cur_net_pnl > sig.mfe_exec_pnl_bps:
-                sig.mfe_exec_pnl_bps = cur_net_pnl
-                sig.time_to_peak_sec = dt
-            if cur_net_pnl < sig.mae_exec_pnl_bps:
-                sig.mae_exec_pnl_bps = cur_net_pnl
-            if f_mid_move > sig.mfe_mid_move_bps:
-                sig.mfe_mid_move_bps = round(f_mid_move, 2)
+        # 3. Update MFE / MAE excursion metrics
+        if cur_net_pnl > sig.mfe_exec_pnl_bps:
+            sig.mfe_exec_pnl_bps = cur_net_pnl
+            sig.time_to_peak_sec = dt
+        if cur_net_pnl < sig.mae_exec_pnl_bps:
+            sig.mae_exec_pnl_bps = cur_net_pnl
+        if f_mid_move > sig.mfe_mid_move_bps:
+            sig.mfe_mid_move_bps = round(f_mid_move, 2)
 
-            # 4. Remaining dislocation edge
-            cur_diff_bps = (
-                (upbit_snap.mid_price - f_snap.mid_price) / f_snap.mid_price * 1e4
-                if f_snap.mid_price > 0
-                else 0.0
-            )
-            rem_edge = (cur_diff_bps - sig.kimchi_baseline_bps) - self.taker_fee_bps
+        # 4. Remaining dislocation edge
+        cur_diff_bps = (
+            (upbit_snap.mid_price - f_snap.mid_price) / f_snap.mid_price * 1e4
+            if f_snap.mid_price > 0
+            else 0.0
+        )
+        rem_edge = (cur_diff_bps - sig.kimchi_baseline_bps) - self.taker_fee_bps
 
-            if not sig.path or dt > sig.path[-1][0]:
-                sig.path.append([
-                    dt,
-                    round(up_mid_move, 2),
-                    round(f_mid_move, 2),
-                    cur_net_pnl,
-                    round(rem_edge, 2),
-                ])
+        if not sig.path or dt > sig.path[-1][0]:
+            sig.path.append([
+                dt,
+                round(up_mid_move, 2),
+                round(f_mid_move, 2),
+                cur_net_pnl,
+                round(rem_edge, 2),
+            ])
 
-            # Closure & Stop-Loss evaluation:
-            pair_cfg = self.get_pair_threshold_config(coin, follower_ex)
-            hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
-            pair_decay_sec = float(pair_cfg.get("alpha_decay_sec", self.alpha_decay_sec))
-            sigma = max(sig.pair_sigma_bps, 2.0)
+        # Closure & Stop-Loss evaluation:
+        pair_cfg = self.get_pair_threshold_config(sig.coin, sig.follower_exchange)
+        hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
+        default_decay = max(self.alpha_decay_sec, hold_sec * 0.5) if hold_sec > self.max_hold_sec else self.alpha_decay_sec
+        pair_decay_sec = float(pair_cfg.get("alpha_decay_sec", default_decay))
+        sigma = max(sig.pair_sigma_bps, 2.0)
 
-            upbit_drop_bps = (
-                (sig.leader_mid - upbit_snap.mid_price) / sig.leader_mid * 1e4
-                if sig.leader_mid > 0
-                else 0.0
-            )
-            cur_dislocation_bps = cur_diff_bps - sig.kimchi_baseline_bps
+        upbit_drop_bps = (
+            (sig.leader_mid - upbit_snap.mid_price) / sig.leader_mid * 1e4
+            if sig.leader_mid > 0
+            else 0.0
+        )
+        cur_dislocation_bps = cur_diff_bps - sig.kimchi_baseline_bps
 
-            close_reason, stop_type = evaluate_exit_reason(
-                cur_net_pnl=cur_net_pnl,
-                net_exec_edge_bps=sig.net_exec_edge_bps,
-                rem_edge=rem_edge,
-                dt=dt,
-                hold_sec=hold_sec,
-                pair_decay_sec=pair_decay_sec,
-                sigma=sigma,
-                upbit_drop_bps=upbit_drop_bps,
-                cur_dislocation_bps=cur_dislocation_bps,
-                stop_invalidation_bps=self.stop_invalidation_bps,
-                stop_adverse_pnl_bps=self.stop_adverse_pnl_bps,
-            )
+        close_reason, stop_type = evaluate_exit_reason(
+            cur_net_pnl=cur_net_pnl,
+            net_exec_edge_bps=sig.net_exec_edge_bps,
+            rem_edge=rem_edge,
+            dt=dt,
+            hold_sec=hold_sec,
+            pair_decay_sec=pair_decay_sec,
+            sigma=sigma,
+            upbit_drop_bps=upbit_drop_bps,
+            cur_dislocation_bps=cur_dislocation_bps,
+            stop_invalidation_bps=self.stop_invalidation_bps,
+            stop_adverse_pnl_bps=self.stop_adverse_pnl_bps,
+        )
 
-            if close_reason is not None:
-                if stop_type is not None:
-                    sig.stop_hit = True
-                    sig.stop_type = stop_type
-                    loss = abs(min(0.0, cur_net_pnl)) if stop_type == "invalidation" else abs(cur_net_pnl)
-                    sig.stop_loss_bps = round(loss, 2)
-                self._close_signal(sig, now, close_reason, f_mid_move, f_exec_move)
-                continue
+        if close_reason is not None:
+            if stop_type is not None:
+                sig.stop_hit = True
+                sig.stop_type = stop_type
+                loss = abs(min(0.0, cur_net_pnl)) if stop_type == "invalidation" else abs(cur_net_pnl)
+                sig.stop_loss_bps = round(loss, 2)
+            self._close_signal(sig, now, close_reason, f_mid_move, f_exec_move)
 
     def _close_signal(
         self,

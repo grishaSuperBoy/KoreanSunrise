@@ -6,8 +6,8 @@ Zero Hardcode & Pure Trading Mathematics:
   - Uses strictly realized executable PnL (net_pnl_bps), which already accounts
     for entry ask, exit bid, and roundtrip taker fees (10 bps).
   - Dynamically filters out retail micro-noise using book microstructure:
-      1. Drain Ratio >= 0.50 (swept >= 50% of Upbit normal ask depth).
-      2. Cross-Liquidity Ratio >= 0.80 (Upbit sweep is commensurate with follower's top-3 depth).
+      1. Drain Ratio >= 0.30 (swept >= 30% of Upbit normal ask depth).
+      2. Cross-Liquidity Ratio >= 0.20 (Upbit sweep is commensurate with follower's top-3 depth).
       3. Follower Top-3 Depth >= $66.7 (supports $10 minimum exchange order at 15% stealth size).
   - Evaluates pure statistical edge:
       * Expectancy: Mean & Median Net PnL (bps) > 0.
@@ -28,11 +28,12 @@ import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
+from config import MIN_ORDER_USD, STEALTH_DEPTH_FRACTION
 from pipeline.pool_state import PoolStateManager
 
 log = logging.getLogger("pipeline.evaluator")
 
-DEFAULT_MIN_EVENTS = 20
+DEFAULT_MIN_EVENTS = 5
 DEFAULT_MIN_PROFIT_FACTOR = 1.25
 DEFAULT_MIN_WIN_RATE = 50.0
 
@@ -102,8 +103,8 @@ class CoinSignalAccumulator:
         if stealth_cap <= 0.0 and f_top3_ask > 0.0:
             stealth_cap = round(0.15 * f_top3_ask, 2)
 
-        # Discard microscopic noise where Upbit sweep was insignificant vs follower
-        if drain_ratio < 0.30 and cross_ratio < 0.30:
+        # Discard microscopic noise where Upbit sweep was insignificant or follower book is overwhelmingly massive
+        if drain_ratio < 0.30 or cross_ratio < 0.20:
             return
 
         self.valid_sweeps += 1
@@ -232,8 +233,8 @@ class SunriseEvaluator:
             # 3. Both Profit Factor AND Win Rate must meet statistical standards
             if s["profit_factor"] < self.min_profit_factor or s["win_rate_pct"] < self.min_win_rate:
                 continue
-            # 4. Book depth supports minimum order
-            if s["top3_depth_usd"] < 50.0:
+            # 4. Book depth supports minimum order ($10 min order at 15% stealth fraction)
+            if s["top3_depth_usd"] < round(MIN_ORDER_USD / STEALTH_DEPTH_FRACTION, 1):
                 continue
 
             qualified.append(s)

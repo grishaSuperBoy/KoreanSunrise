@@ -640,9 +640,7 @@ class BaseCEXStream(BaseVenueStream):
                                 log.warning(f"[{self.name}] Connected but no data in 30s, reconnecting...")
                                 break
 
-                            if not self.last_msg_ts:
-                                self.last_msg_ts = time.time()
-                            elif time.time() - self.last_msg_ts > 180.0:
+                            if (time.time() - self.last_msg_ts) > 180.0:
                                 log.warning(f"[{self.name}] No data for >180s, reconnecting...")
                                 break
 

@@ -59,6 +59,89 @@ class APIServer:
         self._report_lock = threading.Lock()
         self._calib_lock = threading.Lock()
 
+        # Network benchmark caching & background worker lock
+        self._benchmark_lock = threading.Lock()
+        self._benchmark_running = False
+        self._benchmark_last_run = 0.0
+        self._cached_benchmark: Optional[Dict[str, Any]] = None
+
+    def get_benchmark_results(self) -> Dict[str, Any]:
+        """Returns cached benchmark document, reloading from disk if mtime changed."""
+        json_path = os.path.join(PROJECT_ROOT, "logs", "benchmark_connections.json")
+        try:
+            if os.path.isfile(json_path):
+                mtime = os.path.getmtime(json_path)
+                with self._benchmark_lock:
+                    if self._cached_benchmark is None or mtime > self._benchmark_last_run:
+                        with open(json_path, "r", encoding="utf-8") as f:
+                            self._cached_benchmark = json.load(f)
+                        self._benchmark_last_run = mtime
+                    return self._cached_benchmark
+        except Exception as e:
+            log.warning(f"[api_server] Error reading benchmark json: {e}")
+        with self._benchmark_lock:
+            return self._cached_benchmark or {"status": "no_data_yet", "venues": {}}
+
+    def get_benchmark_summary(self) -> Dict[str, Any]:
+        """Returns concise latency summary for /stats endpoint."""
+        doc = self.get_benchmark_results()
+        venues = doc.get("venues", {})
+        if not venues:
+            return {"status": "no_data", "is_running": self._benchmark_running}
+        successful = [v for v in venues.values() if v.get("grade") != "FAILED"]
+        leaders = [v for v in successful if v.get("role") == "LEADER"]
+        followers = [v for v in successful if v.get("role") == "FOLLOWER"]
+        fastest_lead = min((v for v in leaders if v.get("tcp_avg_ms", 0) > 0), key=lambda x: x["tcp_avg_ms"], default=None)
+        fastest_fol = min((v for v in followers if v.get("tcp_avg_ms", 0) > 0), key=lambda x: x["tcp_avg_ms"], default=None)
+        return {
+            "status": "running" if self._benchmark_running else "ready",
+            "is_running": self._benchmark_running,
+            "timestamp_utc": doc.get("timestamp_utc"),
+            "total_venues": len(venues),
+            "reachable_venues": len(successful),
+            "fastest_leader": {"venue": fastest_lead["venue"], "tcp_ms": round(fastest_lead["tcp_avg_ms"], 1)} if fastest_lead else None,
+            "fastest_follower": {"venue": fastest_fol["venue"], "tcp_ms": round(fastest_fol["tcp_avg_ms"], 1)} if fastest_fol else None,
+        }
+
+    def trigger_benchmark(
+        self,
+        repeats: int = 1,
+        concurrency: int = 6,
+        venues: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Launches connection benchmark in a dedicated daemon thread."""
+        with self._benchmark_lock:
+            if self._benchmark_running:
+                return {"status": "already_running", "message": "Benchmark already in progress"}
+            self._benchmark_running = True
+
+        def _worker():
+            try:
+                import asyncio
+                from tools.benchmark_connections import run_benchmark_suite
+                json_path = os.path.join(PROJECT_ROOT, "logs", "benchmark_connections.json")
+                res = asyncio.run(
+                    run_benchmark_suite(
+                        venue_keys=venues,
+                        repeats=repeats,
+                        concurrency=concurrency,
+                        output_json_path=json_path,
+                        use_color=False,
+                    )
+                )
+                with self._benchmark_lock:
+                    self._cached_benchmark = res
+                    self._benchmark_last_run = time.time()
+            except Exception as e:
+                log.error(f"[api_server] Background benchmark failed: {e}")
+            finally:
+                with self._benchmark_lock:
+                    self._benchmark_running = False
+
+        t = threading.Thread(target=_worker, name="benchmark_worker", daemon=True)
+        t.start()
+        return {"status": "started", "message": "Benchmark started in background"}
+
     def get_thresholds_doc(self) -> Dict[str, Any]:
         """Returns cached matrix thresholds document, reloading from disk only when mtime changes."""
         th_file = os.path.join(PROJECT_ROOT, "matrix_thresholds.json")
@@ -183,6 +266,8 @@ class APIServer:
                     self._handle_thresholds()
                 elif path in ("/api/report", "/report"):
                     self._handle_reports_list()
+                elif path in ("/api/benchmark", "/benchmark"):
+                    self._handle_benchmark(q)
                 elif path == "/api/report/content":
                     self._handle_report_content(q)
                 elif path == "/download":
@@ -225,6 +310,8 @@ class APIServer:
                     self._handle_calibrate_thresholds()
                 elif path == "/api/daily-pipeline":
                     self._handle_trigger_pipeline()
+                elif path in ("/api/benchmark/run", "/benchmark/run"):
+                    self._handle_benchmark_run(body_bytes)
                 elif path in ("/pool/pause", "/pool/resume"):
                     self._handle_pool_toggle(path, body_bytes)
                 else:
@@ -356,6 +443,7 @@ class APIServer:
                 data = {
                     "running": getattr(server_ref.service, "running", False),
                     "counters": getattr(server_ref.service.engine, "counters", {}) if hasattr(server_ref.service, "engine") else {},
+                    "network_benchmark": server_ref.get_benchmark_summary(),
                 }
                 self._send_json(data)
 
@@ -501,6 +589,91 @@ class APIServer:
                         os.remove(tmp.name)
                     except OSError:
                         pass
+
+            def _handle_benchmark(self, q: Dict[str, List[str]]) -> None:
+                is_fresh = (
+                    q.get("fresh", ["0"])[0].lower() in ("1", "true", "yes")
+                    or q.get("live", ["0"])[0].lower() in ("1", "true", "yes")
+                    or q.get("run", ["0"])[0].lower() in ("1", "true", "yes")
+                )
+                is_sync = q.get("sync", ["0"])[0].lower() in ("1", "true", "yes")
+                repeats = int(q.get("repeats", ["1"])[0]) if q.get("repeats") else 1
+                concurrency = int(q.get("concurrency", ["6"])[0]) if q.get("concurrency") else 6
+                venues_raw = q.get("venues", [""])[0]
+                venues = [v.strip().lower() for v in venues_raw.split(",") if v.strip()] if venues_raw else None
+
+                if is_fresh:
+                    if is_sync:
+                        try:
+                            import asyncio
+                            from tools.benchmark_connections import run_benchmark_suite
+                            json_path = os.path.join(PROJECT_ROOT, "logs", "benchmark_connections.json")
+                            res = asyncio.run(
+                                run_benchmark_suite(
+                                    venue_keys=venues,
+                                    repeats=repeats,
+                                    concurrency=concurrency,
+                                    output_json_path=json_path,
+                                    use_color=False,
+                                )
+                            )
+                            with server_ref._benchmark_lock:
+                                server_ref._cached_benchmark = res
+                                server_ref._benchmark_last_run = time.time()
+                            resp = {
+                                "status": "completed",
+                                "is_running": False,
+                                "benchmark": res,
+                            }
+                        except Exception as e:
+                            resp = {
+                                "status": "error",
+                                "error": str(e),
+                                "benchmark": server_ref.get_benchmark_results(),
+                            }
+                    else:
+                        trig = server_ref.trigger_benchmark(repeats=repeats, concurrency=concurrency, venues=venues)
+                        resp = {
+                            "status": trig.get("status", "started"),
+                            "message": trig.get("message", ""),
+                            "is_running": server_ref._benchmark_running,
+                            "benchmark": server_ref.get_benchmark_results(),
+                        }
+                else:
+                    resp = {
+                        "status": "running" if server_ref._benchmark_running else "ready",
+                        "is_running": server_ref._benchmark_running,
+                        "benchmark": server_ref.get_benchmark_results(),
+                    }
+
+                self._send_json(resp)
+
+            def _handle_benchmark_run(self, body_bytes: bytes) -> None:
+                repeats = 1
+                concurrency = 6
+                venues = None
+                if body_bytes:
+                    try:
+                        data = json.loads(body_bytes.decode("utf-8", errors="ignore"))
+                        if isinstance(data, dict):
+                            repeats = int(data.get("repeats", 1))
+                            concurrency = int(data.get("concurrency", 6))
+                            v_in = data.get("venues")
+                            if isinstance(v_in, list):
+                                venues = [str(x).strip().lower() for x in v_in if str(x).strip()]
+                            elif isinstance(v_in, str) and v_in.strip():
+                                venues = [x.strip().lower() for x in v_in.split(",") if x.strip()]
+                    except Exception:
+                        pass
+
+                trig = server_ref.trigger_benchmark(repeats=repeats, concurrency=concurrency, venues=venues)
+                resp = {
+                    "ok": trig.get("status") in ("started", "already_running"),
+                    "status": trig.get("status"),
+                    "message": trig.get("message"),
+                    "is_running": server_ref._benchmark_running,
+                }
+                self._send_json(resp)
 
             # Helpers
             def _send_json(self, data: Any, code: int = 200) -> None:

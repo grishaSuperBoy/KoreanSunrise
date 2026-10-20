@@ -43,20 +43,21 @@ DRAIN_THRESHOLD = 0.50          # 50% of normal top-5 ask depth swept on Upbit
 BLOWOUT_THRESHOLD = 2.5         # Instant spread >= 2.5x normal EWMA spread AND >= 2 ticks
 MIN_EXEC_EDGE_BPS = 12.0        # Minimum net executable edge after entry taker fee
 MAX_POSITION_BUDGET_USD = 10000.0
-MIN_ORDER_USD = 10.0            # Minimum order size in USD to reject non-executable micro-orders
+MIN_ORDER_USD = 10.0            # Unified minimum exchange order notional in USD ($10.0 universally accepted across all venues)
 STEALTH_DEPTH_FRACTION = 0.15   # Max 15% of top 3 ask levels on follower order book
+TRADE_CONFIRM_LOOKBACK_SEC = 2.0 # Maximum 2.0s lookback for taker trade confirmation against MM quote cancellations
 
 # Execution Fees & Warmup Safety
 TAKER_FEE_BPS = 5.0             # Single-leg VIP0 taker fee (bps) on Binance/Bybit
 ROUNDTRIP_FEE_BPS = 10.0        # Entry + Exit taker fee (bps) for net realized PnL
 MIN_WARMUP_SAMPLES = 30         # Minimum 1s MAD samples before firing signals
 MAX_SIGNAL_HOLD_SEC = 30.0      # Maximum holding horizon before timeout closure (adaptive ceiling)
-MAX_FOLLOWER_BOOK_AGE_SEC = 5.0 # Maximum staleness allowed for follower book snapshots (adaptive for alts)
+MAX_FOLLOWER_BOOK_AGE_SEC = 0.50 # Maximum 500ms staleness allowed for follower book snapshots (sub-second HFT lead-lag)
 
 # Adaptive Stop-Loss Parameters
 STOP_INVALIDATION_BPS = 15.0    # Model A: Microstructure invalidation tolerance (leader premium breakdown)
 STOP_ADVERSE_PNL_BPS = 35.0     # Model B: Hard adverse PnL drawdown stop (bps)
-ALPHA_DECAY_SEC = 8.0           # Model C: Alpha decay timeout if PnL <= 0 (transmission failure)
+ALPHA_DECAY_SEC = 15.0          # Model C: Alpha decay timeout if PnL <= 0 (fallback if not in matrix)
 
 ALL_SUPPORTED_VENUES = [
     "binance",

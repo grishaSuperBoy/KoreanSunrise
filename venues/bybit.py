@@ -112,7 +112,7 @@ class BybitPerpStream(BaseVenueStream):
     """Subscribes to linear orderbook.50 on Bybit and emits normalized top-5 snapshots."""
 
     WS_URL = "wss://stream.bybit.com/v5/public/linear"
-    WATCHDOG_SECS = 30.0
+    WATCHDOG_SECS = 90.0
 
     def __init__(
         self,

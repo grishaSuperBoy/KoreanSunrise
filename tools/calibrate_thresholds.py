@@ -51,7 +51,7 @@ DEFAULT_MIN_DEV_Z = 1.8
 
 
 def _calc_optimal_hold(t_peaks: List[float], default_val: float = DEFAULT_GLOBAL_HOLD_SEC) -> float:
-    """Calculates personalized holding horizon: median(T_peak) + 1.5*MAD (clamped [2.0s, 60.0s])."""
+    """Calculates personalized holding horizon: median(T_peak) + 1.5 * (1.4826 * MAD) ≈ median + 2.22*MAD (clamped [2.0s, 60.0s])."""
     if not t_peaks:
         return default_val
     med = statistics.median(t_peaks)
@@ -75,14 +75,23 @@ def _calc_spike_and_dev_z(dev_zs: List[float]) -> Tuple[float, float]:
     return spike_sigma, min_dev_z
 
 
-def _collect_signal_files(days_back: float = 7.0) -> List[str]:
-    """Collects gzip files from data/signals within the trailing window."""
-    s_dir = os.path.join(DATA_ROOT, "signals")
+def _collect_signal_files(
+    signals_dir: Optional[Any] = None,
+    days_back: float = 7.0,
+) -> List[str]:
+    """Collects signal files (.jsonl, .jsonl.gz) from signals_dir within the trailing window."""
+    if isinstance(signals_dir, (int, float)):
+        days_back = float(signals_dir)
+        signals_dir = None
+    s_dir = str(signals_dir) if signals_dir else os.path.join(DATA_ROOT, "signals")
     if not os.path.isdir(s_dir):
         return []
+    pattern_gz = os.path.join(s_dir, "**", "*.jsonl.gz")
+    pattern_raw = os.path.join(s_dir, "**", "*.jsonl")
+    all_files = sorted(set(glob.glob(pattern_gz, recursive=True) + glob.glob(pattern_raw, recursive=True)))
+    if days_back is None or days_back <= 0:
+        return all_files
     cutoff = time.time() - (days_back * 86400.0)
-    pattern = os.path.join(s_dir, "**", "*.jsonl.gz")
-    all_files = sorted(glob.glob(pattern, recursive=True))
     res = []
     for fp in all_files:
         try:
@@ -90,7 +99,7 @@ def _collect_signal_files(days_back: float = 7.0) -> List[str]:
                 res.append(fp)
         except OSError:
             pass
-    return res if res else all_files
+    return res
 
 
 def _write_json_atomic(path: str, data: Any) -> None:
@@ -107,15 +116,20 @@ def calibrate(
     days_back: float = 7.0,
     pos_size: float = 10.0,
     roundtrip_fee_bps: float = 10.0,
-    min_trades: int = 5,
+    min_trades: int = 20,
     min_winrate: float = 0.70,
     out_file: str = DEFAULT_OUT_FILE,
     dry_run: bool = False,
     as_json: bool = False,
+    signals_dir: Optional[str] = None,
+    output_path: Optional[str] = None,
+    pairs_filter: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
+    if output_path:
+        out_file = output_path
     t0 = time.time()
     fee_usd = pos_size * (roundtrip_fee_bps / 10000.0)
-    files = _collect_signal_files(days_back=days_back)
+    files = _collect_signal_files(signals_dir=signals_dir, days_back=days_back)
 
     # Aggregator per pair key: {coin}:upbit-{follower_ex}
     # Structure: pair_key -> threshold -> {count, wins, gross, fee, net}
@@ -135,7 +149,8 @@ def calibrate(
     if files:
         for fp in files:
             try:
-                with gzip.open(fp, "rt", encoding="utf-8", errors="replace") as gz:
+                opener = gzip.open if fp.endswith(".gz") else open
+                with opener(fp, "rt", encoding="utf-8", errors="replace") as gz:
                     for line in gz:
                         line = line.strip()
                         if not line:
@@ -165,7 +180,7 @@ def calibrate(
                         swept_usd = float(d.get("leader_swept_usd", 0.0))
                         f_top3_ask = float(d.get("follower_top3_ask_usd", 0.0))
                         cross_ratio = (swept_usd / f_top3_ask) if f_top3_ask > 0 else 0.0
-                        if drain_ratio < 0.40 and cross_ratio < 0.50:
+                        if drain_ratio < 0.30 or cross_ratio < 0.20:
                             continue
 
                         pair_key = f"{coin}:upbit-{follower_ex}"
@@ -202,7 +217,13 @@ def calibrate(
     # Fallback to universe_live.json or live_trading_pool.json if no signals yet
     if not pair_sweeps:
         target_coins: Dict[str, List[str]] = {}
-        if os.path.exists(UNIVERSE_FILE):
+        if pairs_filter:
+            for pk in pairs_filter:
+                parts = pk.split(":")
+                c = parts[0].upper()
+                v = parts[1].split("-")[-1].lower() if len(parts) > 1 else "binance"
+                target_coins.setdefault(c, []).append(v)
+        elif os.path.exists(UNIVERSE_FILE):
             try:
                 with open(UNIVERSE_FILE, "r", encoding="utf-8") as uf:
                     udoc = json.load(uf)
@@ -232,11 +253,13 @@ def calibrate(
                 matrix_output[pk] = {
                     "min_spread_bps": DEFAULT_GLOBAL_FALLBACK_BPS,
                     "max_hold_sec": DEFAULT_GLOBAL_HOLD_SEC,
+                    "alpha_decay_sec": max(5.0, round(DEFAULT_GLOBAL_HOLD_SEC * 0.5, 1)),
                     "spike_sigma": DEFAULT_SPIKE_SIGMA,
                     "min_dev_z": DEFAULT_MIN_DEV_Z,
-                    "expected_winrate": 0.85,
-                    "expected_net_bps": 22.0,
+                    "expected_winrate": 0.0,
+                    "expected_net_bps": 0.0,
                     "sample_trades": 0,
+                    "confidence": "none",
                     "status": "default_baseline",
                     "enabled": True,
                 }
@@ -295,14 +318,17 @@ def calibrate(
             spike_sigma, min_dev_z = _calc_spike_and_dev_z(dev_zs)
 
             classification_counts[status] += 1
+            conf = "high" if best_cnt >= 25 else ("medium" if best_cnt >= 10 else ("low" if best_cnt > 0 else "none"))
             matrix_output[pair_key] = {
                 "min_spread_bps": round(best_t, 1),
                 "max_hold_sec": opt_hold,
+                "alpha_decay_sec": max(5.0, round(opt_hold * 0.5, 1)),
                 "spike_sigma": spike_sigma,
                 "min_dev_z": min_dev_z,
-                "expected_winrate": round(best_wr, 3),
+                "expected_winrate": round(best_wr, 3) if best_cnt > 0 else 0.0,
                 "expected_net_bps": round((best_net / pos_size) * 10000.0 / max(1, best_cnt), 1) if best_cnt else 0.0,
                 "sample_trades": best_cnt,
+                "confidence": conf,
                 "status": status,
                 "enabled": enabled,
             }
@@ -359,7 +385,7 @@ def main() -> None:
     parser.add_argument("--days", type=float, default=7.0, help="Days back of signals (default: 7)")
     parser.add_argument("--size", type=float, default=10.0, help="Order size USD (default: 10)")
     parser.add_argument("--fee-bps", type=float, default=10.0, help="Roundtrip fee bps (default: 10)")
-    parser.add_argument("--min-trades", type=int, default=5, help="Min sample trades per pair (default: 5)")
+    parser.add_argument("--min-trades", type=int, default=20, help="Min sample trades per pair (default: 20)")
     parser.add_argument("--min-winrate", type=float, default=0.70, help="Min winrate guard (default: 0.70)")
     parser.add_argument("--out", default=DEFAULT_OUT_FILE, help="Output matrix file")
     parser.add_argument("--dry-run", action="store_true", help="Do not write file")

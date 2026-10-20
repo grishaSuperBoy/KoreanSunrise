@@ -36,11 +36,11 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_OUTPUT_FILE = os.path.join(PROJECT_ROOT, "universe_live.json")
 
 # Default Screening Thresholds
-DEFAULT_MIN_VOL_USD = 100_000.0         # $100K 24h volume on Upbit & Perp
+DEFAULT_MIN_VOL_USD = 20_000.0          # $20K 24h volume on Upbit & Perp (accessible for small-cap alts)
 DEFAULT_MAX_PRICE_DIFF_PCT = 15.0       # Max 15% price diff (eliminates namesake tokens)
-DEFAULT_MIN_CORR = 0.65                 # Min correlation of minute log-returns
-DEFAULT_MIN_BOTH_TRADE = 0.15           # Min 15% of minutes traded on both sides
-DEFAULT_MIN_DEV_BPS = 8.0               # Min 8.0 bps P90 spread volatility
+DEFAULT_MIN_CORR = 0.50                 # Min correlation of multi-scale log-returns
+DEFAULT_MIN_BOTH_TRADE = 0.05           # Min 5% of minutes traded on both sides (handles slow alts)
+DEFAULT_MIN_DEV_BPS = 6.0               # Min 6.0 bps P90 spread volatility
 DEFAULT_KLINE_LIMIT = 200               # 200 1-minute candles (~3.3h, uniform across all follower venues)
 
 CLIENT_FACTORIES: Dict[str, Any] = {
@@ -201,7 +201,9 @@ class UniverseScreener:
                     "market": mkt_code,
                     "up_px": up_px,
                     "up_vol": up_vol,
+                    # Schema: Dict[venue, Tuple[raw_sym, mult, px_usd, vol_usd, c_size]]
                     "matched_venues": matched_venues_meta,
+                    "matched_venues_meta": matched_venues_meta,
                 }
 
         log.info(
@@ -222,7 +224,17 @@ class UniverseScreener:
             confirmed_venues: Dict[str, Dict[str, Any]] = {}
             best_res: Optional[Dict[str, Any]] = None
 
-            for v, (raw_sym, mult, _, _, c_size) in item["matched_venues"].items():
+            venues_map = item.get("matched_venues_meta") or item.get("matched_venues", {})
+            for v, meta in venues_map.items():
+                if len(meta) == 5:
+                    raw_sym, mult, _, _, c_size = meta
+                elif len(meta) == 3:
+                    raw_sym, mult, c_size = meta
+                elif len(meta) == 2:
+                    raw_sym, mult = meta
+                    c_size = 1.0
+                else:
+                    continue
                 client = self.clients.get(v)
                 if not client:
                     continue

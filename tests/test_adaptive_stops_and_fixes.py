@@ -30,7 +30,7 @@ class TestAdaptiveStopsAndFixes(unittest.TestCase):
         self.engine = KoreanEngine(
             emit_callback=lambda s: self.emitted.append(s),
             warmup_samples=5,
-            max_follower_book_age_sec=5.0,
+            max_follower_book_age_sec=0.50,
             max_hold_sec=30.0,
             stop_invalidation_bps=15.0,
             stop_adverse_pnl_bps=35.0,
@@ -120,14 +120,14 @@ class TestAdaptiveStopsAndFixes(unittest.TestCase):
         self.engine._books[("upbit", coin)] = u_snap
         self.engine._recv_ts[("upbit", coin)] = now - 1.0
 
-        # Follower book arrived 3.5s ago (older than old 0.3s limit, but <= 5.0s)
+        # Follower book arrived 250ms ago (fresh sub-second HFT quote <= 0.50s)
         f_snap = OrderBookDepth5(
             exchange="binance", symbol=coin, raw_symbol=f"{coin}USDT",
-            ts=now - 3.5, exchange_ts=int((now - 3.5) * 1000),
+            ts=now - 0.25, exchange_ts=int((now - 0.25) * 1000),
             bids=[(9.995, 100.0)], asks=[(10.005, 100.0)]
         )
         self.engine._books[("binance", coin)] = f_snap
-        self.engine._recv_ts[("binance", coin)] = now - 3.5
+        self.engine._recv_ts[("binance", coin)] = now - 0.25
 
         # Normalization and baseline state
         self.engine._upbit_norm[coin] = {
@@ -150,7 +150,7 @@ class TestAdaptiveStopsAndFixes(unittest.TestCase):
         )
         self.engine.on_book_update(u_sweep)
 
-        # With 5.0s tolerance, the 3.5s follower book is accepted and signal fires!
+        # With 0.50s tolerance, the 250ms follower book is accepted and signal fires!
         self.assertEqual(len(self.engine._active_signals[coin]), 1)
         sig = self.engine._active_signals[coin][0]
         self.assertEqual(sig.coin, coin)
@@ -387,7 +387,7 @@ class TestAdaptiveStopsAndFixes(unittest.TestCase):
         })
         self.assertEqual(acc.valid_sweeps, 1)
         self.assertEqual(len(acc.net_pnls), 1)
-        self.assertEqual(DEFAULT_MIN_EVENTS, 20)
+        self.assertEqual(DEFAULT_MIN_EVENTS, 5)
 
     # -------------------------------------------------------------
     # Test 10: Daily reconnect jitter never produces 1s thrashing

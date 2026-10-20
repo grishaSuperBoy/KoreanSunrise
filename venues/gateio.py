@@ -25,10 +25,10 @@ class GateioRestClient:
         # Gate.io API WAF rejects fake browser User-Agents with 403; default requests UA works
         self.session.headers.pop("User-Agent", None)
 
-    def fetch_linear_perpetuals(self) -> Dict[str, Tuple[str, float]]:
-        """Returns contract (e.g. 'BTC_USDT', '1000BONK_USDT') -> (canonical_coin 'BTC', mult 1.0 or 1000.0)."""
+    def fetch_linear_perpetuals(self) -> Dict[str, Tuple[str, float, float]]:
+        """Returns contract (e.g. 'BTC_USDT', '1000BONK_USDT') -> (canonical_coin 'BTC', mult 1.0 or 1000.0, quanto_mult)."""
         url = f"{self.BASE_URL}/contracts"
-        out: Dict[str, Tuple[str, float]] = {}
+        out: Dict[str, Tuple[str, float, float]] = {}
         try:
             r = self.session.get(url, timeout=15)
             if r.status_code == 200:

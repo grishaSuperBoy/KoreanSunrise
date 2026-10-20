@@ -15,6 +15,8 @@ import os
 import threading
 from typing import Any, Dict, List, Optional
 
+from config import MIN_ORDER_USD
+
 log = logging.getLogger("pipeline.profile")
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -55,7 +57,7 @@ DEFAULT_PROFILE: Dict[str, Any] = {
         "hyperliquid",
     ],
     "max_active_slots": 5,           # Max concurrent positions
-    "min_order_usd": 10.0,           # Exchange min notional
+    "min_order_usd": MIN_ORDER_USD,  # Exchange min notional
     "stealth_depth_frac": 0.15,      # Universal stealth sizing rule (15% top-3 ask depth)
     "max_single_position_usd": 500.0,# Hard ceiling per position
 }
@@ -195,7 +197,7 @@ class TradingProfileManager:
             reserve_margin = float(self._profile.get("capital", {}).get("reserve_margin_frac", 0.20))
             slots = max(1, int(self._profile.get("max_active_slots", 3)))
             stealth_frac = float(self._profile.get("stealth_depth_frac", 0.15))
-            min_order = float(self._profile.get("min_order_usd", 10.0))
+            min_order = float(self._profile.get("min_order_usd", MIN_ORDER_USD))
             max_cap = float(self._profile.get("max_single_position_usd", 500.0))
 
             slot_budget = (venue_cap / slots) * (1.0 - reserve_margin)

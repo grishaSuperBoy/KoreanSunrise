@@ -110,7 +110,7 @@ class BinanceFuturesStream(BaseVenueStream):
     """Subscribes to depth5@100ms on Binance USDT Linear Perps."""
 
     BASE_WS_URL = "wss://fstream.binance.com/stream"
-    WATCHDOG_SECS = 30.0
+    WATCHDOG_SECS = 90.0
     MAX_STREAMS_PER_CONN = 180
 
     def __init__(

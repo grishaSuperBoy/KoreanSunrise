@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -30,12 +31,14 @@ class UpbitRestClient:
 
     def __init__(self, session: Optional[requests.Session] = None):
         self.session = session or create_http_session()
+        self._lock = threading.Lock()
 
     def fetch_usdt_krw_rate(self) -> float:
         """Fetches current KRW-USDT spot mid rate."""
         url = f"{self.BASE_URL}/ticker?markets=KRW-USDT"
         try:
-            r = self.session.get(url, timeout=6)
+            with self._lock:
+                r = self.session.get(url, timeout=6)
             if r.status_code == 200:
                 data = r.json()
                 if data and len(data) > 0:
@@ -54,7 +57,8 @@ class UpbitRestClient:
         url = f"{self.BASE_URL}/market/all?isDetails=true"
         out: Dict[str, str] = {}
         try:
-            r = self.session.get(url, timeout=8)
+            with self._lock:
+                r = self.session.get(url, timeout=8)
             if r.status_code == 200:
                 for item in r.json():
                     mkt = item.get("market", "")
@@ -84,7 +88,9 @@ class UpbitRestClient:
             chunk = market_codes[i : i + chunk_size]
             url = f"{self.BASE_URL}/ticker?markets={','.join(chunk)}"
             try:
-                r = self.session.get(url, timeout=8)
+                with self._lock:
+                    r = self.session.get(url, timeout=8)
+                    time.sleep(0.12)  # Upbit 10 req/s rate compliance (<= 8.3 req/s safe buffer)
                 if r.status_code == 200:
                     for item in r.json():
                         mkt = item.get("market", "")
@@ -102,7 +108,6 @@ class UpbitRestClient:
                                 "price_usd": price_krw / usdt_krw_rate,
                                 "vol_usd_24h": vol_krw / usdt_krw_rate,
                             }
-                time.sleep(0.12)  # Upbit 10 req/s rate compliance (<= 8.3 req/s safe buffer)
             except Exception as e:
                 log.warning(f"[upbit_rest] Failed to fetch ticker batch ({len(chunk)}): {e}")
 
@@ -128,7 +133,9 @@ class UpbitRestClient:
             if to_param:
                 url += f"&to={to_param}"
             try:
-                r = self.session.get(url, timeout=6)
+                with self._lock:
+                    r = self.session.get(url, timeout=6)
+                    time.sleep(0.12)  # Upbit 10 req/s rate compliance (<= 8.3 req/s safe buffer)
                 if r.status_code != 200:
                     break
                 rows = r.json()
@@ -147,7 +154,6 @@ class UpbitRestClient:
                     break
                 to_param = oldest
                 remaining -= len(rows)
-                time.sleep(0.12)  # Upbit 10 req/s rate compliance (<= 8.3 req/s safe buffer)
             except Exception:
                 break
 
@@ -166,7 +172,7 @@ class UpbitSpotStream(BaseVenueStream):
 
     RATE_MAX_JUMP = 0.02
     RATE_JUMP_ACCEPT_AFTER = 5
-    WATCHDOG_SECS = 30.0
+    WATCHDOG_SECS = 90.0
     BACKOFF_MIN = 3.0
     BACKOFF_MAX = 60.0
     PARSE_ERR_LOG_EVERY = 100

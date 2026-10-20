@@ -39,7 +39,7 @@ class TestKoreanEngineStrategy(unittest.TestCase):
             roundtrip_fee_bps=10.0,
             warmup_samples=5,
             max_hold_sec=15.0,
-            max_follower_book_age_sec=5.0,
+            max_follower_book_age_sec=0.50,
             stop_invalidation_bps=15.0,
             stop_adverse_pnl_bps=35.0,
             alpha_decay_sec=8.0,
@@ -798,12 +798,12 @@ class TestKoreanEngineStrategy(unittest.TestCase):
             "t": now - 1.0,
         }
 
-        # Follower book has tiny depth: Top-3 Ask = $40.0. 15% stealth capacity = $6.00 < $10.0 min_order!
+        # Follower book has tiny depth: Top-3 Ask = $20.0. 15% stealth capacity = $3.00 < $5.0 min_order!
         f_snap = OrderBookDepth5(
             exchange="binance", symbol=coin, raw_symbol="MICROUSDT",
             ts=now, exchange_ts=int(now * 1000),
             bids=[(99.95, 10.0)],
-            asks=[(100.00, 0.2), (100.05, 0.1), (100.10, 0.1)],  # 0.4 * ~100 = $40 total
+            asks=[(100.00, 0.1), (100.05, 0.05), (100.10, 0.05)],  # 0.2 * ~100 = $20 total
         )
         self.engine._books[("binance", coin)] = f_snap
         self.engine._recv_ts[("binance", coin)] = now
@@ -824,7 +824,7 @@ class TestKoreanEngineStrategy(unittest.TestCase):
         )
         self.engine.on_book_update(u_curr)
 
-        # Order size was $6.00 < min_order_usd ($10.00) -> MUST BE REJECTED
+        # Order size was $3.00 < min_order_usd ($5.00) -> MUST BE REJECTED
         self.assertIsNone(st.open_signal)
 
 

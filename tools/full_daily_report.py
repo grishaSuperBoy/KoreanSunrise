@@ -40,19 +40,22 @@ BATTLE_FILE = os.path.join(PROJECT_ROOT, "live_trading_pool.json")
 UNIVERSE_FILE = os.path.join(PROJECT_ROOT, "universe_live.json")
 THRESHOLDS_FILE = os.path.join(PROJECT_ROOT, "matrix_thresholds.json")
 
+from config import ALL_SUPPORTED_VENUES
+
 SWEEP_THRESHOLDS = (10, 15, 20, 25, 30, 35, 40, 50, 60)
-FUNDED_VENUES = {"binance", "bybit", "okx", "gateio", "mexc", "kucoin", "bingx", "htx", "pionex", "asterdex", "hyperliquid"}
+FUNDED_VENUES = set(ALL_SUPPORTED_VENUES)
 
 
 def _collect_files(days_back: float = 1.0) -> List[str]:
     s_dir = os.path.join(DATA_ROOT, "signals")
     if not os.path.isdir(s_dir):
         return []
-    cutoff = time.time() - (days_back * 86400.0)
     pattern = os.path.join(s_dir, "**", "*.jsonl.gz")
     all_files = sorted(glob.glob(pattern, recursive=True))
-    res = [fp for fp in all_files if os.path.getmtime(fp) >= cutoff]
-    return res if res else all_files
+    if days_back is None or days_back <= 0:
+        return all_files
+    cutoff = time.time() - (days_back * 86400.0)
+    return [fp for fp in all_files if os.path.getmtime(fp) >= cutoff]
 
 
 def generate_daily_report(
@@ -205,7 +208,7 @@ def generate_daily_report(
                     swept_usd = float(d.get("leader_swept_usd", 0.0))
                     f_top3_ask = float(d.get("follower_top3_ask_usd", 0.0))
                     cross_ratio = (swept_usd / f_top3_ask) if f_top3_ask > 0 else 0.0
-                    if drain_ratio < 0.30 and cross_ratio < 0.30:
+                    if drain_ratio < 0.30 or cross_ratio < 0.20:
                         continue
 
                     stealth_cap = float(d.get("stealth_capacity_usd", 0.0))

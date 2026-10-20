@@ -21,10 +21,10 @@ class MEXCRestClient:
     def __init__(self, session: Optional[requests.Session] = None):
         self.session = session or create_http_session()
 
-    def fetch_linear_perpetuals(self) -> Dict[str, Tuple[str, float]]:
-        """Returns symbol (e.g. 'BTC_USDT') -> (canonical_coin 'BTC', mult 1.0)."""
+    def fetch_linear_perpetuals(self) -> Dict[str, Tuple[str, float, float]]:
+        """Returns symbol (e.g. 'BTC_USDT') -> (canonical_coin 'BTC', mult 1.0, contractSize)."""
         url = f"{self.BASE_URL}/detail"
-        out: Dict[str, Tuple[str, float]] = {}
+        out: Dict[str, Tuple[str, float, float]] = {}
         try:
             r = self.session.get(url, timeout=8)
             if r.status_code == 200:

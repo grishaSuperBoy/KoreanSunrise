@@ -237,15 +237,39 @@ def render_dashboard_html(
     for pk, cfg in th_items:
         st = cfg.get("status", "default_baseline")
         en = cfg.get("enabled", True)
-        badge_cls = "badge-green" if st == "aggressive_clean" else ("badge-blue" if st == "balanced_standard" else ("badge-yellow" if st == "high_friction" else "badge-red"))
-        status_label = st.replace("_", " ").upper()
+        n_trades = cfg.get("sample_trades", 0)
+        ew = cfg.get("expected_winrate")
+        conf = cfg.get("confidence", "none" if n_trades == 0 else ("low" if n_trades < 10 else ("medium" if n_trades < 25 else "high")))
+
+        if st == "aggressive_clean":
+            badge_cls = "badge-green"
+            status_label = "AGGRESSIVE CLEAN"
+        elif st == "balanced_standard":
+            badge_cls = "badge-blue"
+            status_label = "BALANCED"
+        elif st == "high_friction":
+            badge_cls = "badge-yellow"
+            status_label = "HIGH FRICTION"
+        elif st == "toxic_pruned":
+            badge_cls = "badge-red"
+            status_label = "PRUNED"
+        else:
+            badge_cls = "badge-gray"
+            status_label = "ИНКУБАТОР"
+
+        if n_trades == 0 or ew is None or ew <= 0.0:
+            ew_cell = '<span style="color:#64748b;">—</span>'
+        else:
+            conf_color = "#10b981" if conf == "high" else ("#f59e0b" if conf == "medium" else "#94a3b8")
+            ew_cell = f"{ew * 100:.1f}% <span style='font-size:10px;color:{conf_color};font-weight:600;'>[{conf.upper()}]</span>"
+
         th_rows.append(f"""
         <tr>
           <td style="font-weight:600;">{html.escape(pk)}</td>
           <td><span class="badge {badge_cls}">{status_label}</span></td>
           <td style="text-align:right;font-family:monospace;font-weight:700;">{cfg.get('min_spread_bps', 20.0):.1f} bps</td>
-          <td style="text-align:right;font-family:monospace;">{cfg.get('expected_winrate', 0.85)*100:.1f}%</td>
-          <td style="text-align:right;font-family:monospace;">{cfg.get('sample_trades', 0)}</td>
+          <td style="text-align:right;font-family:monospace;">{ew_cell}</td>
+          <td style="text-align:right;font-family:monospace;">{n_trades}</td>
           <td style="text-align:center;">
             <span style="color:{'#10b981' if en else '#ef4444'};font-weight:700;">{'АКТИВНА' if en else 'ОТКЛЮЧЕНА'}</span>
           </td>
@@ -483,6 +507,7 @@ body {{
 .badge-blue {{ background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); }}
 .badge-yellow {{ background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.3); }}
 .badge-red {{ background: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3); }}
+.badge-gray {{ background: rgba(148, 163, 184, 0.15); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.3); }}
 
 /* Modal overlay */
 .modal-overlay {{
@@ -537,6 +562,7 @@ body {{
     <button class="tab-btn" onclick="switchTab('thresholds', this)">Матрица спредов ({len(th_items)})</button>
     <button class="tab-btn" onclick="switchTab('profile', this)">Депозит и слоты</button>
     <button class="tab-btn" onclick="switchTab('controls', this)">Управление</button>
+    <button type="button" class="tab-btn" onclick="openBenchmarkModal()" style="color:var(--primary);border:1px solid rgba(56,189,248,0.3);background:rgba(56,189,248,0.1);">⚡ Сеть и Задержки</button>
     <form method="POST" action="/logout" style="margin:0;display:inline;">
       <input type="hidden" name="csrf_token" value="{effective_csrf}">
       <button type="submit" class="tab-btn" style="color:var(--red);" title="Завершить сеанс">Выйти 🚪</button>
@@ -648,6 +674,11 @@ body {{
         <p style="color:var(--text-muted);font-size:13px;margin:8px 0 16px;">Выгрузка сигналов, отчётов и конфигураций в 1 клик без передачи токена в URL.</p>
         <a href="/download" class="btn-dl" style="display:block;text-align:center;">📦 Скачать архив</a>
       </div>
+      <div style="background:var(--bg-1);border:1px solid var(--border);border-radius:12px;padding:20px;">
+        <h3>Сетевые задержки бирж</h3>
+        <p style="color:var(--text-muted);font-size:13px;margin:8px 0 16px;">Комплексный замер DNS, TCP SYN, TLS, REST RTT, смещения часов сервера, WS Handshake и WS Ping/Pong по лидерам и фолловерам.</p>
+        <button class="btn-read" style="width:100%;" onclick="openBenchmarkModal()">⚡ Открыть бенчмарк сетей</button>
+      </div>
     </div>
   </div>
 
@@ -661,6 +692,25 @@ body {{
       <button style="background:none;border:none;color:#fff;font-size:20px;cursor:pointer;" onclick="closeModal(event)">&times;</button>
     </div>
     <div id="modalContent" class="modal-content">Загрузка...</div>
+  </div>
+</div>
+
+<!-- MODAL NETWORK BENCHMARK -->
+<div id="benchmarkModal" class="modal-overlay" onclick="handleBenchmarkBackdrop(event)">
+  <div class="modal-box" style="max-width: 1200px;" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span style="font-size:20px;">⚡</span>
+        <h3 style="font-size:16px;font-weight:700;">Сетевые задержки и коннект (Korean Leaders & Follower Perps)</h3>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <button class="btn-read" id="bmRunBtn" onclick="triggerBenchmarkRun()" style="padding:6px 14px;font-size:12px;">🔄 Запустить замер сейчас</button>
+        <button style="background:none;border:none;color:#fff;font-size:22px;cursor:pointer;line-height:1;" onclick="closeBenchmarkModal()">&times;</button>
+      </div>
+    </div>
+    <div id="bmModalBody" class="modal-content" style="font-family:inherit;white-space:normal;">
+      <div style="text-align:center;padding:40px;color:var(--text-muted);">Загрузка данных замера...</div>
+    </div>
   </div>
 </div>
 
@@ -787,6 +837,152 @@ async function toggleCoinPool(action, coin) {{
   }} catch (e) {{
     alert('Ошибка сети: ' + e);
   }}
+}}
+
+function openBenchmarkModal() {{
+  const modal = document.getElementById('benchmarkModal');
+  modal.classList.add('active');
+  document.body.style.overflow = 'hidden';
+  loadBenchmarkData();
+}}
+
+function closeBenchmarkModal() {{
+  const modal = document.getElementById('benchmarkModal');
+  modal.classList.remove('active');
+  document.body.style.overflow = 'auto';
+}}
+
+function handleBenchmarkBackdrop(e) {{
+  if (e.target.id === 'benchmarkModal') {{
+    closeBenchmarkModal();
+  }}
+}}
+
+function triggerBenchmarkRun() {{
+  const btn = document.getElementById('bmRunBtn');
+  btn.disabled = true;
+  btn.innerText = '⏳ Запуск замера...';
+  fetch('/api/benchmark/run', {{
+    method: 'POST',
+    headers: {{
+      'Content-Type': 'application/json',
+      'X-CSRF-Token': CSRF_TOKEN
+    }},
+    body: JSON.stringify({{ repeats: 1, concurrency: 6 }})
+  }})
+  .then(res => res.json())
+  .then(data => {{
+    btn.innerText = '⏳ Выполняется замер (~15-25с)...';
+    pollBenchmarkStatus();
+  }})
+  .catch(err => {{
+    btn.disabled = false;
+    btn.innerText = '🔄 Запустить замер сейчас';
+    alert('Ошибка запуска замера: ' + err.message);
+  }});
+}}
+
+function pollBenchmarkStatus() {{
+  const interval = setInterval(() => {{
+    fetch('/api/benchmark')
+      .then(res => res.json())
+      .then(data => {{
+        if (!data.is_running) {{
+          clearInterval(interval);
+          const btn = document.getElementById('bmRunBtn');
+          btn.disabled = false;
+          btn.innerText = '🔄 Запустить замер сейчас';
+          renderBenchmarkContent(data.benchmark);
+        }}
+      }})
+      .catch(() => clearInterval(interval));
+  }}, 2500);
+}}
+
+function loadBenchmarkData() {{
+  const body = document.getElementById('bmModalBody');
+  body.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted);">Опрос /api/benchmark...</div>';
+  fetch('/api/benchmark')
+    .then(res => res.json())
+    .then(data => {{
+      renderBenchmarkContent(data.benchmark);
+    }})
+    .catch(err => {{
+      body.innerHTML = '<div style="color:var(--red);padding:20px;">Ошибка: ' + err.message + '</div>';
+    }});
+}}
+
+function renderBenchmarkContent(bm) {{
+  const body = document.getElementById('bmModalBody');
+  if (!bm || !bm.venues) {{
+    body.innerHTML = '<div style="padding:24px;text-align:center;color:var(--text-muted);">Замеры ещё не проводились. Нажмите кнопку "Запустить замер сейчас" выше.</div>';
+    return;
+  }}
+  let rows = '';
+  const venues = bm.venues;
+  for (const name in venues) {{
+    const v = venues[name];
+    let badgeClass = 'badge-red';
+    let badgeTxt = '✖ FAIL';
+    if (v.grade === 'ULTRA') {{ badgeClass = 'badge-green'; badgeTxt = '⚡ ULTRA'; }}
+    else if (v.grade === 'FAST') {{ badgeClass = 'badge-blue'; badgeTxt = '● FAST'; }}
+    else if (v.grade === 'MODERATE') {{ badgeClass = 'badge-yellow'; badgeTxt = '▲ MODERATE'; }}
+    else if (v.grade === 'HIGH_LATENCY') {{ badgeClass = 'badge-red'; badgeTxt = '▼ HIGH LAT'; }}
+
+    const roleTag = v.role === 'LEADER' ? '<span class="badge badge-blue">LEAD (KR)</span>' : '<span class="badge" style="background:rgba(255,255,255,0.06);color:var(--text-muted);">FOLLOWER</span>';
+    const clkSkew = (v.clock_skew_ms !== null && v.clock_skew_ms !== undefined) ? ((v.clock_skew_ms > 0 ? '+' : '') + v.clock_skew_ms.toFixed(0) + 'ms') : 'N/A';
+    const wsp = (v.ws_ping_avg_ms !== null && v.ws_ping_avg_ms !== undefined) ? (v.ws_ping_avg_ms.toFixed(1) + 'ms') : 'N/A';
+    const jit = v.jitter_ms ? (v.jitter_ms.toFixed(1) + 'ms') : 'N/A';
+
+    rows += '<tr>' +
+      '<td style="font-weight:700;">' + v.venue + '</td>' +
+      '<td>' + roleTag + '</td>' +
+      '<td style="font-family:monospace;color:var(--text-muted);">' + (v.resolved_ip || 'N/A') + '</td>' +
+      '<td>' + (v.dns_ms ? v.dns_ms.toFixed(1) + 'ms' : 'N/A') + '</td>' +
+      '<td style="color:var(--primary);font-weight:600;">' + (v.tcp_avg_ms ? v.tcp_avg_ms.toFixed(1) + 'ms' : 'N/A') + '</td>' +
+      '<td>' + (v.tls_avg_ms ? v.tls_avg_ms.toFixed(1) + 'ms' : 'N/A') + '</td>' +
+      '<td>' + (v.rest_avg_ms ? v.rest_avg_ms.toFixed(1) + 'ms' : 'N/A') + '</td>' +
+      '<td>' + clkSkew + '</td>' +
+      '<td>' + (v.ws_handshake_avg_ms ? v.ws_handshake_avg_ms.toFixed(1) + 'ms' : 'N/A') + '</td>' +
+      '<td style="color:var(--green);font-weight:600;">' + wsp + '</td>' +
+      '<td>' + jit + '</td>' +
+      '<td><span class="badge ' + badgeClass + '">' + badgeTxt + '</span></td>' +
+    '</tr>';
+  }}
+
+  body.innerHTML = '' +
+    '<div style="margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;background:var(--bg-2);padding:12px 16px;border-radius:10px;border:1px solid var(--border);flex-wrap:wrap;gap:10px;">' +
+      '<div style="font-size:13px;color:var(--text-muted);">' +
+        'Время замера: <strong style="color:var(--text);">' + (bm.timestamp_utc || 'N/A') + '</strong> | Длительность: <strong style="color:var(--text);">' + (bm.total_duration_sec ? bm.total_duration_sec.toFixed(1) + 'с' : 'N/A') + '</strong>' +
+      '</div>' +
+      '<div style="font-size:12px;color:var(--primary);font-family:monospace;">' +
+        'API: /api/benchmark' +
+      '</div>' +
+    '</div>' +
+    '<div style="background:rgba(56,189,248,0.06);border:1px solid rgba(56,189,248,0.2);border-radius:10px;padding:12px 16px;margin-bottom:16px;font-size:12px;color:#bae6fd;line-height:1.5;">' +
+      '<strong>Kimchi Transmission Analysis (Seoul ↔ Tokyo):</strong> Инжекция тиков Upbit/Bithumb (Сеул) → снайпинг Binance/Bybit в Токио занимает ~30-33ms при дислокациях альтов в 500ms - 3.0s. Запас по таймингу составляет более 15-90x.' +
+    '</div>' +
+    '<div style="overflow-x:auto;">' +
+      '<table class="data-table">' +
+        '<thead>' +
+          '<tr>' +
+            '<th>Биржа</th>' +
+            '<th>Роль</th>' +
+            '<th>IP адрес</th>' +
+            '<th>DNS</th>' +
+            '<th>TCP SYN</th>' +
+            '<th>TLS</th>' +
+            '<th>REST RTT</th>' +
+            '<th>Часы</th>' +
+            '<th>WS Conn</th>' +
+            '<th>WS Ping</th>' +
+            '<th>Джиттер</th>' +
+            '<th>Грейд</th>' +
+          '</tr>' +
+        '</thead>' +
+        '<tbody>' + rows + '</tbody>' +
+      '</table>' +
+    '</div>';
 }}
 </script>
 </body>

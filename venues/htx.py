@@ -21,10 +21,10 @@ class HTXRestClient:
     def __init__(self, session: Optional[requests.Session] = None):
         self.session = session or create_http_session()
 
-    def fetch_linear_perpetuals(self) -> Dict[str, Tuple[str, float]]:
-        """Returns contract_code (e.g. 'BTC-USDT') -> (canonical_coin 'BTC', mult 1.0)."""
+    def fetch_linear_perpetuals(self) -> Dict[str, Tuple[str, float, float]]:
+        """Returns contract_code (e.g. 'BTC-USDT') -> (canonical_coin 'BTC', mult 1.0, contract_size)."""
         url = f"{self.BASE_URL}/linear-swap-api/v1/swap_contract_info"
-        out: Dict[str, Tuple[str, float]] = {}
+        out: Dict[str, Tuple[str, float, float]] = {}
         try:
             r = self.session.get(url, timeout=8)
             if r.status_code == 200:

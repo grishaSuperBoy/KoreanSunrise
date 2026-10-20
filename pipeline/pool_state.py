@@ -32,11 +32,13 @@ UNIVERSE_FILE = os.path.join(HERE, "universe_live.json")
 BATTLE_POOL_FILE = os.path.join(HERE, "live_trading_pool.json")
 OVERRIDES_FILE = os.path.join(HERE, "runtime_overrides.json")
 
+from config import MIN_ORDER_USD
+
 # Default sizing & gate rules
-DEFAULT_MIN_ORDER_USD = 10.0      # Exchange minimum order size ($5-$10)
-DEFAULT_STEALTH_FRAC = 0.15       # Max 15% of top-3 follower ask depth
-DEFAULT_SIZE_CAP_USD = 10000.0    # Max budget cap per trade
-DEFAULT_MIN_DEPTH_USD = 66.7      # Min top-3 depth ($10 / 0.15) to support minimum order
+DEFAULT_MIN_ORDER_USD = MIN_ORDER_USD  # Unified exchange minimum order size ($10.0)
+DEFAULT_STEALTH_FRAC = 0.15           # Max 15% of top-3 follower ask depth
+DEFAULT_SIZE_CAP_USD = 10000.0        # Max budget cap per trade
+DEFAULT_MIN_DEPTH_USD = round(DEFAULT_MIN_ORDER_USD / DEFAULT_STEALTH_FRAC, 1) # Min top-3 depth ($10 / 0.15 = 66.7) to support minimum order
 
 
 def _read_json(path: str, default: Any = None) -> Any:

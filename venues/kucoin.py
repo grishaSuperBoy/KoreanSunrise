@@ -29,10 +29,10 @@ class KucoinRestClient:
     def __init__(self, session: Optional[requests.Session] = None):
         self.session = session or create_http_session()
 
-    def fetch_linear_perpetuals(self) -> Dict[str, Tuple[str, float]]:
-        """Returns symbol (e.g. 'XBTUSDTM') -> (canonical_coin 'BTC', mult 1.0)."""
+    def fetch_linear_perpetuals(self) -> Dict[str, Tuple[str, float, float]]:
+        """Returns symbol (e.g. 'XBTUSDTM') -> (canonical_coin 'BTC', mult 1.0, multiplier)."""
         url = f"{self.BASE_URL}/contracts/active"
-        out: Dict[str, Tuple[str, float]] = {}
+        out: Dict[str, Tuple[str, float, float]] = {}
         try:
             r = self.session.get(url, timeout=8)
             if r.status_code == 200:
@@ -135,6 +135,8 @@ class KucoinStream(BaseVenueStream):
 
     def _resolve_symbols(self) -> Dict[str, str]:
         try:
+            if self._session is None:
+                self._session = create_http_session()
             r = self._session.get(self.CONTRACTS, timeout=8)
             if r.status_code == 200:
                 for c in r.json().get("data", []):
@@ -163,14 +165,17 @@ class KucoinStream(BaseVenueStream):
             self._session = None
 
     async def _run_loop(self) -> None:
-        await asyncio.to_thread(self._resolve_symbols)
-        target_syms = list(self._ours_to_venue.values())
-        if not target_syms:
-            log.warning("[kucoin] No symbols resolved for subscription.")
-            return
-
         while self._running:
             try:
+                if not self._ours_to_venue:
+                    await asyncio.to_thread(self._resolve_symbols)
+                target_syms = list(self._ours_to_venue.values())
+                if not target_syms:
+                    log.warning("[kucoin] No symbols resolved for subscription, retrying...")
+                    delay = self._reconnect_policy.compute_delay(Exception("kucoin symbol resolution failed"))
+                    await asyncio.sleep(delay)
+                    continue
+
                 # Get dynamic bullet token using persistent session
                 if self._session is None:
                     self._session = create_http_session()
