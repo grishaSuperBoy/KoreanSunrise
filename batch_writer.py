@@ -23,7 +23,7 @@ def _utc_day(dt: Optional[datetime] = None) -> str:
 class BatchWriter:
     """Buffers signals in RAM (as raw lines) and writes compressed sequentially to disk."""
 
-    def __init__(self, data_root: str = "data", flush_interval_sec: float = 5.0):
+    def __init__(self, data_root: str = "data", flush_interval_sec: float = 1800.0):
         self.data_root = data_root
         self.flush_interval_sec = flush_interval_sec
         self._lines: List[str] = []

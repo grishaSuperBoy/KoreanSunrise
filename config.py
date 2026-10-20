@@ -14,6 +14,7 @@ log = logging.getLogger("config")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 DATA_ROOT = os.getenv("DATA_ROOT", "data")
+SIGNAL_FLUSH_INTERVAL_SEC = float(os.getenv("SIGNAL_FLUSH_INTERVAL_SEC", "1800.0"))  # 30-min in-memory buffer flush
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # API Web Server & Dashboard

@@ -133,7 +133,9 @@ class PionexStream(BaseCEXStream):
                 "limit": 5,
             }
             await ws.send(json.dumps(sub))
-            await asyncio.sleep(0.02)
+            # Pionex rate limit is ~5 req/sec on public WS connection.
+            # 250ms spacing ensures zero 1008 policy violation disconnects.
+            await asyncio.sleep(0.25)
 
     def _parse_message(self, raw_msg: str) -> None:
         try:

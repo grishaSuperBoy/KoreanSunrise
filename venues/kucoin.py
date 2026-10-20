@@ -124,12 +124,30 @@ class KucoinStream(BaseVenueStream):
         callback: Callable[[OrderBookDepth5], None],
         contract_sizes: Optional[Dict[str, float]] = None,
     ):
-        sym_list = list(symbols.keys()) if isinstance(symbols, dict) else list(symbols)
-        super().__init__("kucoin", sym_list, callback)
+        self._sym_map: Dict[str, Tuple[str, float, float]] = {}
+        if isinstance(symbols, dict):
+            raw_list = list(symbols.keys())
+            for k, v in symbols.items():
+                k_u = str(k).upper()
+                if isinstance(v, (list, tuple)):
+                    coin = str(v[0])
+                    mult = float(v[1]) if len(v) > 1 else 1.0
+                    c_size = float(v[2]) if len(v) > 2 else 1.0
+                    self._sym_map[k_u] = (coin, mult, c_size)
+                else:
+                    self._sym_map[k_u] = (str(v), 1.0, 1.0)
+        else:
+            raw_list = [str(s).upper() for s in symbols]
+            self._sym_map = {s: (s, 1.0, 1.0) for s in raw_list}
+
+        super().__init__("kucoin", raw_list, callback)
         self.subscribed = list(self.symbols)
         self._ours_to_venue: Dict[str, str] = {}
         self._venue_to_ours: Dict[str, str] = {}
         self._contract_sizes: Dict[str, float] = {k.upper(): float(v) for k, v in (contract_sizes or {}).items()}
+        for k_u, tup in self._sym_map.items():
+            if k_u not in self._contract_sizes:
+                self._contract_sizes[k_u] = tup[2]
         self._ping_sec = self.PING_FALLBACK_SEC
         self._session = create_http_session()
 
@@ -148,9 +166,12 @@ class KucoinStream(BaseVenueStream):
                         base = "BTC"
                     base_norm = normalize_symbol(base)
                     for s in self.symbols:
-                        if normalize_symbol(s) == base_norm:
+                        s_u = s.upper()
+                        s_norm = normalize_symbol(s)
+                        if s_u == sym or s_norm == base_norm:
                             self._ours_to_venue[s] = sym
-                            self._venue_to_ours[sym] = normalize_symbol(s)
+                            canonical = self._sym_map.get(s_u, (None,))[0] if self._sym_map else base_norm
+                            self._venue_to_ours[sym] = canonical or base_norm
         except Exception as e:
             log.warning(f"[kucoin] Failed to resolve contract symbols: {e}")
         return self._ours_to_venue
@@ -277,7 +298,9 @@ class KucoinStream(BaseVenueStream):
                 return
             sym_raw = topic.split(":", 1)[1].upper()
             clean_raw = sym_raw[:-1] if sym_raw.endswith("M") else sym_raw
-            sym = self._venue_to_ours.get(sym_raw) or normalize_symbol(clean_raw.replace("XBT", "BTC"))
+            fallback_coin = normalize_symbol(clean_raw.replace("XBT", "BTC"))
+            canonical = self._sym_map.get(sym_raw, (None,))[0] if hasattr(self, "_sym_map") else None
+            sym = self._venue_to_ours.get(sym_raw) or (canonical if canonical and canonical != sym_raw else None) or fallback_coin
             contract_size = self._contract_sizes.get(sym_raw, 1.0)
             payload = data.get("data", {})
             bids_raw = payload.get("bids", [])[:5]

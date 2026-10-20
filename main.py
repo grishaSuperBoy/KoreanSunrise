@@ -40,7 +40,10 @@ log = logging.getLogger("main")
 
 class KoreanSunriseService:
     def __init__(self):
-        self.writer = BatchWriter(data_root=C.DATA_ROOT)
+        self.writer = BatchWriter(
+            data_root=C.DATA_ROOT,
+            flush_interval_sec=getattr(C, "SIGNAL_FLUSH_INTERVAL_SEC", 1800.0),
+        )
         self.pool_state = PoolStateManager()
         self.pool_state.reload()
         self.profile_manager = TradingProfileManager()
