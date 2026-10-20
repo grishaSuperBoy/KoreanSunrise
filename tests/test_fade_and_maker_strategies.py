@@ -536,6 +536,39 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
         )
         self.assertIsNone(void)
 
+    def test_asterdex_lead_lag_tight_spread_allowed_wide_rejected(self):
+        """Lead-Lag Taker: AsterDex allowed on tight spreads (<=45 bps), rejected on wide defensive spreads."""
+        from strategies.strategy_1_sweep_lead_lag import KoreanLeadLagStrategy, PairState
+        strat1 = KoreanLeadLagStrategy(emit_callback=lambda s: None)
+        now = time.time()
+        coin = "GMT"
+        st = PairState(coin, "asterdex", warmup_samples=10)
+        for _ in range(15):
+            st.learn(10.0, now)
+
+        upbit_snap = make_snap("upbit", coin, [(1.00, 10000.0)], [(1.015, 5000.0)], now)
+
+        # 1. Wide spread (80 bps > 45 bps) on AsterDex rejected
+        f_wide = make_snap("asterdex", coin, [(1.00, 5000.0)], [(1.008, 5000.0)], now, "GMTUSDT")
+        sig_wide = strat1.evaluate_entry(
+            coin=coin, follower_ex="asterdex", st=st, upbit_snap=upbit_snap, f_snap=f_wide,
+            f_book_age_ms=100.0, norm_depth=10000.0, norm_spread=15.0, swept_usd=5000.0,
+            trigger_type="depth_drain", drain_ratio=0.6, blowout_ratio=1.5, now=now,
+            recent_buys_usd=5000.0, pair_cfg={"enabled": True}, seq_num=1
+        )
+        self.assertIsNone(sig_wide)
+
+        # 2. Tight spread (20 bps <= 45 bps) on AsterDex allowed
+        f_tight = make_snap("asterdex", coin, [(1.00, 5000.0)], [(1.002, 5000.0)], now, "GMTUSDT")
+        sig_tight = strat1.evaluate_entry(
+            coin=coin, follower_ex="asterdex", st=st, upbit_snap=upbit_snap, f_snap=f_tight,
+            f_book_age_ms=100.0, norm_depth=10000.0, norm_spread=15.0, swept_usd=5000.0,
+            trigger_type="depth_drain", drain_ratio=0.6, blowout_ratio=1.5, now=now,
+            recent_buys_usd=5000.0, pair_cfg={"enabled": True}, seq_num=2
+        )
+        self.assertIsNotNone(sig_tight)
+        self.assertEqual(sig_tight.follower_exchange, "asterdex")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -179,6 +179,7 @@ class KoreanEngine:
             stealth_depth_fraction=self.stealth_fraction,
             taker_fee_bps=self.taker_fee_bps,
             max_spread_bps=getattr(C, "MAX_MAKER_SPREAD_BPS", 120.0),
+            allow_asterdex_maker=getattr(C, "ASTERDEX_MAKER_ENABLED", False),
         )
 
         # Pair-specific calibrated execution thresholds

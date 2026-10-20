@@ -69,6 +69,10 @@ FADE_COOLDOWN_SEC = float(os.getenv("FADE_COOLDOWN_SEC", "30.0"))            # A
 # Strategy 3: Maker Liquidity Harvesting
 MAX_MAKER_SPREAD_BPS = float(os.getenv("MAX_MAKER_SPREAD_BPS", "120.0"))     # Max spread ceiling to reject toxic/dead DEX pools
 
+# AsterDex DEX Adaptation & Safety
+MAX_ASTERDEX_SPREAD_BPS = float(os.getenv("MAX_ASTERDEX_SPREAD_BPS", "45.0")) # Hard spread ceiling on AsterDex (blocks 250-350 bps defensive walls)
+ASTERDEX_MAKER_ENABLED = os.getenv("ASTERDEX_MAKER_ENABLED", "false").lower() in ("true", "1") # Block passive maker on DEX AMMs by default
+
 ALL_SUPPORTED_VENUES = [
     "binance",
     "bybit",

@@ -75,6 +75,9 @@ class MakerVoidStrategy:
         stop_invalidation_bps: float = 15.0,
         stop_adverse_pnl_bps: float = 25.0,
         max_spread_bps: float = 120.0,
+        target_pnl_bps: float = 15.0,
+        cooldown_sec: float = 30.0,
+        allow_asterdex_maker: bool = False,
     ):
         self.emit = emit_callback
         self.min_order_usd = min_order_usd
@@ -89,9 +92,13 @@ class MakerVoidStrategy:
         self.stop_invalidation_bps = stop_invalidation_bps
         self.stop_adverse_pnl_bps = stop_adverse_pnl_bps
         self.max_spread_bps = max_spread_bps
+        self.target_pnl_bps = target_pnl_bps
+        self.cooldown_sec = cooldown_sec
+        self.allow_asterdex_maker = allow_asterdex_maker
 
         # (follower_ex, coin, side) -> ActiveMakerVoid
         self._open_voids: Dict[Tuple[str, str, str], ActiveMakerVoid] = {}
+        self._last_void_ts: Dict[Tuple[str, str], float] = {}
         self._seq = itertools.count(1)
         self._lock = threading.RLock()
         self.counters = {
@@ -125,8 +132,20 @@ class MakerVoidStrategy:
             if f_spread < max(self.min_spread_bps, norm_spread_bps * 1.4):
                 return None
 
+            # AsterDex DEX safety guard:
+            # Passive maker orders on DEX pools with synthetic/wide spreads face 100% adverse selection.
+            # Only allow if explicitly enabled AND spread is tight (<= 45.0 bps).
+            if follower_ex.lower() == "asterdex":
+                if not self.allow_asterdex_maker or f_spread > 45.0:
+                    return None
+
             # Toxic pool / broken book safety ceiling (reject DEX spreads > max_spread_bps)
             if f_spread > self.max_spread_bps:
+                return None
+
+            # Cooldown guard: at least cooldown_sec between void postings for same (follower_ex, coin)
+            pair_key = (follower_ex, coin)
+            if (now - self._last_void_ts.get(pair_key, 0.0)) < self.cooldown_sec:
                 return None
 
             upbit_mid = float(getattr(upbit_snap, "mid_price", 0.0) or 0.0) if upbit_snap else 0.0
@@ -184,6 +203,7 @@ class MakerVoidStrategy:
                 taker_fee_bps=self.taker_fee_bps,
             )
             self._open_voids[key] = void
+            self._last_void_ts[pair_key] = now
             self.counters["maker_voids_triggered"] += 1
             log.info(
                 f"[MAKER-VOID] 🛡️ Posted Post-Only {side.upper()} on {coin} ({void.follower_contract}) @ {follower_ex} | "
@@ -259,8 +279,11 @@ class MakerVoidStrategy:
 
                     close_reason: Optional[str] = None
 
-                    # 1. Spread restored to normal
-                    if cur_spread <= max(15.0, norm_spread_bps * 1.15) and net_pnl_bps > 0:
+                    # 1. Take-Profit: Target Net PnL reached (>= target_pnl_bps) or Spread restored to normal
+                    if net_pnl_bps >= self.target_pnl_bps:
+                        close_reason = "target_profit"
+                        self.counters["maker_voids_restored"] += 1
+                    elif cur_spread <= max(15.0, norm_spread_bps * 1.15) and net_pnl_bps > 0:
                         close_reason = "restored"
                         self.counters["maker_voids_restored"] += 1
                     # 2. Hard Invalidation stop

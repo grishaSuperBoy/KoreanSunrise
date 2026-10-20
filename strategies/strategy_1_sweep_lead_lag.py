@@ -289,6 +289,13 @@ class KoreanLeadLagStrategy:
         if f_ask <= 0 or f_bid <= 0:
             return None
 
+        # Follower spread guard: reject illiquid books where follower spread is abnormally wide
+        # (Blocks 150-350 bps defensive quarantine spreads on AsterDex like TAIKO/TREE)
+        f_spread_bps = float(getattr(f_snap, "spread_bps", 0.0) or ((f_ask - f_bid) / f_bid * 1e4))
+        max_f_spread = getattr(C, "MAX_ASTERDEX_SPREAD_BPS", 45.0) if follower_ex.lower() == "asterdex" else 80.0
+        if f_spread_bps > max_f_spread:
+            return None
+
         # Stale quote guard: reject follower books older than max allowed age
         if f_book_age_ms > (self.max_follower_book_age_sec * 1000.0):
             return None

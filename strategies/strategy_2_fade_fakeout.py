@@ -182,6 +182,12 @@ class FadeFakeoutStrategy:
                 if f_bid <= 0 or f_ask <= 0:
                     continue
 
+                # Follower spread guard: reject illiquid defensive spreads (e.g. AsterDex 150-350 bps)
+                f_spread_bps = float(getattr(f_snap, "spread_bps", 0.0) or ((f_ask - f_bid) / f_bid * 1e4))
+                max_f_spread = 45.0 if follower_ex.lower() == "asterdex" else 80.0
+                if f_spread_bps > max_f_spread:
+                    continue
+
                 # Don't open duplicate fade for same (coin, follower_ex) if already open
                 existing = [p for p in self._active.get(coin, []) if p.follower_exchange == follower_ex and not p.closed]
                 if existing:
