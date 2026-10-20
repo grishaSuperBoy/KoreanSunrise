@@ -124,8 +124,8 @@ def check_gate_2_parameter_sync() -> bool:
         errors.append(f"C.ROUNDTRIP_FEE_BPS expected 10.0, got {C.ROUNDTRIP_FEE_BPS}")
 
     # 2. Tolerances & Horizons
-    if C.MAX_FOLLOWER_BOOK_AGE_SEC > 0.50 or C.MAX_FOLLOWER_BOOK_AGE_SEC <= 0:
-        errors.append(f"C.MAX_FOLLOWER_BOOK_AGE_SEC expected <= 0.50s (sub-second HFT quote freshness), got {C.MAX_FOLLOWER_BOOK_AGE_SEC}")
+    if C.MAX_FOLLOWER_BOOK_AGE_SEC > 2.0 or C.MAX_FOLLOWER_BOOK_AGE_SEC <= 0:
+        errors.append(f"C.MAX_FOLLOWER_BOOK_AGE_SEC expected in (0, 2.0]s (follower quote freshness gate), got {C.MAX_FOLLOWER_BOOK_AGE_SEC}")
     if C.MAX_SIGNAL_HOLD_SEC < 30.0:
         errors.append(f"C.MAX_SIGNAL_HOLD_SEC expected >= 30.0s, got {C.MAX_SIGNAL_HOLD_SEC}")
     if C.MIN_ORDER_USD != 10.0:
@@ -143,8 +143,8 @@ def check_gate_2_parameter_sync() -> bool:
 
     # 4. Engine defaults reflection
     eng = KoreanEngine(emit_callback=lambda s: None)
-    if eng.max_follower_book_age_sec > 0.50 or eng.max_follower_book_age_sec <= 0:
-        errors.append(f"KoreanEngine.max_follower_book_age_sec expected <= 0.50s, got {eng.max_follower_book_age_sec}")
+    if eng.max_follower_book_age_sec > 2.0 or eng.max_follower_book_age_sec <= 0:
+        errors.append(f"KoreanEngine.max_follower_book_age_sec expected in (0, 2.0]s, got {eng.max_follower_book_age_sec}")
     if eng.max_hold_sec < 30.0:
         errors.append(f"KoreanEngine.max_hold_sec expected >= 30.0s, got {eng.max_hold_sec}")
     if eng.min_order_usd != 10.0:

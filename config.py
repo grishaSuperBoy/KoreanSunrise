@@ -52,7 +52,7 @@ TAKER_FEE_BPS = 5.0             # Single-leg VIP0 taker fee (bps) on Binance/Byb
 ROUNDTRIP_FEE_BPS = 10.0        # Entry + Exit taker fee (bps) for net realized PnL
 MIN_WARMUP_SAMPLES = 30         # Minimum 1s MAD samples before firing signals
 MAX_SIGNAL_HOLD_SEC = 30.0      # Maximum holding horizon before timeout closure (adaptive ceiling)
-MAX_FOLLOWER_BOOK_AGE_SEC = 0.50 # Maximum 500ms staleness allowed for follower book snapshots (sub-second HFT lead-lag)
+MAX_FOLLOWER_BOOK_AGE_SEC = 1.50 # Maximum 1.5s staleness for follower book snapshots — generous enough for slow alts, still blocks stale 15s+ feeds
 
 # Adaptive Stop-Loss Parameters
 STOP_INVALIDATION_BPS = 15.0    # Model A: Microstructure invalidation tolerance (leader premium breakdown)
