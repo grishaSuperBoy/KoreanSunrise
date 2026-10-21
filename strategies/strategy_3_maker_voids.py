@@ -81,6 +81,8 @@ class MakerVoidStrategy:
         cooldown_sec: float = 30.0,
         allow_asterdex_maker: bool = False,
         hunter_mode: bool = False,
+        align_trend: bool = False,
+        require_upbit: bool = False,
         max_active_voids: int = 10,
         max_total_exposure_usd: float = 5000.0,
         counters: Optional[Dict[str, int]] = None,
@@ -102,6 +104,8 @@ class MakerVoidStrategy:
         self.cooldown_sec = cooldown_sec
         self.allow_asterdex_maker = allow_asterdex_maker
         self.hunter_mode = hunter_mode
+        self.align_trend = align_trend
+        self.require_upbit = require_upbit
         self.max_active_voids = max_active_voids
         self.max_total_exposure_usd = max_total_exposure_usd
 
@@ -136,6 +140,7 @@ class MakerVoidStrategy:
         recv_ts: Optional[float] = None,
         is_warmed_up: bool = False,
         market_regime: str = "NEUTRAL",
+        require_upbit: Optional[bool] = None,
     ) -> Optional[ActiveMakerVoid]:
         """
         Detects if follower order book presents a tradeable opportunity.
@@ -161,7 +166,13 @@ class MakerVoidStrategy:
             if market_regime == "FLASH_DUMP":
                 return None
 
-            # 0d. Portfolio Exposure Guard
+            # 0d. Korean Anchor Guard: reject unanchored tokens without active Upbit/Bithumb reference when required
+            req_upbit = self.require_upbit if require_upbit is None else require_upbit
+            upbit_mid = float(getattr(upbit_snap, "mid_price", 0.0) or 0.0) if upbit_snap else 0.0
+            if req_upbit and upbit_mid <= 0.0:
+                return None
+
+            # 0e. Portfolio Exposure Guard
             active_voids = [v for v in self._open_voids.values() if not v.closed]
             if len(active_voids) >= self.max_active_voids:
                 return None
@@ -180,7 +191,6 @@ class MakerVoidStrategy:
             if (now - self._last_void_ts.get(pair_key, 0.0)) < self.cooldown_sec:
                 return None
 
-            upbit_mid = float(getattr(upbit_snap, "mid_price", 0.0) or 0.0) if upbit_snap else 0.0
             follower_mid = float(getattr(f_snap, "mid_price", 0.0) or (0.5 * (f_bid + f_ask)))
             half_spread_edge = 0.5 * f_spread
 
@@ -240,18 +250,33 @@ class MakerVoidStrategy:
                     return None
 
                 order_type = "maker_post_only"
-                if upbit_mid > follower_mid and upbit_mid > 0:
-                    side = "ask"
-                    target_limit_px = f_ask - 0.5 * (f_ask - f_bid)
-                    maker_edge_bps = max(half_spread_edge, (upbit_mid - target_limit_px) / target_limit_px * 1e4)
-                elif upbit_mid < follower_mid and upbit_mid > 0:
-                    side = "bid"
-                    target_limit_px = f_bid + 0.5 * (f_ask - f_bid)
-                    maker_edge_bps = max(half_spread_edge, (target_limit_px - upbit_mid) / target_limit_px * 1e4)
+                disloc_bps = (upbit_mid - follower_mid) / follower_mid * 1e4 if (upbit_mid > 0 and follower_mid > 0) else 0.0
+                if self.align_trend:
+                    if disloc_bps > 1.0:
+                        side = "bid"
+                        target_limit_px = f_bid + 0.5 * (f_ask - f_bid)
+                        maker_edge_bps = max(half_spread_edge, (upbit_mid - target_limit_px) / target_limit_px * 1e4)
+                    elif disloc_bps < -1.0:
+                        side = "ask"
+                        target_limit_px = f_ask - 0.5 * (f_ask - f_bid)
+                        maker_edge_bps = max(half_spread_edge, (target_limit_px - upbit_mid) / target_limit_px * 1e4)
+                    else:
+                        side = "bid"
+                        target_limit_px = f_bid + 0.5 * (f_ask - f_bid)
+                        maker_edge_bps = half_spread_edge
                 else:
-                    side = "ask"
-                    target_limit_px = f_ask - 0.5 * (f_ask - f_bid)
-                    maker_edge_bps = half_spread_edge
+                    if disloc_bps > 1.0:
+                        side = "ask"
+                        target_limit_px = f_ask - 0.5 * (f_ask - f_bid)
+                        maker_edge_bps = max(half_spread_edge, (upbit_mid - target_limit_px) / target_limit_px * 1e4)
+                    elif disloc_bps < -1.0:
+                        side = "bid"
+                        target_limit_px = f_bid + 0.5 * (f_ask - f_bid)
+                        maker_edge_bps = max(half_spread_edge, (target_limit_px - upbit_mid) / target_limit_px * 1e4)
+                    else:
+                        side = "ask"
+                        target_limit_px = f_ask - 0.5 * (f_ask - f_bid)
+                        maker_edge_bps = half_spread_edge
 
             if maker_edge_bps < self.min_maker_edge_bps:
                 return None
@@ -402,7 +427,9 @@ class MakerVoidStrategy:
                         if getattr(void, "order_type", "") == "taker_void_sweep":
                             stop_thresh = -(void.spread_open_bps + (void.taker_fee_bps * 2.0) + self.stop_invalidation_bps)
                         else:
-                            stop_thresh = -self.stop_invalidation_bps
+                            # Maker post-only starts MTM across the wide spread (half_spread + taker exit fee).
+                            # Threshold must account for the initial spread buffer so it doesn't stop out prematurely on fill tick.
+                            stop_thresh = -((void.spread_open_bps * 0.5) + void.taker_fee_bps + self.stop_invalidation_bps)
 
                         if net_pnl_bps <= stop_thresh:
                             close_reason = "stop_invalidation"
@@ -481,6 +508,7 @@ class MakerVoidStrategy:
             "close_ts": void.close_ts,
             "duration_sec": void.duration_sec,
             "target_limit_px": void.target_limit_px,
+            "ref_lead_mid": getattr(void, "ref_lead_mid", None),
             "maker_edge_bps": void.maker_edge_bps,
             "maker_filled": void.maker_filled,
             "spread_open_bps": void.spread_open_bps,

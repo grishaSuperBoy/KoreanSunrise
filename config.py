@@ -94,6 +94,8 @@ S2_INVERT_TO_LONG = os.getenv("S2_INVERT_TO_LONG", "true").lower() in ("true", "
 # Strategy 3: Maker Liquidity Harvesting (Passive Post-Only inside Widened Spreads)
 MAX_MAKER_SPREAD_BPS = float(os.getenv("MAX_MAKER_SPREAD_BPS", "120.0"))     # Max spread ceiling to reject toxic/dead DEX pools
 S3_HUNTER_MODE = os.getenv("S3_HUNTER_MODE", "false").lower() in ("true", "1", "yes") # False (Default): Passive Maker Void. True: Taker mode (must use tight spread + large lag)
+S3_ALIGN_TREND = os.getenv("S3_ALIGN_TREND", "true").lower() in ("true", "1", "yes") # True: align maker limit orders with Upbit directional momentum
+S3_REQUIRE_UPBIT = os.getenv("S3_REQUIRE_UPBIT", "true").lower() in ("true", "1", "yes") # True: reject unanchored tokens without active Upbit/Bithumb feed
 
 # AsterDex DEX Adaptation & Safety
 MAX_ASTERDEX_SPREAD_BPS = float(os.getenv("MAX_ASTERDEX_SPREAD_BPS", "45.0")) # Hard spread ceiling on AsterDex (blocks 250-350 bps defensive walls)

@@ -1179,6 +1179,90 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
         self.assertIsNotNone(v_pump_buy)
         self.assertEqual(v_pump_buy.side, "buy")
 
+    def test_maker_void_spread_aware_stop_does_not_trigger_on_fill(self):
+        """Verifies spread-aware stop buffer prevents premature invalidation on wide spread fill."""
+        now = time.time()
+        emitted = []
+        strat = MakerVoidStrategy(
+            emit_callback=lambda s: emitted.append(s),
+            min_spread_bps=20.0,
+            stop_invalidation_bps=15.0,
+            taker_fee_bps=5.0,
+        )
+        # Follower spread is blown out: bid=10.00, ask=10.06 -> 60 bps spread
+        f_snap = make_snap("bybit", "TIA", [(10.00, 2000.0)], [(10.06, 2000.0)], now)
+        upbit_snap = make_snap("upbit", "TIA", [(10.04, 1000.0)], [(10.08, 1000.0)], now)
+
+        void = strat.check_void_opportunity("bybit", "TIA", f_snap, upbit_snap, now, norm_spread_bps=15.0, is_warmed_up=True)
+        self.assertIsNotNone(void)
+        self.assertEqual(void.side, "ask")
+        self.assertEqual(void.target_limit_px, 10.03)
+
+        # Fill tick: market bid reaches 10.03, but ask remains wide at 10.06
+        # Initial MTM net PnL is (10.03 - 10.06)/10.03 * 1e4 - 5.0 ≈ -34.9 bps.
+        # With spread buffer: stop_thresh = -(60*0.5 + 5 + 15) = -50.0 bps.
+        # Order MUST NOT be killed by stop_invalidation on this tick!
+        f_fill = make_snap("bybit", "TIA", [(10.03, 1000.0)], [(10.06, 1000.0)], now + 0.1)
+        strat.on_follower_tick("bybit", "TIA", f_fill, now + 0.1, norm_spread_bps=15.0)
+
+        self.assertTrue(void.maker_filled)
+        self.assertFalse(void.closed)
+        self.assertEqual(len(emitted), 0)
+
+        # Next tick: spread collapses to normal (10 bps): bid=10.01, ask=10.02
+        f_norm = make_snap("bybit", "TIA", [(10.01, 2000.0)], [(10.02, 2000.0)], now + 0.5)
+        strat.on_follower_tick("bybit", "TIA", f_norm, now + 0.5, norm_spread_bps=15.0)
+
+        self.assertTrue(void.closed)
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(emitted[0]["close_reason"], "restored")
+        self.assertGreater(emitted[0]["net_pnl_bps"], 0.0)
+
+    def test_maker_void_trend_aligned_side_selection(self):
+        """Verifies align_trend=True buys inside spread when Upbit is higher and sells when lower."""
+        now = time.time()
+        strat = MakerVoidStrategy(
+            emit_callback=lambda s: None,
+            min_spread_bps=20.0,
+            align_trend=True,
+        )
+        f_snap = make_snap("binance", "SEI", [(10.00, 1000.0)], [(10.06, 1000.0)], now)
+
+        # 1. Upbit leading higher (10.08 > 10.03) -> Place Limit BID (long) inside spread
+        upbit_high = make_snap("upbit", "SEI", [(10.07, 1000.0)], [(10.09, 1000.0)], now)
+        v_high = strat.check_void_opportunity("binance", "SEI", f_snap, upbit_high, now, norm_spread_bps=15.0, is_warmed_up=True)
+        self.assertIsNotNone(v_high)
+        self.assertEqual(v_high.side, "bid")
+        self.assertAlmostEqual(v_high.target_limit_px, 10.03, places=4)
+
+        # 2. Upbit leading lower (9.98 < 10.03) -> Place Limit ASK (short) inside spread
+        strat._last_void_ts.clear()
+        strat._open_voids.clear()
+        upbit_low = make_snap("upbit", "SEI", [(9.97, 1000.0)], [(9.99, 1000.0)], now)
+        v_low = strat.check_void_opportunity("binance", "SEI", f_snap, upbit_low, now, norm_spread_bps=15.0, is_warmed_up=True)
+        self.assertIsNotNone(v_low)
+        self.assertEqual(v_low.side, "ask")
+        self.assertAlmostEqual(v_low.target_limit_px, 10.03, places=4)
+
+    def test_maker_void_require_upbit_filter(self):
+        """Verifies require_upbit=True rejects unanchored tokens without active Upbit price."""
+        now = time.time()
+        strat = MakerVoidStrategy(
+            emit_callback=lambda s: None,
+            min_spread_bps=20.0,
+            require_upbit=True,
+        )
+        f_snap = make_snap("gateio", "RANDOM", [(10.00, 1000.0)], [(10.06, 1000.0)], now)
+
+        # No Upbit snap -> Rejected
+        v_none = strat.check_void_opportunity("gateio", "RANDOM", f_snap, None, now, norm_spread_bps=15.0, is_warmed_up=True)
+        self.assertIsNone(v_none)
+
+        # Active Upbit snap -> Accepted
+        upbit_snap = make_snap("upbit", "RANDOM", [(10.05, 1000.0)], [(10.07, 1000.0)], now)
+        v_ok = strat.check_void_opportunity("gateio", "RANDOM", f_snap, upbit_snap, now, norm_spread_bps=15.0, is_warmed_up=True)
+        self.assertIsNotNone(v_ok)
+
 
 if __name__ == "__main__":
     unittest.main()
