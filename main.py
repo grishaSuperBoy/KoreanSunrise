@@ -161,14 +161,24 @@ class KoreanSunriseService:
                     self.engine.sweep_timeouts(now)
                 except Exception as e:
                     log.error(f"[main] sweep_timeouts error: {e}")
-                await asyncio.to_thread(self.writer.maybe_flush, now)
+
+                try:
+                    await asyncio.to_thread(self.writer.maybe_flush, now)
+                except Exception as e:
+                    log.error(f"[main] maybe_flush error: {e}")
 
                 if now - last_reload >= 30.0:
                     last_reload = now
-                    await asyncio.to_thread(self.engine.maybe_reload_thresholds, now)
+                    try:
+                        await asyncio.to_thread(self.engine.maybe_reload_thresholds, now)
+                    except Exception as e:
+                        log.error(f"[main] maybe_reload_thresholds error: {e}")
 
                 if now - last_heartbeat >= 15.0:
-                    self._log_heartbeat()
+                    try:
+                        self._log_heartbeat()
+                    except Exception as e:
+                        log.error(f"[main] log_heartbeat error: {e}")
                     last_heartbeat = now
 
                 try:
@@ -178,6 +188,8 @@ class KoreanSunriseService:
 
         except asyncio.CancelledError:
             log.info("Received CancelledError")
+        except Exception as e:
+            log.exception(f"[main] Exception in main run loop: {e}")
         finally:
             await self.shutdown()
 
@@ -243,7 +255,10 @@ def main() -> None:
     try:
         asyncio.run(main_async())
     except KeyboardInterrupt:
-        pass
+        log.info("[main] KeyboardInterrupt received. Exiting.")
+    except Exception as e:
+        log.exception(f"[main] Fatal unhandled exception in main: {e}")
+        raise
 
 
 if __name__ == "__main__":
