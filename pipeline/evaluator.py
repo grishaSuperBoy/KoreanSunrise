@@ -26,7 +26,7 @@ import os
 import statistics
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from config import MIN_ORDER_USD, STEALTH_DEPTH_FRACTION
 from pipeline.pool_state import PoolStateManager
@@ -192,6 +192,50 @@ class SunriseEvaluator:
         self.min_profit_factor = min_profit_factor
         self.min_win_rate = min_win_rate
         self.pool = pool_state or PoolStateManager()
+        self.regime_stats: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    def get_regime_breakdown(self) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """Returns statistical performance breakdown grouped by (strategy, market_regime)."""
+        return self.regime_stats
+
+    def _build_regime_breakdown(
+        self, regime_records: Dict[Tuple[str, str], List[float]]
+    ) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        stats: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for (strat, reg), pnls in regime_records.items():
+            if not pnls:
+                continue
+            n = len(pnls)
+            gains = sum(p for p in pnls if p > 0)
+            losses = sum(abs(p) for p in pnls if p < 0)
+            win_count = sum(1 for p in pnls if p > 0)
+            win_rate = (win_count / n) * 100.0 if n > 0 else 0.0
+            pf = round(gains / losses, 2) if losses > 0 else (5.0 if gains > 0 else 0.0)
+            stats[(strat, reg)] = {
+                "strategy": strat,
+                "regime": reg,
+                "count": n,
+                "mean_net_pnl_bps": round(statistics.mean(pnls), 2),
+                "median_net_pnl_bps": round(statistics.median(pnls), 2),
+                "win_rate_pct": round(win_rate, 1),
+                "profit_factor": pf,
+                "total_pnl_bps": round(sum(pnls), 2),
+            }
+        return stats
+
+    def _log_regime_report(self, stats: Dict[Tuple[str, str], Dict[str, Any]]) -> None:
+        log.info("====================================================================================================")
+        log.info("                      QUANTITATIVE MARKET REGIME PERFORMANCE BREAKDOWN                              ")
+        log.info("====================================================================================================")
+        log.info("  STRATEGY    | REGIME       | COUNT | MEAN PNL  | MED PNL   | WIN RATE | PROFIT FACTOR | TOTAL PNL ")
+        log.info("----------------------------------------------------------------------------------------------------")
+        for (strat, reg), st in sorted(stats.items()):
+            log.info(
+                f"  {strat:<12}| {reg:<13}| {st['count']:>5d} | "
+                f"{st['mean_net_pnl_bps']:>+8.2f} b| {st['median_net_pnl_bps']:>+8.2f} b| "
+                f"{st['win_rate_pct']:>7.1f}% | {st['profit_factor']:>13.2f} | {st['total_pnl_bps']:>+9.1f} b"
+            )
+        log.info("====================================================================================================")
 
     def run(self, dry_run: bool = False) -> List[Dict[str, Any]]:
         t0 = time.time()
@@ -205,6 +249,7 @@ class SunriseEvaluator:
         log.info(f"[evaluator] Processing {len(files)} compressed signal archives...")
 
         accumulators: Dict[str, CoinSignalAccumulator] = defaultdict(lambda: CoinSignalAccumulator(""))
+        regime_records: Dict[Tuple[str, str], List[float]] = defaultdict(list)
         total_rows = 0
 
         for fpath in files:
@@ -216,6 +261,14 @@ class SunriseEvaluator:
                     accumulators[coin] = CoinSignalAccumulator(coin)
                 accumulators[coin].add_signal(row)
                 total_rows += 1
+
+                net_pnl = row.get("net_pnl_bps")
+                if net_pnl is not None and math.isfinite(float(net_pnl)):
+                    strat = str(row.get("strategy") or "lead_lag").lower()
+                    reg = str(row.get("market_regime") or "NEUTRAL").upper()
+                    regime_records[(strat, reg)].append(float(net_pnl))
+
+        self.regime_stats = self._build_regime_breakdown(regime_records)
 
         # Finalize stats
         all_stats: List[Dict[str, Any]] = []
@@ -257,6 +310,9 @@ class SunriseEvaluator:
                 f"N={q['event_count']} | Depth: ${q['top3_depth_usd']:>6.0f} | "
                 f"Cap15%: ${q['stealth_capacity_usd']:>5.0f} | MFE: +{q['mean_mfe_bps']:.1f} bps"
             )
+
+        if self.regime_stats:
+            self._log_regime_report(self.regime_stats)
 
         if not dry_run:
             self.pool.reload()

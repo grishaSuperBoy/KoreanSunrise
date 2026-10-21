@@ -10,8 +10,8 @@ from pipeline.market_regime import MarketRegime, MarketRegimeDetector, MarketReg
 class TestMarketRegimeDetector(unittest.TestCase):
     def setUp(self):
         self.detector = MarketRegimeDetector(
-            btc_dump_30s_bps=-20.0,
-            btc_dump_300s_bps=-45.0,
+            btc_dump_30s_bps=-30.0,
+            btc_dump_300s_bps=-80.0,
             btc_pump_300s_bps=30.0,
             dump_cooldown_sec=60.0,
             breadth_dump_threshold=25.0,
@@ -143,6 +143,93 @@ class TestMarketRegimeDetector(unittest.TestCase):
         self.assertIn("breadth_pct_300s", d)
         self.assertIn("btc_ret_30s_bps", d)
         self.assertIn("btc_dump_active", d)
+
+    def test_regime_modifiers_tuning(self):
+        now = 1000.0
+        # In NEUTRAL warmup: 1.0 baseline across all metrics
+        e_l, d_l, s_l = self.detector.get_regime_modifiers("long", now)
+        e_s, d_s, s_s = self.detector.get_regime_modifiers("short", now)
+        self.assertEqual((e_l, d_l, s_l), (1.0, 1.0, 1.0))
+        self.assertEqual((e_s, d_s, s_s), (1.0, 1.0, 1.0))
+
+        # Trigger flash dump: 100,000 -> 99,700
+        self.detector.on_btc_tick(100000.0, now - 40.0)
+        self.detector.on_btc_tick(100000.0, now - 20.0)
+        self.detector.on_btc_tick(99700.0, now)
+        e_l, d_l, s_l = self.detector.get_regime_modifiers("long", now)
+        e_s, d_s, s_s = self.detector.get_regime_modifiers("short", now)
+        # In flash dump: Long size 0.0 (vetoed), Short size 1.5x (boosted)
+        self.assertEqual(s_l, 0.0)
+        self.assertEqual(s_s, 1.5)
+        self.assertEqual(e_s, 0.7)
+
+    def test_btc_minor_noise_does_not_trigger_dump(self):
+        t0 = 2000.0
+        # Normal BTC noise: -20 bps (100,000 -> 99,800)
+        self.detector.on_btc_tick(100000.0, t0 - 40.0)
+        self.detector.on_btc_tick(99800.0, t0)
+        snap = self.detector.get_regime(t0)
+        self.assertFalse(snap.btc_dump_active)
+        self.assertNotEqual(snap.regime, MarketRegime.FLASH_DUMP)
+
+    def test_btc_moderate_dump_filtered_by_bullish_breadth(self):
+        t0 = 3000.0
+        coins = [f"COIN_{i}" for i in range(10)]
+        # 300s ago all at 10.0
+        for c in coins:
+            self.detector.on_alt_tick(c, 10.0, t0 - 300.0)
+        # Now: 8 out of 10 coins surged (80% green breadth)
+        for c in coins[:8]:
+            self.detector.on_alt_tick(c, 10.5, t0)
+        for c in coins[8:]:
+            self.detector.on_alt_tick(c, 9.8, t0)
+
+        # BTC flickers down by -32 bps in 30s
+        self.detector.on_btc_tick(100000.0, t0 - 40.0)
+        self.detector.on_btc_tick(99680.0, t0)
+
+        snap = self.detector.get_regime(t0)
+        # Bullish breadth (80%) filters out the BTC noise! Longs not vetoed!
+        self.assertFalse(snap.btc_dump_active)
+        self.assertNotEqual(snap.regime, MarketRegime.FLASH_DUMP)
+
+    def test_btc_moderate_dump_confirmed_by_bearish_breadth(self):
+        t0 = 4000.0
+        coins = [f"COIN_{i}" for i in range(10)]
+        for c in coins:
+            self.detector.on_alt_tick(c, 10.0, t0 - 300.0)
+        # Now: 8 out of 10 coins dropped (only 20% breadth)
+        for c in coins[:2]:
+            self.detector.on_alt_tick(c, 10.5, t0)
+        for c in coins[2:]:
+            self.detector.on_alt_tick(c, 9.5, t0)
+
+        # BTC drops -32 bps in 30s
+        self.detector.on_btc_tick(100000.0, t0 - 40.0)
+        self.detector.on_btc_tick(99680.0, t0)
+
+        snap = self.detector.get_regime(t0)
+        # Bearish breadth confirms the dump!
+        self.assertTrue(snap.btc_dump_active)
+        self.assertEqual(snap.regime, MarketRegime.FLASH_DUMP)
+
+    def test_btc_severe_crash_unconditional(self):
+        t0 = 5000.0
+        coins = [f"COIN_{i}" for i in range(10)]
+        for c in coins:
+            self.detector.on_alt_tick(c, 10.0, t0 - 300.0)
+        # Even if alts were green:
+        for c in coins:
+            self.detector.on_alt_tick(c, 10.5, t0)
+
+        # Violent BTC drop: -55 bps (100,000 -> 99,450)
+        self.detector.on_btc_tick(100000.0, t0 - 40.0)
+        self.detector.on_btc_tick(99450.0, t0)
+
+        snap = self.detector.get_regime(t0)
+        # Severe crash triggers unconditionally!
+        self.assertTrue(snap.btc_dump_active)
+        self.assertEqual(snap.regime, MarketRegime.FLASH_DUMP)
 
 
 if __name__ == "__main__":

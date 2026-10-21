@@ -171,11 +171,13 @@ class KoreanEngine:
         # O(1) follower lookup index: coin -> set of follower exchanges
         self._coin_followers: Dict[str, Set[str]] = defaultdict(set)
 
-        # Upbit recent taker buys: coin -> deque of (ts, trade_usd)
+        # Upbit recent taker buys/sells: coin -> deque of (ts, trade_usd)
         self._buys_lock = threading.Lock()
         self._upbit_recent_buys: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=200))
+        self._upbit_recent_sells: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=200))
         self._has_upbit_trades: Dict[str, bool] = defaultdict(bool)
         self._bithumb_recent_buys: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=200))
+        self._bithumb_recent_sells: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=200))
         self._has_bithumb_trades: Dict[str, bool] = defaultdict(bool)
 
         # Korean leader normalisation state per coin:
@@ -200,10 +202,15 @@ class KoreanEngine:
             "ticks_bithumb": 0,
             "ticks_followers": 0,
             "trades_upbit": 0,
+            "trades_upbit_sells": 0,
             "trades_bithumb": 0,
+            "trades_bithumb_sells": 0,
             "cancels_blocked": 0,
+            "cancels_blocked_sells": 0,
             "korean_unconfirmed_blocked": 0,
             "signals_triggered": 0,
+            "signals_long": 0,
+            "signals_short": 0,
             "signals_battle": 0,
             "signals_incubator": 0,
             "signals_converged": 0,
@@ -228,6 +235,7 @@ class KoreanEngine:
 
         # Macro Market Regime & Altcoin Breadth Engine
         self.regime_detector = MarketRegimeDetector()
+        self.regime_benchmark_exchange = getattr(C, "REGIME_BENCHMARK_EXCHANGE", "binance").lower()
 
         # Multi-Strategy Quantitative Suite:
         # Strategy 1: Korean Sunrise Momentum (Upbit Sweep Lead-Lag)
@@ -361,10 +369,16 @@ class KoreanEngine:
         ex = snap.exchange.lower()
         coin = snap.symbol.upper()
 
-        if coin == "BTC":
-            self.regime_detector.on_btc_tick(snap.mid_price, now)
-        else:
-            self.regime_detector.on_alt_tick(coin, snap.mid_price, now)
+        # Macro Market Regime Benchmark:
+        # Strictly feed ticks from the benchmark follower exchange (default: "binance").
+        # Upbit/Bithumb MUST NEVER be ingested into the BTC velocity or alt breadth buffer
+        # because KRW Kimchi premium (+150-300 bps) and multi-exchange tick interleaving
+        # create synthetic price jumps of 50+ bps, falsely tripping the flash dump circuit breaker.
+        if ex == self.regime_benchmark_exchange:
+            if coin == "BTC":
+                self.regime_detector.on_btc_tick(snap.mid_price, now)
+            else:
+                self.regime_detector.on_alt_tick(coin, snap.mid_price, now)
 
         key = (ex, coin)
 
@@ -434,17 +448,19 @@ class KoreanEngine:
             # Strategy 3: Maker Liquidity Harvesting / Taker Hunter (using follower's own EWMA spread baseline and freshness check)
             f_recv = self._recv_ts.get((ex, coin), now)
             self.strat_maker.on_follower_tick(ex, coin, snap, now, norm_spread_bps=f_norm_spread, recv_ts=f_recv)
+            cur_regime = self.regime_detector.get_regime(now).regime.value
             self.strat_maker.check_void_opportunity(
                 ex, coin, snap, upbit_snap, now,
                 norm_spread_bps=f_norm_spread,
                 recv_ts=f_recv,
                 is_warmed_up=is_f_warmed,
+                market_regime=cur_regime,
             )
 
     def on_upbit_trade(self, coin: str, trade_usd: float, is_taker_buy: bool, ts: float) -> None:
         """
         Real-time trade stream ingestion from Upbit.
-        Records taker buys to verify liquidity sweeps and reject MM quote cancellations.
+        Records taker buys/sells to verify liquidity sweeps and reject MM quote cancellations.
         Thread-safe across concurrent WebSocket worker threads.
         """
         self.regime_detector.on_korean_trade(trade_usd, is_taker_buy, ts)
@@ -454,11 +470,14 @@ class KoreanEngine:
             self._has_upbit_trades[c] = True
             if is_taker_buy and trade_usd > 0.0:
                 self._upbit_recent_buys[c].append((ts, trade_usd))
+            elif (not is_taker_buy) and trade_usd > 0.0:
+                self.counters["trades_upbit_sells"] = self.counters.get("trades_upbit_sells", 0) + 1
+                self._upbit_recent_sells[c].append((ts, trade_usd))
 
     def on_bithumb_trade(self, coin: str, trade_usd: float, is_taker_buy: bool, ts: float) -> None:
         """
         Real-time trade stream ingestion from Bithumb.
-        Records taker buys to verify Bithumb liquidity sweeps and volume explosions.
+        Records taker buys/sells to verify Bithumb liquidity sweeps and volume explosions.
         Thread-safe across concurrent WebSocket worker threads.
         """
         self.regime_detector.on_korean_trade(trade_usd, is_taker_buy, ts)
@@ -468,6 +487,9 @@ class KoreanEngine:
             self._has_bithumb_trades[c] = True
             if is_taker_buy and trade_usd > 0.0:
                 self._bithumb_recent_buys[c].append((ts, trade_usd))
+            elif (not is_taker_buy) and trade_usd > 0.0:
+                self.counters["trades_bithumb_sells"] = self.counters.get("trades_bithumb_sells", 0) + 1
+                self._bithumb_recent_sells[c].append((ts, trade_usd))
 
     def get_recent_upbit_buys(self, coin: str, cutoff: float) -> Tuple[float, bool]:
         """
@@ -486,6 +508,22 @@ class KoreanEngine:
             has_trades = self._has_upbit_trades.get(c, False)
             return recent_buys_usd, has_trades
 
+    def get_recent_upbit_sells(self, coin: str, cutoff: float) -> Tuple[float, bool]:
+        """
+        Thread-safe retrieval and pruning of recent taker sells for a coin on Upbit.
+        Returns (recent_sells_usd, has_trades).
+        """
+        c = coin.upper()
+        with self._buys_lock:
+            sells_deque = self._upbit_recent_sells.get(c)
+            recent_sells_usd = 0.0
+            if sells_deque:
+                while sells_deque and sells_deque[0][0] < cutoff:
+                    sells_deque.popleft()
+                recent_sells_usd = sum(s[1] for s in sells_deque)
+            has_trades = self._has_upbit_trades.get(c, False)
+            return recent_sells_usd, has_trades
+
     def get_recent_bithumb_buys(self, coin: str, cutoff: float) -> Tuple[float, bool]:
         """
         Thread-safe retrieval and pruning of recent taker buys for a coin on Bithumb.
@@ -502,29 +540,51 @@ class KoreanEngine:
             has_trades = self._has_bithumb_trades.get(c, False)
             return recent_buys_usd, has_trades
 
+    def get_recent_bithumb_sells(self, coin: str, cutoff: float) -> Tuple[float, bool]:
+        """
+        Thread-safe retrieval and pruning of recent taker sells for a coin on Bithumb.
+        Returns (recent_sells_usd, has_trades).
+        """
+        c = coin.upper()
+        with self._buys_lock:
+            sells_deque = self._bithumb_recent_sells.get(c)
+            recent_sells_usd = 0.0
+            if sells_deque:
+                while sells_deque and sells_deque[0][0] < cutoff:
+                    sells_deque.popleft()
+                recent_sells_usd = sum(s[1] for s in sells_deque)
+            has_trades = self._has_bithumb_trades.get(c, False)
+            return recent_sells_usd, has_trades
+
     # ----------------------------------------------------------- Korean Norm (EWMA)
     def _update_norm(self, coin: str, snap: OrderBookDepth5, now: float, venue: str = "upbit") -> None:
         norm_map = self._bithumb_norm if venue == "bithumb" else self._upbit_norm
         nrm = norm_map.get(coin)
-        cur_depth = snap.depth_ask_usd
+        cur_depth_ask = snap.depth_ask_usd
         cur_best_ask_usd = snap.best_ask_usd
+        cur_depth_bid = snap.depth_bid_usd
+        cur_best_bid_usd = snap.best_bid_usd
         cur_spread = snap.spread_bps
 
         if nrm is None:
             norm_map[coin] = UpbitNormState(
-                depth_ask=max(cur_depth, DEPTH_FLOOR_USD),
+                depth_ask=max(cur_depth_ask, DEPTH_FLOOR_USD),
                 best_ask_usd=max(cur_best_ask_usd, BEST_ASK_FLOOR_USD),
                 spread_bps=max(cur_spread, 1.0),
                 t=now,
+                depth_bid=max(cur_depth_bid, DEPTH_FLOOR_USD),
+                best_bid_usd=max(cur_best_bid_usd, BEST_ASK_FLOOR_USD),
             )
             return
 
         if isinstance(nrm, dict):
             nrm = norm_map[coin] = UpbitNormState(
-                depth_ask=float(nrm["depth_ask"]),
-                best_ask_usd=float(nrm["best_ask_usd"]),
-                spread_bps=float(nrm["spread_bps"]),
-                t=float(nrm["t"]),
+                depth_ask=float(nrm.get("depth_ask", DEPTH_FLOOR_USD)),
+                best_ask_usd=float(nrm.get("best_ask_usd", BEST_ASK_FLOOR_USD)),
+                spread_bps=float(nrm.get("spread_bps", 20.0)),
+                t=float(nrm.get("t", now)),
+                depth_bid=float(nrm.get("depth_bid", nrm.get("depth_ask", DEPTH_FLOOR_USD))),
+                best_bid_usd=float(nrm.get("best_bid_usd", nrm.get("best_ask_usd", BEST_ASK_FLOOR_USD))),
             )
 
         dt = max(0.0, now - nrm.t)
@@ -532,11 +592,15 @@ class KoreanEngine:
         a = 1.0 - math.exp(-dt / NORM_TAU)
 
         clamped_spread = min(cur_spread, nrm.spread_bps * 5.0)
-        clamped_depth = min(cur_depth, nrm.depth_ask * 5.0)
+        clamped_depth_ask = min(cur_depth_ask, nrm.depth_ask * 5.0)
         clamped_best_ask = min(cur_best_ask_usd, nrm.best_ask_usd * 5.0)
+        clamped_depth_bid = min(cur_depth_bid, (getattr(nrm, "depth_bid", 0.0) or cur_depth_bid) * 5.0)
+        clamped_best_bid = min(cur_best_bid_usd, (getattr(nrm, "best_bid_usd", 0.0) or cur_best_bid_usd) * 5.0)
 
-        nrm.depth_ask = max((1.0 - a) * nrm.depth_ask + a * clamped_depth, DEPTH_FLOOR_USD)
+        nrm.depth_ask = max((1.0 - a) * nrm.depth_ask + a * clamped_depth_ask, DEPTH_FLOOR_USD)
         nrm.best_ask_usd = max((1.0 - a) * nrm.best_ask_usd + a * clamped_best_ask, BEST_ASK_FLOOR_USD)
+        nrm.depth_bid = max((1.0 - a) * (getattr(nrm, "depth_bid", 0.0) or cur_depth_bid) + a * clamped_depth_bid, DEPTH_FLOOR_USD)
+        nrm.best_bid_usd = max((1.0 - a) * (getattr(nrm, "best_bid_usd", 0.0) or cur_best_bid_usd) + a * clamped_best_bid, BEST_ASK_FLOOR_USD)
         nrm.spread_bps = max((1.0 - a) * nrm.spread_bps + a * clamped_spread, 0.5)
 
     def _update_upbit_norm(self, coin: str, snap: OrderBookDepth5, now: float) -> None:
@@ -551,6 +615,11 @@ class KoreanEngine:
         """Public inspection API: retrieves normalized spread in bps for a leader venue safely across object/dict states."""
         norm_map = self._bithumb_norm if venue.lower() == "bithumb" else self._upbit_norm
         return _extract_spread_bps(norm_map.get(coin), default=default)
+
+    @property
+    def current_regime(self) -> str:
+        """Current real-time macro market regime ('STRONG_PUMP', 'BULL_DRIFT', 'NEUTRAL', 'BEAR_DRIFT', 'FLASH_DUMP')."""
+        return self.regime_detector.get_regime().regime.value
     # ----------------------------------------------------------- Signal Logic
     def _eval_lead_lag(
         self,
@@ -582,64 +651,116 @@ class KoreanEngine:
 
         # Test fixture compatibility: unit tests (e.g. test_korean_engine_strategy) inject raw dict mocks into _upbit_norm
         if isinstance(nrm, dict):
-            norm_depth = float(nrm.get("depth_ask", DEPTH_FLOOR_USD))
+            norm_depth_ask = float(nrm.get("depth_ask", DEPTH_FLOOR_USD))
             norm_best_ask_usd = float(nrm.get("best_ask_usd", BEST_ASK_FLOOR_USD))
+            norm_depth_bid = float(nrm.get("depth_bid", norm_depth_ask))
+            norm_best_bid_usd = float(nrm.get("best_bid_usd", norm_best_ask_usd))
         else:
-            norm_depth = nrm.depth_ask
+            norm_depth_ask = nrm.depth_ask
             norm_best_ask_usd = nrm.best_ask_usd
+            norm_depth_bid = getattr(nrm, "depth_bid", 0.0) or norm_depth_ask
+            norm_best_bid_usd = getattr(nrm, "best_bid_usd", 0.0) or norm_best_ask_usd
         norm_spread = _extract_spread_bps(nrm, default=20.0)
 
-        cur_depth = leader_snap.depth_ask_usd
+        cur_depth_ask = leader_snap.depth_ask_usd
+        cur_depth_bid = leader_snap.depth_bid_usd
         cur_spread = leader_snap.spread_bps
-
-        trigger_type: Optional[str] = None
-        drain_ratio = 0.0
-        swept_usd = 0.0
         blowout_ratio = cur_spread / max(norm_spread, 0.5)
+
+        long_edge_mult, long_drain_mult, long_size_mult = self.regime_detector.get_regime_modifiers("long", now)
+        short_edge_mult, short_drain_mult, short_size_mult = self.regime_detector.get_regime_modifiers("short", now)
+
+        long_trigger_type: Optional[str] = None
+        long_drain_ratio = 0.0
+        long_swept_usd = 0.0
+
+        short_trigger_type: Optional[str] = None
+        short_drain_ratio = 0.0
+        short_swept_usd = 0.0
 
         ask_lifted = leader_snap.best_ask > prev_leader_snap.best_ask * (1.0 + 1e-7)
         ask_held = abs(leader_snap.best_ask - prev_leader_snap.best_ask) <= prev_leader_snap.best_ask * 1e-7
         bid_non_decreasing = leader_snap.best_bid >= prev_leader_snap.best_bid * (1.0 - 1e-7)
 
-        # 1. True Depth Drain
+        bid_dropped = leader_snap.best_bid < prev_leader_snap.best_bid * (1.0 - 1e-7)
+        bid_held = abs(leader_snap.best_bid - prev_leader_snap.best_bid) <= prev_leader_snap.best_bid * 1e-7
+        ask_non_increasing = leader_snap.best_ask <= prev_leader_snap.best_ask * (1.0 + 1e-7)
+
+        eff_long_drain = self.drain_threshold * long_drain_mult
+        eff_short_drain = self.drain_threshold * short_drain_mult
+
+        # 1. Long Depth Drain
         if ask_lifted and bid_non_decreasing:
             swept_top_level = prev_leader_snap.best_ask_usd
-            top5_loss = max(0.0, prev_leader_snap.depth_ask_usd - cur_depth)
-            swept_usd = max(top5_loss, swept_top_level)
-            drain_ratio = max(
-                swept_usd / max(norm_depth, DEPTH_FLOOR_USD),
+            top5_loss = max(0.0, prev_leader_snap.depth_ask_usd - cur_depth_ask)
+            long_swept_usd = max(top5_loss, swept_top_level)
+            long_drain_ratio = max(
+                long_swept_usd / max(norm_depth_ask, DEPTH_FLOOR_USD),
                 swept_top_level / max(norm_best_ask_usd * 2.0, DEPTH_FLOOR_USD),
             )
-            if drain_ratio >= self.drain_threshold:
-                trigger_type = "depth_drain"
+            if long_drain_ratio >= eff_long_drain:
+                long_trigger_type = "depth_drain"
 
         elif ask_held and bid_non_decreasing:
             best_ask_loss = prev_leader_snap.best_ask_usd - leader_snap.best_ask_usd
-            top5_loss = prev_leader_snap.depth_ask_usd - cur_depth
+            top5_loss = prev_leader_snap.depth_ask_usd - cur_depth_ask
             if best_ask_loss > 0 and top5_loss > 0:
                 if best_ask_loss >= 0.5 * top5_loss:
-                    swept_usd = top5_loss
-                    drain_ratio = top5_loss / max(norm_depth, DEPTH_FLOOR_USD)
-                    if drain_ratio >= self.drain_threshold:
-                        trigger_type = "depth_drain"
+                    long_swept_usd = top5_loss
+                    long_drain_ratio = top5_loss / max(norm_depth_ask, DEPTH_FLOOR_USD)
+                    if long_drain_ratio >= eff_long_drain:
+                        long_trigger_type = "depth_drain"
 
-        # 2. Upward Spread Blowout
+        # 2. Long Upward Spread Blowout
         if (
-            trigger_type is None
+            long_trigger_type is None
             and ask_lifted
             and bid_non_decreasing
             and blowout_ratio >= self.blowout_threshold
         ):
-            trigger_type = "spread_blowout"
-            swept_usd = max(prev_leader_snap.best_ask_usd, max(0.0, prev_leader_snap.depth_ask_usd - cur_depth))
+            long_trigger_type = "spread_blowout"
+            long_swept_usd = max(prev_leader_snap.best_ask_usd, max(0.0, prev_leader_snap.depth_ask_usd - cur_depth_ask))
+
+        # 3. Short Depth Drain
+        if bid_dropped and ask_non_increasing:
+            swept_top_level_bid = prev_leader_snap.best_bid_usd
+            top5_loss_bid = max(0.0, prev_leader_snap.depth_bid_usd - cur_depth_bid)
+            short_swept_usd = max(top5_loss_bid, swept_top_level_bid)
+            short_drain_ratio = max(
+                short_swept_usd / max(norm_depth_bid, DEPTH_FLOOR_USD),
+                swept_top_level_bid / max(norm_best_bid_usd * 2.0, DEPTH_FLOOR_USD),
+            )
+            if short_drain_ratio >= eff_short_drain:
+                short_trigger_type = "depth_drain"
+
+        elif bid_held and ask_non_increasing:
+            best_bid_loss = prev_leader_snap.best_bid_usd - leader_snap.best_bid_usd
+            top5_loss_bid = prev_leader_snap.depth_bid_usd - cur_depth_bid
+            if best_bid_loss > 0 and top5_loss_bid > 0:
+                if best_bid_loss >= 0.5 * top5_loss_bid:
+                    short_swept_usd = top5_loss_bid
+                    short_drain_ratio = top5_loss_bid / max(norm_depth_bid, DEPTH_FLOOR_USD)
+                    if short_drain_ratio >= eff_short_drain:
+                        short_trigger_type = "depth_drain"
+
+        # 4. Short Downward Spread Blowout
+        if (
+            short_trigger_type is None
+            and bid_dropped
+            and ask_non_increasing
+            and blowout_ratio >= self.blowout_threshold
+        ):
+            short_trigger_type = "spread_blowout"
+            short_swept_usd = max(prev_leader_snap.best_bid_usd, max(0.0, prev_leader_snap.depth_bid_usd - cur_depth_bid))
 
         # Cancel vs. Sweep Discrimination (Anti-Ghosting Guard)
         recent_buys_usd = 0.0
         is_cancel_blocked = False
-        saved_trigger_type = trigger_type
-        saved_swept_usd = swept_usd
-        if trigger_type is not None:
-            cutoff = now - getattr(self, "trade_confirm_lookback_sec", 2.0)
+        saved_trigger_type = long_trigger_type
+        saved_swept_usd = long_swept_usd
+        cutoff = now - getattr(self, "trade_confirm_lookback_sec", 2.0)
+
+        if long_trigger_type is not None:
             if leader_ex == "bithumb":
                 recent_buys_usd, has_trades = self.get_recent_bithumb_buys(coin, cutoff)
             else:
@@ -648,24 +769,61 @@ class KoreanEngine:
             should_verify_trades = self.require_trade_confirmation or has_trades
             if should_verify_trades:
                 ratio_needed = 0.25 if ask_held else 0.15
-                min_buys_needed = max(getattr(self, "min_trade_confirm_floor_usd", 5.0), swept_usd * ratio_needed)
+                min_buys_needed = max(getattr(self, "min_trade_confirm_floor_usd", 5.0), long_swept_usd * ratio_needed)
 
                 if recent_buys_usd < min_buys_needed:
                     self.counters["cancels_blocked"] = self.counters.get("cancels_blocked", 0) + 1
                     is_cancel_blocked = True
                     log.debug(
                         f"[engine] Blocked false sweep / MM cancel on {leader_ex.capitalize()} {coin}: "
-                        f"swept_usd=${swept_usd:.1f}, but recent taker buys=${recent_buys_usd:.1f} "
+                        f"swept_usd=${long_swept_usd:.1f}, but recent taker buys=${recent_buys_usd:.1f} "
                         f"(needed ${min_buys_needed:.1f})"
                     )
-                    trigger_type = None
-                    swept_usd = 0.0
-                    drain_ratio = 0.0
+                    long_trigger_type = None
+                    long_swept_usd = 0.0
+                    long_drain_ratio = 0.0
 
-            if leader_ex == "bithumb" and trigger_type is not None:
+            if leader_ex == "bithumb" and long_trigger_type is not None:
                 min_bithumb_swept = getattr(C, "BITHUMB_MIN_SWEPT_USD", 3000.0)
-                if swept_usd < min_bithumb_swept and recent_buys_usd < min_bithumb_swept:
-                    trigger_type = None
+                if long_swept_usd < min_bithumb_swept and recent_buys_usd < min_bithumb_swept:
+                    long_trigger_type = None
+
+        recent_sells_usd = 0.0
+        if short_trigger_type is not None:
+            if leader_ex == "bithumb":
+                recent_sells_usd, has_trades_s = self.get_recent_bithumb_sells(coin, cutoff)
+            else:
+                recent_sells_usd, has_trades_s = self.get_recent_upbit_sells(coin, cutoff)
+
+            should_verify_sells = self.require_trade_confirmation or has_trades_s
+            if should_verify_sells:
+                ratio_needed = 0.25 if bid_held else 0.15
+                min_sells_needed = max(getattr(self, "min_trade_confirm_floor_usd", 5.0), short_swept_usd * ratio_needed)
+
+                if recent_sells_usd < min_sells_needed:
+                    self.counters["cancels_blocked_sells"] = self.counters.get("cancels_blocked_sells", 0) + 1
+                    log.debug(
+                        f"[engine] Blocked false bid sweep / MM cancel on {leader_ex.capitalize()} {coin}: "
+                        f"swept_usd=${short_swept_usd:.1f}, but recent taker sells=${recent_sells_usd:.1f} "
+                        f"(needed ${min_sells_needed:.1f})"
+                    )
+                    short_trigger_type = None
+                    short_swept_usd = 0.0
+                    short_drain_ratio = 0.0
+
+            if leader_ex == "bithumb" and short_trigger_type is not None:
+                min_bithumb_swept = getattr(C, "BITHUMB_MIN_SWEPT_USD", 3000.0)
+                if short_swept_usd < min_bithumb_swept and recent_sells_usd < min_bithumb_swept:
+                    short_trigger_type = None
+
+        active_side = "long" if long_trigger_type else ("short" if short_trigger_type else None)
+        trigger_type = long_trigger_type or short_trigger_type
+        swept_usd = long_swept_usd if active_side == "long" else short_swept_usd
+        drain_ratio = long_drain_ratio if active_side == "long" else short_drain_ratio
+        norm_depth = norm_depth_ask if active_side == "long" else norm_depth_bid
+        recent_trade_usd = recent_buys_usd if active_side == "long" else recent_sells_usd
+        edge_mult = long_edge_mult if active_side == "long" else short_edge_mult
+        size_mult = long_size_mult if active_side == "long" else short_size_mult
 
         with self._engine_lock:
             follower_exchanges = set(self._coin_followers.get(coin, set()))
@@ -726,6 +884,7 @@ class KoreanEngine:
                         cur_diff = (upbit_book.mid_price - f_book.mid_price) / f_book.mid_price * 1e4
                     return pair_st.is_stable(t, current_diff_bps=cur_diff)
 
+                cur_regime = self.regime_detector.get_regime(now).regime.value
                 self.strat_fade.on_fakeout_detected(
                     coin=coin,
                     trigger_type=fade_trig,
@@ -734,6 +893,7 @@ class KoreanEngine:
                     follower_snaps=f_snaps,
                     now=now,
                     fade_reason=fade_reason,
+                    market_regime=cur_regime,
                     is_stable_pair_fn=_is_pair_stable_for_fade,
                     recv_ts_map=self._recv_ts,
                 )
@@ -775,9 +935,12 @@ class KoreanEngine:
                     drain_ratio=drain_ratio,
                     blowout_ratio=blowout_ratio,
                     now=now,
-                    recent_buys_usd=recent_buys_usd,
+                    recent_buys_usd=recent_trade_usd,
                     leader_ex=leader_ex,
                     leader_snap=leader_snap,
+                    side=active_side or "long",
+                    edge_multiplier=edge_mult,
+                    size_multiplier=size_mult,
                 )
 
             with self._engine_lock:
@@ -804,17 +967,27 @@ class KoreanEngine:
         recent_buys_usd: float = 0.0,
         leader_ex: str = "upbit",
         leader_snap: Optional[OrderBookDepth5] = None,
+        side: str = "long",
+        edge_multiplier: float = 1.0,
+        size_multiplier: float = 1.0,
     ) -> None:
         leader_snap_to_use = leader_snap if leader_snap is not None else upbit_snap
         if leader_snap_to_use is None or f_snap is None:
             return
 
-        # Macro Market Regime & Flash Dump Circuit Breaker
-        long_allowed, long_reason = self.regime_detector.is_long_allowed(now)
-        if not long_allowed:
-            self.counters["regime_dump_blocked"] = self.counters.get("regime_dump_blocked", 0) + 1
-            log.info(f"[REGIME-VETO] S1 Long blocked on {coin} @ {follower_ex}: {long_reason}")
-            return
+        # Macro Market Regime & Flash Dump Circuit Breaker / Pump Shield
+        if side == "short":
+            short_allowed, short_reason = self.regime_detector.is_short_allowed(now)
+            if not short_allowed:
+                self.counters["regime_pump_blocked_shorts"] = self.counters.get("regime_pump_blocked_shorts", 0) + 1
+                log.info(f"[REGIME-SHIELD] S1 Short blocked on {coin} @ {follower_ex}: {short_reason}")
+                return
+        else:
+            long_allowed, long_reason = self.regime_detector.is_long_allowed(now)
+            if not long_allowed:
+                self.counters["regime_dump_blocked"] = self.counters.get("regime_dump_blocked", 0) + 1
+                log.info(f"[REGIME-VETO] S1 Long blocked on {coin} @ {follower_ex}: {long_reason}")
+                return
 
         pair_cfg = self.get_pair_threshold_config(coin, follower_ex, leader_ex=leader_ex)
         seq_num = next(self._seq)
@@ -837,6 +1010,9 @@ class KoreanEngine:
             seq_num=seq_num,
             pool_state=self.pool_state,
             profile_manager=self.profile_manager,
+            side=side,
+            edge_multiplier=edge_multiplier,
+            size_multiplier=size_multiplier,
         )
         if sig is None:
             return
@@ -860,19 +1036,33 @@ class KoreanEngine:
             # S1 snipes global perps when Korean leaders break out.
             # Confirmation is intentionally permissive (OR): either price parity exists
             # OR taker buying is already active on the peer Korean venue, validating leadership.
-            if leader_ex == "upbit":
-                recent_other_buys, _ = self.get_recent_bithumb_buys(coin, cutoff)
-                sig.korean_spread_bps = round((other_snap.mid_price - leader_snap_to_use.mid_price) / leader_snap_to_use.mid_price * 1e4, 1)
-                parity = (other_snap.mid_price >= leader_snap_to_use.mid_price * 0.9995)
-                # Volume confirmation requires non-dust flow (>= min_confirm_usd in prod, > 0 in telemetry mode)
-                vol_confirmed = (recent_other_buys >= min_confirm_usd and recent_other_buys > 0) if min_confirm_usd > 0 else (recent_other_buys > 0)
-                sig.korean_confirmed = parity or vol_confirmed
+            if side == "short":
+                if leader_ex == "upbit":
+                    recent_other_sells, _ = self.get_recent_bithumb_sells(coin, cutoff)
+                    sig.korean_spread_bps = round((other_snap.mid_price - leader_snap_to_use.mid_price) / leader_snap_to_use.mid_price * 1e4, 1)
+                    parity = (other_snap.mid_price <= leader_snap_to_use.mid_price * 1.0005)
+                    vol_confirmed = (recent_other_sells >= min_confirm_usd and recent_other_sells > 0) if min_confirm_usd > 0 else (recent_other_sells > 0)
+                    sig.korean_confirmed = parity or vol_confirmed
+                else:
+                    recent_other_sells, _ = self.get_recent_upbit_sells(coin, cutoff)
+                    sig.korean_spread_bps = round((leader_snap_to_use.mid_price - other_snap.mid_price) / other_snap.mid_price * 1e4, 1)
+                    parity = (leader_snap_to_use.mid_price <= other_snap.mid_price * 1.0005)
+                    vol_confirmed = (recent_other_sells >= min_confirm_usd and recent_other_sells > 0) if min_confirm_usd > 0 else (recent_other_sells > 0)
+                    sig.korean_confirmed = parity or vol_confirmed
             else:
-                recent_other_buys, _ = self.get_recent_upbit_buys(coin, cutoff)
-                sig.korean_spread_bps = round((leader_snap_to_use.mid_price - other_snap.mid_price) / other_snap.mid_price * 1e4, 1)
-                parity = (leader_snap_to_use.mid_price >= other_snap.mid_price * 0.9995)
-                vol_confirmed = (recent_other_buys >= min_confirm_usd and recent_other_buys > 0) if min_confirm_usd > 0 else (recent_other_buys > 0)
-                sig.korean_confirmed = parity or vol_confirmed
+                if leader_ex == "upbit":
+                    recent_other_buys, _ = self.get_recent_bithumb_buys(coin, cutoff)
+                    sig.korean_spread_bps = round((other_snap.mid_price - leader_snap_to_use.mid_price) / leader_snap_to_use.mid_price * 1e4, 1)
+                    parity = (other_snap.mid_price >= leader_snap_to_use.mid_price * 0.9995)
+                    # Volume confirmation requires non-dust flow (>= min_confirm_usd in prod, > 0 in telemetry mode)
+                    vol_confirmed = (recent_other_buys >= min_confirm_usd and recent_other_buys > 0) if min_confirm_usd > 0 else (recent_other_buys > 0)
+                    sig.korean_confirmed = parity or vol_confirmed
+                else:
+                    recent_other_buys, _ = self.get_recent_upbit_buys(coin, cutoff)
+                    sig.korean_spread_bps = round((leader_snap_to_use.mid_price - other_snap.mid_price) / other_snap.mid_price * 1e4, 1)
+                    parity = (leader_snap_to_use.mid_price >= other_snap.mid_price * 0.9995)
+                    vol_confirmed = (recent_other_buys >= min_confirm_usd and recent_other_buys > 0) if min_confirm_usd > 0 else (recent_other_buys > 0)
+                    sig.korean_confirmed = parity or vol_confirmed
 
             # Cross-Korean Confirmation Gate:
             # In live Battle mode (real money execution), block unconfirmed pumps if require_korean_confirmation is on.
@@ -894,16 +1084,18 @@ class KoreanEngine:
             self._active_signals[coin].append(sig)
 
         self.counters["signals_triggered"] += 1
+        self.counters[f"signals_{side}"] = self.counters.get(f"signals_{side}", 0) + 1
         dual_icon = "⚡" if sig.korean_confirmed else ""
         dual_suffix = "+DUAL" if sig.korean_confirmed else ""
         if sig.is_actionable:
             self.counters["signals_battle"] += 1
-            tag = f"[SIGNAL-BATTLE ({leader_ex.upper()}{dual_suffix})] ⚔️{dual_icon}"
+            tag = f"[SIGNAL-BATTLE ({leader_ex.upper()}{dual_suffix}) ({side.upper()})] ⚔️{dual_icon}"
         else:
             self.counters["signals_incubator"] += 1
-            tag = f"[SIGNAL-INCUBATOR ({leader_ex.upper()}{dual_suffix})] 🧪{dual_icon}"
+            tag = f"[SIGNAL-INCUBATOR ({leader_ex.upper()}{dual_suffix}) ({side.upper()})] 🧪{dual_icon}"
 
-        buys_str = f", Buys: ${sig.leader_recent_buys_usd:.0f}" if sig.leader_recent_buys_usd > 0 else ""
+        trades_label = "Buys" if side == "long" else "Sells"
+        buys_str = f", {trades_label}: ${sig.leader_recent_buys_usd:.0f}" if sig.leader_recent_buys_usd > 0 else ""
         kr_str = (
             f" | KR-Conf: {sig.korean_confirmed} ({sig.korean_spread_bps:+.1f}bps)"
             if sig.korean_co_listed
@@ -956,23 +1148,40 @@ class KoreanEngine:
                 return
 
             dt = round(now - sig.open_ts, 3)
+            side = getattr(sig, "side", "long") or "long"
 
             # 1. Mid-to-Mid move on follower and leader (bps)
-            f_mid_move = (
-                (f_snap.mid_price - sig.follower_mid) / sig.follower_mid * 1e4
-                if sig.follower_mid > 0
-                else 0.0
-            )
-            lead_mid_move = (
-                (leader_snap.mid_price - sig.leader_mid) / sig.leader_mid * 1e4
-                if sig.leader_mid > 0
-                else 0.0
-            )
+            if side == "short":
+                f_mid_move = (
+                    (sig.follower_mid - f_snap.mid_price) / sig.follower_mid * 1e4
+                    if sig.follower_mid > 0
+                    else 0.0
+                )
+                lead_mid_move = (
+                    (sig.leader_mid - leader_snap.mid_price) / sig.leader_mid * 1e4
+                    if sig.leader_mid > 0
+                    else 0.0
+                )
+                # True executable move: Entry at VWAP bid -> Exit at current VWAP ask (buy to cover)
+                entry_px = getattr(sig, "follower_entry_px", 0.0) or sig.follower_best_bid
+                exit_px = f_snap.vwap_ask_usd(sig.suggested_size_usd) if sig.suggested_size_usd > 0 else f_snap.best_ask
+                f_exec_move = (entry_px - exit_px) / entry_px * 1e4 if entry_px > 0 else 0.0
+            else:
+                f_mid_move = (
+                    (f_snap.mid_price - sig.follower_mid) / sig.follower_mid * 1e4
+                    if sig.follower_mid > 0
+                    else 0.0
+                )
+                lead_mid_move = (
+                    (leader_snap.mid_price - sig.leader_mid) / sig.leader_mid * 1e4
+                    if sig.leader_mid > 0
+                    else 0.0
+                )
+                # True executable move: Entry at VWAP ask -> Exit at current VWAP bid
+                entry_px = getattr(sig, "follower_entry_px", 0.0) or sig.follower_best_ask
+                exit_px = f_snap.vwap_bid_usd(sig.suggested_size_usd) if sig.suggested_size_usd > 0 else f_snap.best_bid
+                f_exec_move = (exit_px - entry_px) / entry_px * 1e4 if entry_px > 0 else 0.0
 
-            # 2. True executable move on follower: Entry at VWAP ask -> Exit at current VWAP bid (bps)
-            entry_px = getattr(sig, "follower_entry_px", 0.0) or sig.follower_best_ask
-            exit_px = f_snap.vwap_bid_usd(sig.suggested_size_usd) if sig.suggested_size_usd > 0 else f_snap.best_bid
-            f_exec_move = (exit_px - entry_px) / entry_px * 1e4 if entry_px > 0 else 0.0
             cur_net_pnl = round(f_exec_move - self.roundtrip_fee_bps, 2)
 
             # 3. Update MFE / MAE excursion metrics
@@ -990,7 +1199,22 @@ class KoreanEngine:
                 if f_snap.mid_price > 0
                 else 0.0
             )
-            rem_edge = (cur_diff_bps - sig.kimchi_baseline_bps) - self.taker_fee_bps
+            if side == "short":
+                cur_dislocation_bps = sig.kimchi_baseline_bps - cur_diff_bps
+                rem_edge = cur_dislocation_bps - self.taker_fee_bps
+                leader_adverse_bps = (
+                    (leader_snap.mid_price - sig.leader_mid) / sig.leader_mid * 1e4
+                    if sig.leader_mid > 0
+                    else 0.0
+                )
+            else:
+                cur_dislocation_bps = cur_diff_bps - sig.kimchi_baseline_bps
+                rem_edge = cur_dislocation_bps - self.taker_fee_bps
+                leader_adverse_bps = (
+                    (sig.leader_mid - leader_snap.mid_price) / sig.leader_mid * 1e4
+                    if sig.leader_mid > 0
+                    else 0.0
+                )
 
             if (not sig.path or dt > sig.path[-1][0]) and len(sig.path) < 50:
                 sig.path.append([
@@ -1008,13 +1232,6 @@ class KoreanEngine:
             pair_decay_sec = float(pair_cfg.get("alpha_decay_sec", default_decay))
             sigma = max(sig.pair_sigma_bps, 2.0)
 
-            leader_drop_bps = (
-                (sig.leader_mid - leader_snap.mid_price) / sig.leader_mid * 1e4
-                if sig.leader_mid > 0
-                else 0.0
-            )
-            cur_dislocation_bps = cur_diff_bps - sig.kimchi_baseline_bps
-
             close_reason, stop_type = evaluate_exit_reason(
                 cur_net_pnl=cur_net_pnl,
                 net_exec_edge_bps=sig.net_exec_edge_bps,
@@ -1023,7 +1240,7 @@ class KoreanEngine:
                 hold_sec=hold_sec,
                 pair_decay_sec=pair_decay_sec,
                 sigma=sigma,
-                upbit_drop_bps=leader_drop_bps,
+                upbit_drop_bps=leader_adverse_bps,
                 cur_dislocation_bps=cur_dislocation_bps,
                 stop_invalidation_bps=self.stop_invalidation_bps,
                 stop_adverse_pnl_bps=self.stop_adverse_pnl_bps,

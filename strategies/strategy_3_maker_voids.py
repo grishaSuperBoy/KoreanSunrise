@@ -135,12 +135,14 @@ class MakerVoidStrategy:
         norm_spread_bps: float = 20.0,
         recv_ts: Optional[float] = None,
         is_warmed_up: bool = False,
+        market_regime: str = "NEUTRAL",
     ) -> Optional[ActiveMakerVoid]:
         """
         Detects if follower order book presents a tradeable opportunity.
 
         Maker mode: passive post-only inside a widened spread (classic liquidity harvesting).
         Hunter mode: taker lag-arb crossing a TIGHT spread when Upbit leads by a large dislocation.
+        Applies macro market regime filtering to prevent toxic adverse selection.
 
         NOTE: `is_warmed_up` defaults to False for fail-safe behavior. Engine MUST pass it
         explicitly once the follower-spread baseline EWMA has accumulated enough samples.
@@ -155,7 +157,11 @@ class MakerVoidStrategy:
             if (now - snap_ts) > self.max_follower_book_age_sec:
                 return None
 
-            # 0c. Portfolio Exposure Guard
+            # 0c. Macro Regime Guard: Hard veto on FLASH_DUMP (avoid liquidation cascade slippage)
+            if market_regime == "FLASH_DUMP":
+                return None
+
+            # 0d. Portfolio Exposure Guard
             active_voids = [v for v in self._open_voids.values() if not v.closed]
             if len(active_voids) >= self.max_active_voids:
                 return None
@@ -194,10 +200,17 @@ class MakerVoidStrategy:
                 if abs(dislocation_bps) < 40.0:
                     return None
 
+                is_buy_signal = (dislocation_bps > 0)
+                # Macro Regime direction shield for taker hunter
+                if market_regime == "BEAR_DRIFT" and is_buy_signal:
+                    return None  # Do not catch falling knives in bear drift
+                if market_regime == "STRONG_PUMP" and not is_buy_signal:
+                    return None  # Do not short lagging alts into a broad market pump wave
+
                 roundtrip_fee = self.taker_fee_bps * 2.0
                 required_edge = (f_spread / 2.0) + roundtrip_fee + 10.0
 
-                if dislocation_bps > 0:
+                if is_buy_signal:
                     # Upbit leading higher -> BUY, sweeping ask
                     side = "buy"
                     target_limit_px = f_ask

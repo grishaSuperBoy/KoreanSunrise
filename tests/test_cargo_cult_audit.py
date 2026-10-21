@@ -558,6 +558,46 @@ class TestCargoCultAudit(unittest.TestCase):
         st.learn(0.0, now + 37.0)
         self.assertTrue(st.is_stable(now + 38.0), "is_stable recovers True after reversion to normal basis")
 
+    def test_evaluator_market_regime_breakdown(self):
+        """SunriseEvaluator groups and aggregates PnL metrics by market regime and strategy."""
+        import os
+        import tempfile
+        import gzip
+        import json
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            sig_dir = os.path.join(tmp_dir, "signals", "2026-10-21")
+            os.makedirs(sig_dir, exist_ok=True)
+            fpath = os.path.join(sig_dir, "signals_test.jsonl.gz")
+            with gzip.open(fpath, "wt", encoding="utf-8") as f:
+                # 3 signals in STRONG_PUMP (profitable)
+                for i in range(3):
+                    f.write(json.dumps({
+                        "coin": "SOL", "strategy": "lead_lag", "market_regime": "STRONG_PUMP",
+                        "net_pnl_bps": 25.0 + i * 5.0, "drain_ratio": 0.5, "leader_swept_usd": 1000.0,
+                        "follower_top3_ask_usd": 2000.0, "stealth_capacity_usd": 300.0
+                    }) + "\n")
+                # 2 signals in BEAR_DRIFT (losses)
+                for i in range(2):
+                    f.write(json.dumps({
+                        "coin": "SOL", "strategy": "lead_lag", "market_regime": "BEAR_DRIFT",
+                        "net_pnl_bps": -15.0 - i * 5.0, "drain_ratio": 0.5, "leader_swept_usd": 1000.0,
+                        "follower_top3_ask_usd": 2000.0, "stealth_capacity_usd": 300.0
+                    }) + "\n")
+
+            evaluator = SunriseEvaluator(data_root=tmp_dir, days_back=1, min_events=2)
+            evaluator.run(dry_run=True)
+            breakdown = evaluator.get_regime_breakdown()
+            self.assertIn(("lead_lag", "STRONG_PUMP"), breakdown)
+            self.assertIn(("lead_lag", "BEAR_DRIFT"), breakdown)
+            pump_stats = breakdown[("lead_lag", "STRONG_PUMP")]
+            self.assertEqual(pump_stats["count"], 3)
+            self.assertEqual(pump_stats["win_rate_pct"], 100.0)
+            self.assertGreater(pump_stats["mean_net_pnl_bps"], 0.0)
+            bear_stats = breakdown[("lead_lag", "BEAR_DRIFT")]
+            self.assertEqual(bear_stats["count"], 2)
+            self.assertEqual(bear_stats["win_rate_pct"], 0.0)
+            self.assertLess(bear_stats["mean_net_pnl_bps"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

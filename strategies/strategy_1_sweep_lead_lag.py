@@ -34,6 +34,8 @@ class UpbitNormState:
     best_ask_usd: float
     spread_bps: float
     t: float
+    depth_bid: float = 0.0
+    best_bid_usd: float = 0.0
 
     def __getitem__(self, key: str) -> float:
         return getattr(self, key)
@@ -275,6 +277,9 @@ class KoreanLeadLagStrategy:
         seq_num: int,
         pool_state: Any = None,
         profile_manager: Any = None,
+        side: str = "long",
+        edge_multiplier: float = 1.0,
+        size_multiplier: float = 1.0,
     ) -> Optional[SunriseSignal]:
         """Calculates dislocation, edge, stealth sizing, and instantiates SunriseSignal if valid."""
         pool_st = pool_state if pool_state is not None else self.pool_state
@@ -301,7 +306,13 @@ class KoreanLeadLagStrategy:
             return None
 
         raw_diff_bps = (upbit_mid - f_mid) / f_mid * 1e4
-        dislocation_bps = raw_diff_bps - st.baseline_bps
+        if side == "short":
+            # Downward dislocation: Korean leader dropped below follower
+            dislocation_bps = st.baseline_bps - raw_diff_bps
+        else:
+            # Upward dislocation: Korean leader lifted above follower
+            dislocation_bps = raw_diff_bps - st.baseline_bps
+
         if dislocation_bps <= 0:
             return None
 
@@ -315,11 +326,14 @@ class KoreanLeadLagStrategy:
 
         pair_hold_sec = float(pair_cfg.get("max_hold_sec", self.max_hold_sec))
         top3_ask_depth_usd = f_snap.top_n_ask_depth_usd(3)
+        top3_bid_depth_usd = f_snap.top_n_bid_depth_usd(3)
+        target_top3_depth = top3_bid_depth_usd if side == "short" else top3_ask_depth_usd
+
         min_depth_needed = self.min_order_usd / max(self.stealth_fraction, 0.01)
-        if top3_ask_depth_usd < min_depth_needed:
+        if target_top3_depth < min_depth_needed:
             return None
 
-        stealth_capacity_usd = round(self.stealth_fraction * top3_ask_depth_usd, 2)
+        stealth_capacity_usd = round(self.stealth_fraction * target_top3_depth, 2)
         is_battle = pool_st.is_battle_coin(coin) if pool_st else False
         basket = "battle" if is_battle else "incubator"
         is_actionable = is_battle
@@ -327,38 +341,51 @@ class KoreanLeadLagStrategy:
         if prof_mgr:
             if not prof_mgr.is_venue_active(follower_ex):
                 return None
-            sized = prof_mgr.calculate_stealth_order_size(follower_ex, top3_ask_depth_usd)
+            sized = prof_mgr.calculate_stealth_order_size(follower_ex, target_top3_depth)
             if is_battle and sized is None:
                 return None
-            suggested_size_usd = sized if sized is not None else min(
+            base_size = sized if sized is not None else min(
                 self.max_position_budget_usd,
                 stealth_capacity_usd,
             )
         else:
-            suggested_size_usd = min(self.max_position_budget_usd, stealth_capacity_usd)
+            base_size = min(self.max_position_budget_usd, stealth_capacity_usd)
+
+        # Modulate size by regime multiplier (capped by max budget * size_multiplier and stealth depth)
+        eff_budget = self.max_position_budget_usd * max(size_multiplier, 0.1)
+        suggested_size_usd = min(base_size * max(size_multiplier, 0.1), eff_budget, stealth_capacity_usd)
 
         if suggested_size_usd < self.min_order_usd:
             return None
 
-        f_entry_px = f_snap.vwap_ask_usd(suggested_size_usd)
-        if f_entry_px <= 0:
-            return None
+        if side == "short":
+            # Short execution: sell into follower bids at VWAP
+            f_entry_px = f_snap.vwap_bid_usd(suggested_size_usd)
+            if f_entry_px <= 0:
+                return None
+            gross_exec_edge_bps = (f_entry_px - upbit_mid) / f_entry_px * 1e4 + st.baseline_bps
+            init_exit_px = f_snap.vwap_ask_usd(suggested_size_usd)
+            init_exec_move_bps = (f_entry_px - init_exit_px) / f_entry_px * 1e4
+        else:
+            # Long execution: buy into follower asks at VWAP
+            f_entry_px = f_snap.vwap_ask_usd(suggested_size_usd)
+            if f_entry_px <= 0:
+                return None
+            gross_exec_edge_bps = (upbit_mid - f_entry_px) / f_entry_px * 1e4 - st.baseline_bps
+            init_exit_px = f_snap.vwap_bid_usd(suggested_size_usd)
+            init_exec_move_bps = (init_exit_px - f_entry_px) / f_entry_px * 1e4
 
-        f_ask_diff_bps = (upbit_mid - f_entry_px) / f_entry_px * 1e4
-        gross_exec_edge_bps = f_ask_diff_bps - st.baseline_bps
         net_edge = gross_exec_edge_bps - self.roundtrip_fee_bps
+        init_net_pnl_bps = round(init_exec_move_bps - self.roundtrip_fee_bps, 2)
 
+        eff_min_edge = self.min_edge_bps * max(edge_multiplier, 0.2)
         if "min_spread_bps" in pair_cfg:
-            req_spread = float(pair_cfg["min_spread_bps"])
+            req_spread = float(pair_cfg["min_spread_bps"]) * max(edge_multiplier, 0.2)
             if gross_exec_edge_bps < req_spread or net_edge <= 0.0:
                 return None
         else:
-            if net_edge < self.min_edge_bps:
+            if net_edge < eff_min_edge:
                 return None
-
-        init_exit_px = f_snap.vwap_bid_usd(suggested_size_usd)
-        init_exec_move_bps = (init_exit_px - f_entry_px) / f_entry_px * 1e4
-        init_net_pnl_bps = round(init_exec_move_bps - self.roundtrip_fee_bps, 2)
 
         lead_ex = getattr(upbit_snap, "exchange", "upbit") or "upbit"
         sig = SunriseSignal(
@@ -384,7 +411,7 @@ class KoreanLeadLagStrategy:
             follower_best_ask=round(f_ask, 8),
             follower_spread_bps=round(f_snap.spread_bps, 2),
             follower_top3_ask_usd=round(top3_ask_depth_usd, 2),
-            follower_top3_bid_usd=round(f_snap.top_n_bid_depth_usd(3), 2),
+            follower_top3_bid_usd=round(top3_bid_depth_usd, 2),
             follower_imbalance_top3=round(f_snap.imbalance_top3, 3),
             kimchi_baseline_bps=round(st.baseline_bps, 2),
             pair_sigma_bps=round(sigma, 2),
@@ -399,6 +426,7 @@ class KoreanLeadLagStrategy:
             stealth_capacity_usd=round(stealth_capacity_usd, 2),
             follower_entry_px=round(f_entry_px, 8),
             leader_recent_buys_usd=round(recent_buys_usd, 2),
+            side=side,
             basket=basket,
             is_actionable=is_actionable,
             max_hold_sec=pair_hold_sec,

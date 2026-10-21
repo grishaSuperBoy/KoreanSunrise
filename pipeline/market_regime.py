@@ -71,8 +71,8 @@ class MarketRegimeDetector:
 
     def __init__(
         self,
-        btc_dump_30s_bps: float = -20.0,
-        btc_dump_300s_bps: float = -45.0,
+        btc_dump_30s_bps: float = -35.0,
+        btc_dump_300s_bps: float = -80.0,
         btc_pump_300s_bps: float = 30.0,
         dump_cooldown_sec: float = 120.0,
         breadth_dump_threshold: float = 25.0,
@@ -119,10 +119,26 @@ class MarketRegimeDetector:
             while self._btc_history and self._btc_history[0][0] < cutoff:
                 self._btc_history.popleft()
 
-            # Immediate flash dump check
+            # Immediate flash dump check:
+            # 1. 300s cumulative breakdown: BTC dropped >= btc_dump_300s_bps (default -80.0 bps / -0.8%) over 5 minutes.
+            # 2. 30s acute flash crash:
+            #    - Severe shock (<= -50.0 bps): acute cascade wick, triggers unconditionally.
+            #    - Moderate shock (<= btc_dump_30s_bps, e.g. -35.0 bps):
+            #      If breadth is available, confirms with market breadth (breadth_300s <= 45.0% or breadth_60s <= 40.0%).
+            #      If breadth has not warmed up yet (< min_coins_for_breadth), triggers safely.
             ret_30s = self._calc_btc_ret(ts, 30.0)
             ret_300s = self._calc_btc_ret(ts, 300.0)
-            if ret_30s <= self.btc_dump_30s_bps or ret_300s <= self.btc_dump_300s_bps:
+
+            is_300s_dump = ret_300s <= self.btc_dump_300s_bps
+            is_30s_dump = False
+            if ret_30s <= -50.0:
+                is_30s_dump = True
+            elif ret_30s <= self.btc_dump_30s_bps:
+                b60, b300, active_c = self._calc_breadth(ts)
+                if active_c < self.min_coins_for_breadth or b300 <= 45.0 or b60 <= 40.0:
+                    is_30s_dump = True
+
+            if is_30s_dump or is_300s_dump:
                 if ts >= self._dump_cooldown_until:
                     log.warning(
                         f"[REGIME-CIRCUIT-BREAKER] 🚨 BTC Flash Dump Triggered! "
@@ -171,8 +187,8 @@ class MarketRegimeDetector:
             return 0.0
         cur_px = self._btc_history[-1][1]
         target_ts = now - window_sec
-        # Find closest price at or before target_ts
-        past_px = cur_px
+        # Find closest price at or before target_ts, defaulting to oldest available tick in buffer
+        past_px = self._btc_history[0][1]
         for t, p in self._btc_history:
             if t <= target_ts:
                 past_px = p
@@ -326,3 +342,42 @@ class MarketRegimeDetector:
         if snap.regime == MarketRegime.BEAR_DRIFT:
             return 1.5
         return 1.0
+
+    def get_regime_modifiers(self, side: str, now: float) -> Tuple[float, float, float]:
+        """
+        Calculates dynamic (edge_multiplier, drain_multiplier, size_multiplier) for S1 Lead-Lag:
+        - With market regime tailwind (Long in PUMP, Short in DUMP/BEAR):
+          - Lower edge requirement (0.7x - 0.8x, easier entry).
+          - Lower drain threshold (0.7x - 0.8x, faster trigger).
+          - Higher position size multiplier (1.3x - 1.5x).
+        - Against market regime (Long in BEAR, Short in BULL):
+          - Higher edge requirement (1.4x, stricter defense).
+          - Higher drain requirement (1.3x, requires massive idiosyncratic sweep).
+          - Reduced position size (0.5x).
+        - NEUTRAL: 1.0x baseline across all parameters.
+        """
+        snap = self.get_regime(now)
+        reg = snap.regime
+
+        if side.lower() == "long":
+            if reg == MarketRegime.STRONG_PUMP:
+                return (0.7, 0.8, 1.5)
+            elif reg == MarketRegime.BULL_DRIFT:
+                return (0.9, 0.9, 1.2)
+            elif reg == MarketRegime.BEAR_DRIFT:
+                return (1.4, 1.3, 0.5)
+            elif reg == MarketRegime.FLASH_DUMP:
+                return (2.0, 2.0, 0.0)  # Longs are vetoed during flash dump
+            else:  # NEUTRAL
+                return (1.0, 1.0, 1.0)
+        else:  # short
+            if reg == MarketRegime.FLASH_DUMP:
+                return (0.7, 0.7, 1.5)
+            elif reg == MarketRegime.BEAR_DRIFT:
+                return (0.8, 0.8, 1.3)
+            elif reg == MarketRegime.STRONG_PUMP:
+                return (2.0, 2.0, 0.0)  # Shorts are vetoed during strong pump
+            elif reg == MarketRegime.BULL_DRIFT:
+                return (1.4, 1.3, 0.5)
+            else:  # NEUTRAL
+                return (1.0, 1.0, 1.0)

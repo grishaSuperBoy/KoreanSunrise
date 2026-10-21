@@ -827,6 +827,206 @@ class TestKoreanEngineStrategy(unittest.TestCase):
         # Order size was $3.00 < min_order_usd ($5.00) -> MUST BE REJECTED
         self.assertIsNone(st.open_signal)
 
+    # -------------------------------------------------------------------------
+    # 15. Strategy 1: Downward Depth Drain & Bid Sweep (Short Entry)
+    # -------------------------------------------------------------------------
+    def test_depth_drain_bid_dropped_short_entry(self):
+        coin = "ETH"
+        now = time.time()
+
+        st = self.engine._get_or_create_pair_state(coin, "binance")
+        for i in range(6):
+            st.learn(0.0, now - 30.0 + i * 2.0)
+        self.assertTrue(st.is_warmed_up)
+
+        # Baseline Upbit norm: depth 1000 USD, best bid 200 USD, spread 5 bps
+        self.engine._upbit_norm[coin] = {
+            "depth_ask": 1000.0,
+            "best_ask_usd": 200.0,
+            "depth_bid": 1000.0,
+            "best_bid_usd": 200.0,
+            "spread_bps": 5.0,
+            "t": now - 1.0,
+        }
+
+        # Follower calm book: bid 100.00, ask 100.05 (mid 100.025)
+        f_snap = OrderBookDepth5(
+            exchange="binance", symbol=coin, raw_symbol="ETHUSDT",
+            ts=now, exchange_ts=int(now * 1000),
+            bids=[(100.00, 20.0), (99.95, 20.0)],
+            asks=[(100.05, 20.0), (100.10, 20.0)]
+        )
+        self.engine._books[("binance", coin)] = f_snap
+        self.engine._recv_ts[("binance", coin)] = now
+
+        # Upbit previous tick: best bid 100.0 ($200), depth 1000 USD, ask 100.05
+        u_prev = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now - 0.1, exchange_ts=int((now - 0.1) * 1000),
+            bids=[(100.00, 2.0), (99.90, 8.0)],
+            asks=[(100.05, 10.0)]
+        )
+        self.engine._books[("upbit", coin)] = u_prev
+
+        # Upbit current tick: best bid DROPS to 99.50 (-50 bps), depth_bid drops to 400 USD
+        # Ask non-increasing (100.05 -> 100.05)
+        u_curr = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now, exchange_ts=int(now * 1000),
+            bids=[(99.50, 4.0)],
+            asks=[(100.05, 10.0)]
+        )
+
+        self.engine.on_book_update(u_curr)
+
+        self.assertIsNotNone(st.open_signal)
+        sig = st.open_signal
+        self.assertEqual(sig.trigger_type, "depth_drain")
+        self.assertEqual(sig.side, "short")
+        self.assertEqual(sig.coin, coin)
+        self.assertEqual(sig.follower_exchange, "binance")
+        self.assertGreaterEqual(sig.net_exec_edge_bps, 5.0)
+        self.assertAlmostEqual(sig.follower_entry_px, 100.0, places=2)
+
+    # -------------------------------------------------------------------------
+    # 16. Strategy 1: Short Position Lifecycle & Take-Profit Convergence
+    # -------------------------------------------------------------------------
+    def test_short_position_lifecycle_convergence(self):
+        coin = "ETH"
+        now = time.time()
+        st = self.engine._get_or_create_pair_state(coin, "binance")
+        for i in range(6):
+            st.learn(0.0, now - 30.0 + i * 2.0)
+
+        self.engine._upbit_norm[coin] = {
+            "depth_ask": 1000.0, "best_ask_usd": 200.0,
+            "depth_bid": 1000.0, "best_bid_usd": 200.0,
+            "spread_bps": 5.0, "t": now - 1.0,
+        }
+
+        f_snap = OrderBookDepth5(
+            exchange="binance", symbol=coin, raw_symbol="ETHUSDT",
+            ts=now, exchange_ts=int(now * 1000),
+            bids=[(100.00, 20.0)], asks=[(100.05, 20.0)]
+        )
+        self.engine._books[("binance", coin)] = f_snap
+        self.engine._recv_ts[("binance", coin)] = now
+
+        u_prev = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now - 0.1, exchange_ts=int((now - 0.1) * 1000),
+            bids=[(100.00, 2.0), (99.90, 8.0)], asks=[(100.05, 10.0)]
+        )
+        self.engine._books[("upbit", coin)] = u_prev
+
+        u_curr = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now, exchange_ts=int(now * 1000),
+            bids=[(99.40, 4.0)], asks=[(100.05, 10.0)]
+        )
+        self.engine.on_book_update(u_curr)
+        sig = st.open_signal
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.side, "short")
+
+        # Follower catches up and plunges down to 99.40 (bid 99.35, ask 99.40)
+        # Short entered at 100.00, covered at 99.40 (+60 bps gain)
+        f_snap_converged = OrderBookDepth5(
+            exchange="binance", symbol=coin, raw_symbol="ETHUSDT",
+            ts=now + 1.5, exchange_ts=int((now + 1.5) * 1000),
+            bids=[(99.35, 20.0)], asks=[(99.40, 20.0)]
+        )
+        self.engine.on_book_update(f_snap_converged)
+
+        self.assertTrue(sig.closed)
+        self.assertEqual(sig.close_reason, "converged")
+        self.assertGreater(sig.net_pnl_bps, 0.0)
+
+    # -------------------------------------------------------------------------
+    # 17. Strategy 1: Short Position Invalidation Stop on Upbit Rebound
+    # -------------------------------------------------------------------------
+    def test_short_position_invalidation_stop(self):
+        coin = "ETH"
+        now = time.time()
+        st = self.engine._get_or_create_pair_state(coin, "binance")
+        for i in range(6):
+            st.learn(0.0, now - 30.0 + i * 2.0)
+
+        self.engine._upbit_norm[coin] = {
+            "depth_ask": 1000.0, "best_ask_usd": 200.0,
+            "depth_bid": 1000.0, "best_bid_usd": 200.0,
+            "spread_bps": 5.0, "t": now - 1.0,
+        }
+
+        f_snap = OrderBookDepth5(
+            exchange="binance", symbol=coin, raw_symbol="ETHUSDT",
+            ts=now, exchange_ts=int(now * 1000),
+            bids=[(100.00, 20.0)], asks=[(100.05, 20.0)]
+        )
+        self.engine._books[("binance", coin)] = f_snap
+        self.engine._recv_ts[("binance", coin)] = now
+
+        u_prev = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now - 0.1, exchange_ts=int((now - 0.1) * 1000),
+            bids=[(100.00, 2.0), (99.90, 8.0)], asks=[(100.05, 10.0)]
+        )
+        self.engine._books[("upbit", coin)] = u_prev
+
+        u_curr = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now, exchange_ts=int(now * 1000),
+            bids=[(99.40, 4.0)], asks=[(100.05, 10.0)]
+        )
+        self.engine.on_book_update(u_curr)
+        sig = st.open_signal
+        self.assertIsNotNone(sig)
+
+        # Upbit V-reverses sharply and rebounds up to 101.00 (+160 bps adverse move)
+        u_rebound = OrderBookDepth5(
+            exchange="upbit", symbol=coin, raw_symbol=f"KRW-{coin}",
+            ts=now + 1.0, exchange_ts=int((now + 1.0) * 1000),
+            bids=[(101.00, 10.0)], asks=[(101.05, 10.0)]
+        )
+        self.engine.on_book_update(u_rebound)
+
+        self.assertTrue(sig.closed)
+        self.assertEqual(sig.close_reason, "stop_invalidation")
+        self.assertTrue(sig.stop_hit)
+        self.assertEqual(sig.stop_type, "invalidation")
+
+    def test_regime_benchmark_exchange_feed_isolation(self):
+        """Verifies that only the benchmark follower exchange (binance) feeds regime BTC and alt history."""
+        now = time.time()
+        # Upbit BTC tick with huge Kimchi premium (+300 bps)
+        u_btc = OrderBookDepth5(
+            exchange="upbit", symbol="BTC", raw_symbol="KRW-BTC",
+            ts=now, exchange_ts=int(now * 1000),
+            bids=[(103000.0, 1.0)], asks=[(103010.0, 1.0)]
+        )
+        self.engine.on_book_update(u_btc)
+        # Upbit must NEVER be recorded in _btc_history!
+        self.assertEqual(len(self.engine.regime_detector._btc_history), 0)
+
+        # Bybit BTC tick (when benchmark is binance) must also not pollute
+        bybit_btc = OrderBookDepth5(
+            exchange="bybit", symbol="BTC", raw_symbol="BTCUSDT",
+            ts=now + 0.1, exchange_ts=int((now + 0.1) * 1000),
+            bids=[(99950.0, 1.0)], asks=[(99960.0, 1.0)]
+        )
+        self.engine.on_book_update(bybit_btc)
+        self.assertEqual(len(self.engine.regime_detector._btc_history), 0)
+
+        # Binance BTC tick must be recorded as reference benchmark
+        binance_btc = OrderBookDepth5(
+            exchange="binance", symbol="BTC", raw_symbol="BTCUSDT",
+            ts=now + 0.2, exchange_ts=int((now + 0.2) * 1000),
+            bids=[(100000.0, 1.0)], asks=[(100010.0, 1.0)]
+        )
+        self.engine.on_book_update(binance_btc)
+        self.assertEqual(len(self.engine.regime_detector._btc_history), 1)
+        self.assertAlmostEqual(self.engine.regime_detector._btc_history[-1][1], 100005.0)
+
 
 if __name__ == "__main__":
     unittest.main()

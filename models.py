@@ -258,6 +258,7 @@ class SunriseSignal:
     stealth_capacity_usd: float = 0.0
     follower_entry_px: float = 0.0
     leader_recent_buys_usd: float = 0.0
+    side: str = "long"               # Directional side: "long" | "short"
 
     # Pool routing
     basket: str = "incubator"

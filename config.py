@@ -79,6 +79,9 @@ MAX_PORTFOLIO_EXPOSURE_USD = MAX_STRATEGY_EXPOSURE_USD
 MAKER_REBATE_BPS = float(os.getenv("MAKER_REBATE_BPS", "0.0")) # Realistic maker rebate on alts (0.0 bps default; 0% rebate on non-VIP alts)
 FOLLOWER_SPREAD_WARMUP_SAMPLES = int(os.getenv("FOLLOWER_SPREAD_WARMUP_SAMPLES", "5")) # Min order book ticks required before follower spread baseline is active
 
+# Macro Market Regime Benchmark Configuration
+REGIME_BENCHMARK_EXCHANGE = os.getenv("REGIME_BENCHMARK_EXCHANGE", "binance").lower() # Benchmark venue for BTC momentum and alt breadth (avoids Kimchi contamination)
+
 ALPHA_DECAY_SEC = 15.0          # Model C: Alpha decay timeout if PnL <= 0 (fallback if not in matrix)
 
 # Strategy 2: Pre-Sweep Early Long / Inverted Fade (Long on MM Quote Pulls & Micro-Bursts)

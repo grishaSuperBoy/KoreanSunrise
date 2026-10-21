@@ -1074,6 +1074,111 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
         self.assertIn(("bybit", "BTC"), engine._follower_spread_ewma)
         self.assertNotIn(("okx", "DEADCOIN"), engine._follower_spread_ewma)
 
+    def test_s2_regime_flash_dump_and_bear_drift_filters(self):
+        """Verify S2 Market Regime Filter: VETO on FLASH_DUMP, $5k swept floor on BEAR_DRIFT."""
+        now = time.time()
+        fade_long_strat = FadeFakeoutStrategy(
+            emit_callback=lambda sig: None,
+            invert_to_long=True,
+            max_follower_depth_usd=5000.0,
+        )
+        upbit_snap = make_snap("upbit", "ARB", [(1.000, 1000.0)], [(1.005, 1000.0)], now)
+        f_snap = make_snap("bybit", "ARB", [(0.999, 1000.0)], [(1.000, 500.0)], now)
+
+        # 1. FLASH_DUMP -> Hard Veto
+        opened_dump = fade_long_strat.on_fakeout_detected(
+            coin="ARB", trigger_type="depth_drain", swept_usd=8000.0,
+            upbit_snap=upbit_snap, follower_snaps={"bybit": f_snap}, now=now,
+            fade_reason="micro_sweep_exhaustion", market_regime="FLASH_DUMP"
+        )
+        self.assertEqual(len(opened_dump), 0)
+
+        # 2. BEAR_DRIFT with swept_usd < 5000 -> Blocked
+        opened_weak = fade_long_strat.on_fakeout_detected(
+            coin="ARB", trigger_type="depth_drain", swept_usd=2500.0,
+            upbit_snap=upbit_snap, follower_snaps={"bybit": f_snap}, now=now,
+            fade_reason="micro_sweep_exhaustion", market_regime="BEAR_DRIFT"
+        )
+        self.assertEqual(len(opened_weak), 0)
+
+        # 3. BEAR_DRIFT with swept_usd >= 5000 -> Allowed
+        opened_strong = fade_long_strat.on_fakeout_detected(
+            coin="ARB", trigger_type="depth_drain", swept_usd=6000.0,
+            upbit_snap=upbit_snap, follower_snaps={"bybit": f_snap}, now=now,
+            fade_reason="micro_sweep_exhaustion", market_regime="BEAR_DRIFT"
+        )
+        self.assertEqual(len(opened_strong), 1)
+        self.assertEqual(opened_strong[0].side, "long")
+
+    def test_s2_classic_fade_strong_pump_veto(self):
+        """Verify S2 Classic Fade (Short) blocks entries during STRONG_PUMP."""
+        now = time.time()
+        fade_short_strat = FadeFakeoutStrategy(
+            emit_callback=lambda sig: None,
+            invert_to_long=False,
+            max_follower_depth_usd=5000.0,
+        )
+        upbit_snap = make_snap("upbit", "OP", [(2.000, 1000.0)], [(2.010, 1000.0)], now)
+        f_snap = make_snap("binance", "OP", [(1.995, 500.0)], [(2.000, 1000.0)], now)
+
+        # STRONG_PUMP -> Blocked
+        opened_pump = fade_short_strat.on_fakeout_detected(
+            coin="OP", trigger_type="depth_drain", swept_usd=2000.0,
+            upbit_snap=upbit_snap, follower_snaps={"binance": f_snap}, now=now,
+            fade_reason="micro_sweep_exhaustion", market_regime="STRONG_PUMP"
+        )
+        self.assertEqual(len(opened_pump), 0)
+
+        # NEUTRAL -> Allowed
+        opened_neutral = fade_short_strat.on_fakeout_detected(
+            coin="OP", trigger_type="depth_drain", swept_usd=2000.0,
+            upbit_snap=upbit_snap, follower_snaps={"binance": f_snap}, now=now,
+            fade_reason="micro_sweep_exhaustion", market_regime="NEUTRAL"
+        )
+        self.assertEqual(len(opened_neutral), 1)
+        self.assertEqual(opened_neutral[0].side, "short")
+
+    def test_s3_regime_flash_dump_and_directional_filters(self):
+        """Verify S3 Market Regime: FLASH_DUMP veto, BEAR_DRIFT blocks buys, STRONG_PUMP blocks sells."""
+        now = time.time()
+        hunter = MakerVoidStrategy(
+            emit_callback=lambda sig: None,
+            hunter_mode=True,
+            taker_fee_bps=2.0,
+        )
+        # Follower tight book (5 bps spread): bid 100.00, ask 100.05
+        f_snap = make_snap("bybit", "SOL", [(100.00, 50.0)], [(100.05, 50.0)], now)
+
+        # Upbit leading higher (101.00 -> +95 bps dislocation -> BUY opportunity)
+        upbit_high = make_snap("upbit", "SOL", [(100.95, 50.0)], [(101.05, 50.0)], now)
+
+        # Upbit leading lower (99.00 -> -100 bps dislocation -> SELL opportunity)
+        upbit_low = make_snap("upbit", "SOL", [(98.95, 50.0)], [(99.05, 50.0)], now)
+
+        # 1. FLASH_DUMP blocks both buy and sell
+        v_dump_buy = hunter.check_void_opportunity("bybit", "SOL", f_snap, upbit_high, now, is_warmed_up=True, market_regime="FLASH_DUMP")
+        v_dump_sell = hunter.check_void_opportunity("bybit", "SOL", f_snap, upbit_low, now, is_warmed_up=True, market_regime="FLASH_DUMP")
+        self.assertIsNone(v_dump_buy)
+        self.assertIsNone(v_dump_sell)
+
+        # 2. BEAR_DRIFT blocks buy, but allows sell!
+        v_bear_buy = hunter.check_void_opportunity("bybit", "SOL", f_snap, upbit_high, now, is_warmed_up=True, market_regime="BEAR_DRIFT")
+        self.assertIsNone(v_bear_buy)
+
+        v_bear_sell = hunter.check_void_opportunity("bybit", "SOL", f_snap, upbit_low, now, is_warmed_up=True, market_regime="BEAR_DRIFT")
+        self.assertIsNotNone(v_bear_sell)
+        self.assertEqual(v_bear_sell.side, "sell")
+
+        # 3. STRONG_PUMP blocks sell, but allows buy!
+        hunter._last_void_ts.clear()
+        hunter._open_voids.clear()
+        v_pump_sell = hunter.check_void_opportunity("bybit", "SOL", f_snap, upbit_low, now, is_warmed_up=True, market_regime="STRONG_PUMP")
+        self.assertIsNone(v_pump_sell)
+
+        v_pump_buy = hunter.check_void_opportunity("bybit", "SOL", f_snap, upbit_high, now, is_warmed_up=True, market_regime="STRONG_PUMP")
+        self.assertIsNotNone(v_pump_buy)
+        self.assertEqual(v_pump_buy.side, "buy")
+
 
 if __name__ == "__main__":
     unittest.main()

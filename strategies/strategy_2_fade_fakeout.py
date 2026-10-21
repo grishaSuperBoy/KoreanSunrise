@@ -166,17 +166,31 @@ class FadeFakeoutStrategy:
         follower_snaps: Dict[str, Any],
         now: float,
         fade_reason: str,
+        market_regime: str = "NEUTRAL",
         is_stable_pair_fn: Optional[Callable[[str, str, float], bool]] = None,
         recv_ts_map: Optional[Dict[Tuple[str, str], float]] = None,
     ) -> List[ActiveFadePosition]:
         """
-        Opens short positions fading the fakeout across contemporaneous follower books.
-        Guards against stale quotes and dislocated baselines.
+        Opens positions fading the fakeout across contemporaneous follower books.
+        Applies macro market regime gating to prevent catching knives or fading systemic pumps.
         """
         with self._lock:
             # Jitter Guard: in inverted long mode, reject high-frequency majors that generate noise
             if self.invert_to_long and coin.upper() in JITTER_MAJORS:
                 return []
+
+            # Macro Market Regime Guard
+            if self.invert_to_long:
+                if market_regime == "FLASH_DUMP":
+                    log.debug(f"[S2-VETO] Blocked Long on {coin} due to FLASH_DUMP regime.")
+                    return []
+                if market_regime == "BEAR_DRIFT" and swept_usd < 5000.0:
+                    log.debug(f"[S2-FILTER] Filtered Long on {coin} in BEAR_DRIFT: swept ${swept_usd:.0f} < $5000 required.")
+                    return []
+            else:
+                if market_regime == "STRONG_PUMP":
+                    log.debug(f"[S2-VETO] Blocked Short Fade on {coin} due to STRONG_PUMP regime.")
+                    return []
 
             # 0. Portfolio Exposure Guard: cap total active positions and exposure
             current_active = sum(len([p for p in plist if not p.closed]) for plist in self._active.values())
