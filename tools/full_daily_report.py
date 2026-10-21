@@ -46,7 +46,13 @@ THRESHOLDS_FILE = os.path.join(PROJECT_ROOT, "matrix_thresholds.json")
 from config import ALL_SUPPORTED_VENUES
 
 SWEEP_THRESHOLDS = (10, 15, 20, 25, 30, 35, 40, 50, 60)
+TSUNAMI_THRESHOLDS = (1.0, 2.0, 3.0, 5.0, 8.0, 10.0, 15.0, 20.0, 30.0)
 FUNDED_VENUES = set(ALL_SUPPORTED_VENUES)
+TARGET_ALPHA_VENUES = {"binance", "bybit", "gateio", "mexc", "hyperliquid"}
+EXCLUDED_MAJOR_COINS = {
+    "BTC", "ETH", "SOL", "AAVE", "UNI", "INJ", "PENDLE", "JTO", 
+    "ENS", "GMT", "AXL", "DATA", "ICP", "ZRO"
+}
 
 
 def _collect_files(days_back: float = 1.0) -> List[str]:
@@ -138,6 +144,13 @@ def generate_daily_report(
         "bithumb_confirmed_only": _new_bucket(),
         "bithumb_unconfirmed_only": _new_bucket(),
         "single_listed_kr_only": _new_bucket(),
+        "whale_sweep_15k_only": _new_bucket(),
+        "tsunami_ratio_10x_only": _new_bucket(),
+        "tsunami_ratio_20x_only": _new_bucket(),
+    }
+    s1_tsunami_grid = {
+        t: {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0, "pnl_bps": []}
+        for t in TSUNAMI_THRESHOLDS
     }
     s1_kr_confirmation = {
         "confirmed": {
@@ -314,6 +327,27 @@ def generate_daily_report(
                             _add_s1_bucket(s1_scenarios["battle_coins_only"])
                         if f_ex in FUNDED_VENUES:
                             _add_s1_bucket(s1_scenarios["funded_venues_only"])
+
+                        # Korean Whale Sweep & Tsunami Ratio Scenarios
+                        f_spread_bps = float(d.get("follower_spread_bps", 999.0) or 999.0)
+                        tsunami_ratio = (swept_usd / max(f_top3_ask, 100.0)) if f_top3_ask > 0 else 0.0
+                        if f_ex in TARGET_ALPHA_VENUES and coin not in EXCLUDED_MAJOR_COINS and f_spread_bps <= 70.0:
+                            if swept_usd >= 15000.0:
+                                _add_s1_bucket(s1_scenarios["whale_sweep_15k_only"])
+                            if swept_usd >= 3000.0 and tsunami_ratio >= 10.0:
+                                _add_s1_bucket(s1_scenarios["tsunami_ratio_10x_only"])
+                            if swept_usd >= 3000.0 and tsunami_ratio >= 20.0:
+                                _add_s1_bucket(s1_scenarios["tsunami_ratio_20x_only"])
+                            if swept_usd >= 3000.0:
+                                for r in TSUNAMI_THRESHOLDS:
+                                    if tsunami_ratio >= r:
+                                        tg = s1_tsunami_grid[r]
+                                        tg["count"] += 1
+                                        tg["gross"] += gross
+                                        tg["fee"] += fee_usd
+                                        tg["net"] += net
+                                        tg["wins"] += is_win
+                                        tg["pnl_bps"].append(net_pnl_bps)
 
                         # Cross-Korean Bithumb Confirmation Cohort Analysis
                         is_co = d.get("korean_co_listed")
@@ -758,6 +792,18 @@ def generate_daily_report(
                 "close_reasons": dict(s1_close_reasons),
                 "pnl_scenarios": s1_pnl_summary,
                 "korean_confirmation_telemetry": s1_kr_summary,
+                "tsunami_grid": {
+                    str(t): {
+                        "trades": s1_tsunami_grid[t]["count"],
+                        "wins": s1_tsunami_grid[t]["wins"],
+                        "winrate_pct": round((s1_tsunami_grid[t]["wins"] / s1_tsunami_grid[t]["count"] * 100.0), 1) if s1_tsunami_grid[t]["count"] else 0.0,
+                        "gross_usd": round(s1_tsunami_grid[t]["gross"], 2),
+                        "fee_usd": round(s1_tsunami_grid[t]["fee"], 2),
+                        "net_pnl_usd": round(s1_tsunami_grid[t]["net"], 2),
+                        "mean_net_bps": round(statistics.mean(s1_tsunami_grid[t]["pnl_bps"]), 1) if s1_tsunami_grid[t]["pnl_bps"] else 0.0,
+                    }
+                    for t in TSUNAMI_THRESHOLDS
+                },
             },
             "fade_fakeout": {
                 "name": "2. Fade the Fakeout (Short)",
@@ -853,6 +899,9 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
         "bithumb_confirmed_only": "Bithumb Подтверждён (Dual-Pump) ⚔️",
         "bithumb_unconfirmed_only": "Bithumb Не подтверждён (Dislocated) ⚠️",
         "single_listed_kr_only": "Моно-листинг (Без Bithumb) 🇰🇷",
+        "whale_sweep_15k_only": "Фикс. Кит-выкуп >= $15k (Top CEXs) 🐳",
+        "tsunami_ratio_10x_only": "Квантовый Tsunami Ratio >= 10.0x (Floor $3k) 🌊",
+        "tsunami_ratio_20x_only": "Квантовый Tsunami Ratio >= 20.0x (Floor $3k) 🌊🔥",
     }
     for k, row in s1.get("pnl_scenarios", {}).items():
         lbl = labels.get(k, k)
@@ -884,6 +933,27 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
                 f"| **{lbl}** | {kr_row['trades']:,} | {kr_row['winrate_pct']}% | "
                 f"${kr_row['gross_usd']:.2f} | -${kr_row['fee_usd']:.2f} | **${kr_row['net_pnl_usd']:.2f}** | "
                 f"{kr_row.get('mean_net_pnl_bps', 0.0):+.1f} bps | +{kr_row.get('mean_mfe_bps', 0.0):.1f} bps | {kr_row['profit_factor']} |"
+            )
+
+    # Section 2.2: Tsunami Ratio Grid
+    tsunami_grid = s1.get("tsunami_grid", {})
+    if tsunami_grid:
+        lines.extend([
+            "",
+            "### 2.2. Квантовая Модель: Tsunami Ratio (Выкуп Upbit / Стакан фьючерса, Floor >= $3k):",
+            "| Порог Tsunami Ratio | Сделок | Win Rate | Gross USD | Комиссии | Net PnL USD | Net bps/сд. | Статус |",
+            "| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        ])
+        for r_str, r_data in sorted(tsunami_grid.items(), key=lambda x: float(x[0])):
+            cnt = r_data["trades"]
+            if cnt == 0:
+                continue
+            r_val = float(r_str)
+            status = "🔥 Prime Alpha" if r_val >= 10.0 and r_data["net_pnl_usd"] > 0 else ("⚡ High Conviction" if r_val >= 5.0 else "Normal")
+            lines.append(
+                f"| **>={r_val:.1f}x** | {cnt:,} | {r_data['winrate_pct']}% | "
+                f"${r_data['gross_usd']:.2f} | -${r_data['fee_usd']:.2f} | **${r_data['net_pnl_usd']:.2f}** | "
+                f"{r_data['mean_net_bps']:+.1f} bps | {status} |"
             )
 
     # Section 3: Strategy 2 - Fade the Fakeout
