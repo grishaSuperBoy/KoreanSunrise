@@ -181,8 +181,8 @@ class BithumbSpotStream(BaseVenueStream):
                 async with websockets.connect(
                     self.WS_URL,
                     open_timeout=15,
-                    ping_interval=20,
-                    ping_timeout=15,
+                    ping_interval=None,
+                    ping_timeout=None,
                     max_size=10 * 1024 * 1024,
                 ) as ws:
                     self._note_connect()

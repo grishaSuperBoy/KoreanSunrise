@@ -162,8 +162,8 @@ class BinanceFuturesStream(BaseVenueStream):
                 async with websockets.connect(
                     url,
                     open_timeout=20,
-                    ping_interval=20,
-                    ping_timeout=15,
+                    ping_interval=None,
+                    ping_timeout=None,
                     max_queue=4096,
                 ) as ws:
                     self._connected_chunks.add(chunk_id)

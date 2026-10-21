@@ -106,7 +106,8 @@ class BingXStream(BaseCEXStream):
         await ws.send("ping")
 
     async def _send_subscriptions(self, ws: Any) -> None:
-        for s in self.symbols:
+        # BingX limits to 100 channels per connection; cap to top 80 to prevent rate-limit drops
+        for s in self.symbols[:80]:
             raw_sym = self._to_raw_symbol(s)
             sub = {
                 "id": f"sub_{raw_sym}",
@@ -114,7 +115,7 @@ class BingXStream(BaseCEXStream):
                 "dataType": f"{raw_sym}@depth20",
             }
             await ws.send(json.dumps(sub))
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0.05)
 
     def _parse_message(self, raw_msg: str) -> None:
         try:
