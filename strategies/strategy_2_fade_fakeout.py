@@ -121,8 +121,8 @@ class FadeFakeoutStrategy:
         self,
         is_cancel_blocked: bool,
         swept_usd: float,
-        upbit_spread_bps: float,
-        recent_buys_usd: Optional[float] = None,
+        upbit_spread_bps: float,         
+        korean_confirmed: bool = False,
     ) -> Tuple[bool, str]:
         """
         Detects if an observed Upbit sweep event fits the fakeout pattern.
@@ -130,7 +130,13 @@ class FadeFakeoutStrategy:
         1. Swept USD must be a micro-sweep (<= max_fade_swept_usd). NEVER fade large sweeps!
         2. Upbit spread must be wide (>= min_upbit_spread_bps), indicating an illiquid gap.
         3. Separates true MM quote cancellations from retail exhaustion.
+        4. Cross-Korean Confirmation Guard: If korean_confirmed is True (both Upbit & Bithumb
+           are surging together), NEVER fade — it is a genuine dual-exchange Korean pump.
         """
+        # Hard gate: cross-Korean dual pump. Never short when both Korean venues are pumping!
+        if korean_confirmed:
+            return False, ""
+
         # Hard gate: volume ceiling. Large sweeps are momentum, not fakeouts.
         if swept_usd > self.max_fade_swept_usd or swept_usd <= 0.0:
             return False, ""

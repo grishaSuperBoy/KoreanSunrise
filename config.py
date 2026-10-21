@@ -58,6 +58,14 @@ MAX_FOLLOWER_BOOK_AGE_SEC = 1.50 # Maximum 1.5s staleness for follower book snap
 # Adaptive Stop-Loss Parameters
 STOP_INVALIDATION_BPS = 15.0    # Model A: Microstructure invalidation tolerance (leader premium breakdown)
 STOP_ADVERSE_PNL_BPS = 35.0     # Model B: Hard adverse PnL drawdown stop (bps)
+
+# Bithumb Co-Leader Configuration
+BITHUMB_ENABLED = os.getenv("BITHUMB_ENABLED", "true").lower() in ("true", "1", "yes")
+BITHUMB_MIN_SWEPT_USD = float(os.getenv("BITHUMB_MIN_SWEPT_USD", "3000.0"))
+REQUIRE_KOREAN_CONFIRMATION = os.getenv("REQUIRE_KOREAN_CONFIRMATION", "false").lower() in ("true", "1", "yes")
+STRICT_KOREAN_GATE = os.getenv("STRICT_KOREAN_GATE", "false").lower() in ("true", "1", "yes")
+MIN_KOREAN_CONFIRM_USD = float(os.getenv("MIN_KOREAN_CONFIRM_USD", "0.0")) # Min taker volume ($) on peer Korean exchange for confirmation (0.0 for incubator, 500.0+ for battle)
+
 ALPHA_DECAY_SEC = 15.0          # Model C: Alpha decay timeout if PnL <= 0 (fallback if not in matrix)
 
 # Strategy 2: Fade the Fakeout (Short on Micro-Sweeps & Gaps)

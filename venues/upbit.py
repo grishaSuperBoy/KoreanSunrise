@@ -182,12 +182,14 @@ class UpbitSpotStream(BaseVenueStream):
         krw_to_coin: Dict[str, str],
         callback: Callable[[OrderBookDepth5], None],
         trade_callback: Optional[Callable[[str, float, bool, float], None]] = None,
+        on_rate_update: Optional[Callable[[float], None]] = None,
     ):
         coins = sorted(set(krw_to_coin.values()))
         super().__init__("upbit", coins, callback)
         self._krw_to_coin: Dict[str, str] = dict(krw_to_coin)
         self.subscribed: List[str] = list(coins)
         self.trade_callback = trade_callback
+        self.on_rate_update = on_rate_update
 
         self.usdt_krw_rate: float = 0.0
         self.rate_ready: bool = False
@@ -225,6 +227,11 @@ class UpbitSpotStream(BaseVenueStream):
             self.rate_ts = time.time()
             self._rate_jump_count = 0
             log.info(f"[upbit] USDT/KRW mid-rate initialised: {new_rate:.2f}")
+            if self.on_rate_update:
+                try:
+                    self.on_rate_update(new_rate)
+                except Exception:
+                    pass
             return
 
         deviation = abs(new_rate - self.usdt_krw_rate) / self.usdt_krw_rate
@@ -240,6 +247,11 @@ class UpbitSpotStream(BaseVenueStream):
         self._rate_jump_count = 0
         self.usdt_krw_rate = new_rate
         self.rate_ts = time.time()
+        if self.on_rate_update:
+            try:
+                self.on_rate_update(new_rate)
+            except Exception:
+                pass
 
     async def _run_loop(self) -> None:
         target_codes: List[str] = ["KRW-USDT"] + sorted(self._krw_to_coin.keys())

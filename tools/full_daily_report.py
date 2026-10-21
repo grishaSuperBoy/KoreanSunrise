@@ -135,6 +135,23 @@ def generate_daily_report(
         "calibrated_threshold_only": _new_bucket(),
         "battle_coins_only": _new_bucket(),
         "funded_venues_only": _new_bucket(),
+        "bithumb_confirmed_only": _new_bucket(),
+        "bithumb_unconfirmed_only": _new_bucket(),
+        "single_listed_kr_only": _new_bucket(),
+    }
+    s1_kr_confirmation = {
+        "confirmed": {
+            "count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0, "gains": 0.0, "losses": 0.0,
+            "pnl_bps": [], "mfes": [], "maes": [], "durs": []
+        },
+        "unconfirmed": {
+            "count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0, "gains": 0.0, "losses": 0.0,
+            "pnl_bps": [], "mfes": [], "maes": [], "durs": []
+        },
+        "single_listed": {
+            "count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0, "gains": 0.0, "losses": 0.0,
+            "pnl_bps": [], "mfes": [], "maes": [], "durs": []
+        },
     }
     s1_sweep = {t: {"count": 0, "wins": 0, "gross": 0.0, "fee": 0.0, "net": 0.0} for t in SWEEP_THRESHOLDS}
     s1_pair_stats = collections.defaultdict(lambda: {
@@ -297,6 +314,43 @@ def generate_daily_report(
                             _add_s1_bucket(s1_scenarios["battle_coins_only"])
                         if f_ex in FUNDED_VENUES:
                             _add_s1_bucket(s1_scenarios["funded_venues_only"])
+
+                        # Cross-Korean Bithumb Confirmation Cohort Analysis
+                        is_co = d.get("korean_co_listed")
+                        if is_co is None:
+                            is_co = (float(d.get("korean_spread_bps", 0.0) or 0.0) != 0.0 or bool(d.get("korean_confirmed", False)))
+                        is_conf = bool(d.get("korean_confirmed", False))
+
+                        if is_co and is_conf:
+                            kr_key = "confirmed"
+                            _add_s1_bucket(s1_scenarios["bithumb_confirmed_only"])
+                        elif is_co and not is_conf:
+                            kr_key = "unconfirmed"
+                            _add_s1_bucket(s1_scenarios["bithumb_unconfirmed_only"])
+                        else:
+                            kr_key = "single_listed"
+                            _add_s1_bucket(s1_scenarios["single_listed_kr_only"])
+
+                        kc = s1_kr_confirmation[kr_key]
+                        kc["count"] += 1
+                        kc["gross"] += gross
+                        kc["fee"] += fee_usd
+                        kc["net"] += net
+                        kc["wins"] += is_win
+                        if net > 0:
+                            kc["gains"] += net
+                        elif net < 0:
+                            kc["losses"] += abs(net)
+                        kc["pnl_bps"].append(net_pnl_bps)
+                        mfe_val = d.get("mfe_exec_pnl_bps")
+                        if mfe_val is not None:
+                            kc["mfes"].append(float(mfe_val))
+                        mae_val = d.get("mae_exec_pnl_bps")
+                        if mae_val is not None:
+                            kc["maes"].append(float(mae_val))
+                        dur_val = d.get("duration_sec")
+                        if dur_val is not None:
+                            kc["durs"].append(float(dur_val))
 
                         # Threshold sweep
                         for t in SWEEP_THRESHOLDS:
@@ -492,6 +546,29 @@ def generate_daily_report(
             "profit_factor": _safe_pf(gains, losses),
         }
 
+    # Strategy 1: Korean Co-Leader Confirmation summary
+    s1_kr_summary = {}
+    for k, v in s1_kr_confirmation.items():
+        cnt = v["count"]
+        pnls = v["pnl_bps"]
+        mfes = v["mfes"]
+        maes = v["maes"]
+        durs = v["durs"]
+        s1_kr_summary[k] = {
+            "trades": cnt,
+            "wins": v["wins"],
+            "winrate_pct": round((v["wins"] / cnt * 100.0), 1) if cnt else 0.0,
+            "gross_usd": round(v["gross"], 2),
+            "fee_usd": round(v["fee"], 2),
+            "net_pnl_usd": round(v["net"], 2),
+            "profit_factor": _safe_pf(v["gains"], v["losses"]),
+            "mean_net_pnl_bps": round(statistics.mean(pnls), 2) if pnls else 0.0,
+            "median_net_pnl_bps": round(statistics.median(pnls), 2) if pnls else 0.0,
+            "mean_mfe_bps": round(statistics.mean(mfes), 2) if mfes else 0.0,
+            "mean_mae_bps": round(statistics.mean(maes), 2) if maes else 0.0,
+            "avg_duration_sec": round(statistics.mean(durs), 2) if durs else 0.0,
+        }
+
     # Strategy 2 summary
     s2_cnt = s2_bucket["count"]
     s2_summary = {
@@ -680,6 +757,7 @@ def generate_daily_report(
                 "trigger_types": dict(s1_trigger_types),
                 "close_reasons": dict(s1_close_reasons),
                 "pnl_scenarios": s1_pnl_summary,
+                "korean_confirmation_telemetry": s1_kr_summary,
             },
             "fade_fakeout": {
                 "name": "2. Fade the Fakeout (Short)",
@@ -772,6 +850,9 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
         "calibrated_threshold_only": "Калиброванный фильтр (Matrix Thresholds)",
         "battle_coins_only": "Проверенный пул (Battle Pool Only)",
         "funded_venues_only": "Фондированные биржи (Funded CEXs Only)",
+        "bithumb_confirmed_only": "Bithumb Подтверждён (Dual-Pump) ⚔️",
+        "bithumb_unconfirmed_only": "Bithumb Не подтверждён (Dislocated) ⚠️",
+        "single_listed_kr_only": "Моно-листинг (Без Bithumb) 🇰🇷",
     }
     for k, row in s1.get("pnl_scenarios", {}).items():
         lbl = labels.get(k, k)
@@ -779,6 +860,31 @@ def _render_markdown_report(doc: Dict[str, Any]) -> str:
             f"| **{lbl}** | {row['trades']:,} | {row['winrate_pct']}% | "
             f"${row['gross_usd']:.2f} | ${row['fee_usd']:.2f} | **${row['net_pnl_usd']:.2f}** | {row['profit_factor']} |"
         )
+
+    # Section 2.1: Korean Co-Leader Confirmation Attribution
+    kr_telemetry = s1.get("korean_confirmation_telemetry", {})
+    if kr_telemetry:
+        lines.extend([
+            "",
+            "### 2.1. Кросс-Корейская аналитика (Bithumb Confirmation Attribution):",
+            "| Когорта сигналов | Сигналов | Win Rate | Gross USD | Комиссии | Net PnL USD | Net bps/сд. | Mean MFE | Profit Factor |",
+            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        ])
+        kr_labels = {
+            "confirmed": "Bithumb Confirmed (Памп обеих корейских бирж) ⚔️",
+            "unconfirmed": "Bithumb Unconfirmed (Upbit дернулся, Bithumb спит) ⚠️",
+            "single_listed": "Single-Listed (Моно-листинг / нет стакана Bithumb) 🇰🇷",
+        }
+        for k_key in ("confirmed", "unconfirmed", "single_listed"):
+            kr_row = kr_telemetry.get(k_key, {})
+            if not kr_row:
+                continue
+            lbl = kr_labels.get(k_key, k_key)
+            lines.append(
+                f"| **{lbl}** | {kr_row['trades']:,} | {kr_row['winrate_pct']}% | "
+                f"${kr_row['gross_usd']:.2f} | -${kr_row['fee_usd']:.2f} | **${kr_row['net_pnl_usd']:.2f}** | "
+                f"{kr_row.get('mean_net_pnl_bps', 0.0):+.1f} bps | +{kr_row.get('mean_mfe_bps', 0.0):.1f} bps | {kr_row['profit_factor']} |"
+            )
 
     # Section 3: Strategy 2 - Fade the Fakeout
     lines.extend([

@@ -14,6 +14,7 @@ from venues.base import BaseVenueStream
 from venues.asterdex import AsterdexStream
 from venues.bingx import BingXStream
 from venues.binance import BinanceFuturesStream
+from venues.bithumb import BithumbRestClient, BithumbSpotStream
 from venues.bybit import BybitPerpStream
 from venues.gateio import GateioStream
 from venues.htx import HTXStream
@@ -36,19 +37,53 @@ class StreamManager:
         callback: Callable[[OrderBookDepth5], None],
         trade_callback: Optional[Callable[[str, float, bool, float], None]] = None,
         active_venues: Optional[List[str]] = None,
+        bithumb_trade_callback: Optional[Callable[[str, float, bool, float], None]] = None,
     ):
         self.universe = universe
         self.callback = callback
         self.trade_callback = trade_callback
+        self.bithumb_trade_callback = bithumb_trade_callback
         self.streams: Dict[str, BaseVenueStream] = {}
+
+        allowed_venues = [v.lower() for v in active_venues] if active_venues else None
 
         # 1. Leader stream: Upbit (Spot KRW)
         if universe.upbit_krw_to_coin:
+            def _sync_to_bithumb(rate: float) -> None:
+                b_stream = self.streams.get("bithumb")
+                if isinstance(b_stream, BithumbSpotStream) and rate > 0:
+                    b_stream.set_usdt_krw_rate(rate)
+
             self.streams["upbit"] = UpbitSpotStream(
                 universe.upbit_krw_to_coin,
                 callback=callback,
                 trade_callback=trade_callback,
+                on_rate_update=_sync_to_bithumb,
             )
+
+        # 1b. Co-Leader stream: Bithumb (Spot KRW)
+        import config as C
+        bithumb_enabled = getattr(C, "BITHUMB_ENABLED", True)
+
+        if bithumb_enabled and universe.coins:
+            b_cb = bithumb_trade_callback or trade_callback
+            try:
+                init_rate = self.get_usdt_krw_rate() or 1400.0
+                raw_doc = getattr(universe, "_raw_doc", {}) or {}
+                bt_coins = [
+                    coin for coin, p in raw_doc.get("pairs", {}).items()
+                    if p.get("bithumb_symbol")
+                ] or universe.coins
+                self.streams["bithumb"] = BithumbSpotStream(
+                    coins=bt_coins,
+                    callback=callback,
+                    trade_callback=b_cb,
+                    initial_usdt_krw_rate=init_rate,
+                    rate_provider=self.get_usdt_krw_rate,
+                )
+                log.info(f"[stream_manager] Registered co-leader feed for BITHUMB ({len(bt_coins)} coins)")
+            except Exception as e:
+                log.warning(f"[stream_manager] Failed to initialize Bithumb feed: {e}")
 
         # 2. Dynamic Follower streams
         allowed_venues = [v.lower() for v in active_venues] if active_venues else None
@@ -129,10 +164,14 @@ class StreamManager:
                 log.error(f"[stream_manager] Error stopping {name} feed: {e}")
 
     def get_usdt_krw_rate(self) -> float:
-        """Returns the real-time USDT/KRW conversion rate from Upbit feed."""
+        """Returns the real-time USDT/KRW conversion rate from Upbit feed, keeping Bithumb synced."""
         upbit_stream = self.streams.get("upbit")
         if isinstance(upbit_stream, UpbitSpotStream) and upbit_stream.rate_ready:
-            return round(upbit_stream.usdt_krw_rate, 2)
+            rate = round(upbit_stream.usdt_krw_rate, 2)
+            bithumb_stream = self.streams.get("bithumb")
+            if isinstance(bithumb_stream, BithumbSpotStream) and rate > 0:
+                bithumb_stream.set_usdt_krw_rate(rate)
+            return rate
         return 0.0
 
     def get_status(self) -> Dict[str, Dict[str, Any]]:
@@ -149,7 +188,7 @@ class StreamManager:
                 "seq_gaps": getattr(s, "seq_gaps", 0),
                 "seq_duplicates": getattr(s, "seq_duplicates", 0),
             }
-            if isinstance(s, UpbitSpotStream):
-                info["usdt_krw_rate"] = round(s.usdt_krw_rate, 2) if s.rate_ready else 0.0
+            if isinstance(s, (UpbitSpotStream, BithumbSpotStream)):
+                info["usdt_krw_rate"] = round(s.usdt_krw_rate, 2) if getattr(s, "rate_ready", False) else 0.0
             status[name] = info
         return status

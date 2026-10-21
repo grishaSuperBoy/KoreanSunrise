@@ -42,6 +42,19 @@ def normalize_exchange_ts(raw_ts: Any) -> int:
             else:
                 return int_val * 1000
 
+        # ISO-8601 formatted date/time strings (e.g. "2026-10-21T03:00:00.123" or "2026-10-21 03:00:00.123456")
+        if "T" in s_ts or ("-" in s_ts and ":" in s_ts):
+            from datetime import datetime, timezone, timedelta
+            try:
+                iso_clean = s_ts.replace(" ", "T")
+                dt = datetime.fromisoformat(iso_clean)
+                if dt.tzinfo is None:
+                    kst = timezone(timedelta(hours=9))
+                    dt = dt.replace(tzinfo=kst)
+                return int(dt.timestamp() * 1000)
+            except Exception:
+                return 0
+
         val = float(raw_ts)
         if not math.isfinite(val) or val <= 0:
             return 0
@@ -250,6 +263,11 @@ class SunriseSignal:
     basket: str = "incubator"
     is_actionable: bool = False
     max_hold_sec: float = 6.0
+
+    # Cross-Korean co-leader metrics
+    korean_spread_bps: float = 0.0
+    korean_confirmed: bool = False
+    korean_co_listed: bool = False
 
     # Outcome & Excursion tracking
     closed: bool = False

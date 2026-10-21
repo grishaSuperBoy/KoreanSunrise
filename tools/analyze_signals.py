@@ -194,6 +194,49 @@ def main() -> None:
             w_pct = sum(1 for x in exec_pnls if x > 0.0) / len(exec_pnls) * 100.0 if exec_pnls else 0.0
             print(f"t = +{h:<10.2f}s | {_mean(mid_moves):>+19.2f} | {_mean(exec_pnls):>+23.2f} | {w_pct:>9.1f}%")
 
+        # ---------------------------------------------------------------------
+        # Cross-Korean Confirmation Attribution Table
+        # ---------------------------------------------------------------------
+        print("\n[3.1] KOREAN CO-LEADER ATTRIBUTION: BITHUMB CONFIRMATION ANALYSIS:")
+        kr_groups = defaultdict(list)
+        for s in s1_signals:
+            is_co = s.get("korean_co_listed")
+            if is_co is None:
+                is_co = (float(s.get("korean_spread_bps", 0.0) or 0.0) != 0.0 or bool(s.get("korean_confirmed", False)))
+            is_conf = bool(s.get("korean_confirmed", False))
+            if is_co and is_conf:
+                cohort = "Bithumb Confirmed (Dual-Pump)"
+            elif is_co and not is_conf:
+                cohort = "Bithumb Unconfirmed (Disloc.)"
+            else:
+                cohort = "Single Korean Venue (Solo)"
+            kr_groups[cohort].append(s)
+
+        print(
+            f"{'Korean Cohort':<32} | {'Count':>5} | {'Win%':>6} | {'Net PnL ($)':>11} | "
+            f"{'Mean (bps)':>10} | {'Med (bps)':>9} | {'Mean MFE':>9} | {'Mean MAE':>9} | {'Avg Dur':>8}"
+        )
+        print("-" * 115)
+        for cohort_name in (
+            "Bithumb Confirmed (Dual-Pump)",
+            "Bithumb Unconfirmed (Disloc.)",
+            "Single Korean Venue (Solo)",
+        ):
+            rows = kr_groups.get(cohort_name, [])
+            if not rows:
+                continue
+            n = len(rows)
+            pnls = [float(r.get("net_pnl_bps", 0.0)) for r in rows]
+            mfes = [float(r.get("mfe_exec_pnl_bps", 0.0)) for r in rows if r.get("mfe_exec_pnl_bps") is not None]
+            maes = [float(r.get("mae_exec_pnl_bps", 0.0)) for r in rows if r.get("mae_exec_pnl_bps") is not None]
+            durs = [float(r.get("duration_sec", 0.0)) for r in rows if r.get("duration_sec") is not None]
+            usd_pnl = sum(10.0 * (p / 10000.0) for p in pnls)
+            win_pct = sum(1 for p in pnls if p > 0.0) / n * 100.0
+            print(
+                f"{cohort_name:<32} | {n:>5d} | {win_pct:>5.1f}% | ${usd_pnl:>10.2f} | "
+                f"{_mean(pnls):>+9.2f}b | {_med(pnls):>+8.2f}b | {_mean(mfes):>+8.2f}b | {_mean(maes):>+8.2f}b | {_mean(durs):>7.2f}s"
+            )
+
     # -------------------------------------------------------------------------
     # 3. Strategy 2 Deep Dive: Fade the Fakeout (Shorts)
     # -------------------------------------------------------------------------

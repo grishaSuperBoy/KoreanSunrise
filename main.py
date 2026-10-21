@@ -142,6 +142,7 @@ class KoreanSunriseService:
             universe=self.universe,
             callback=self.engine.on_book_update,
             trade_callback=self.engine.on_upbit_trade,
+            bithumb_trade_callback=self.engine.on_bithumb_trade,
             active_venues=active_venues,
         )
         await self.stream_manager.start_all()
@@ -196,8 +197,8 @@ class KoreanSunriseService:
         log.info(
             f"[HEARTBEAT] KRW/USDT: {krw_rate:.1f} | "
             f"Pool: Inc {summary['incubator']} | Battle {summary['battle']} (Active: {summary['battle_active']}) | "
-            f"Ticks: Up {c['ticks_upbit']} (Trades: {c.get('trades_upbit', 0)}) / Foll {c['ticks_followers']} | "
-            f"Cancels: {c.get('cancels_blocked', 0)} | "
+            f"Ticks: Up {c['ticks_upbit']} (Trades: {c.get('trades_upbit', 0)}) / Bit {c.get('ticks_bithumb', 0)} (Trades: {c.get('trades_bithumb', 0)}) / Foll {c['ticks_followers']} | "
+            f"Cancels: {c.get('cancels_blocked', 0)} / KR-Unconf: {c.get('korean_unconfirmed_blocked', 0)} | "
             f"S1(LeadLag): {c['signals_triggered']} (⚔️{c.get('signals_battle', 0)}/🧪{c.get('signals_incubator', 0)}) | "
             f"S2(Fade): {c.get('fade_signals_triggered', 0)} (🎯{c.get('fade_signals_converged', 0)}) | "
             f"S3(Maker): {c.get('maker_voids_triggered', 0)} (🧲{c.get('maker_voids_filled', 0)}) | "

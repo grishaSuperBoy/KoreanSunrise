@@ -36,6 +36,7 @@ NORM_TAU = 600.0        # EWMA time constant for Upbit depth and spread normaliz
 BASELINE_TAU = 600.0    # EWMA time constant for cross-venue basis baseline (sec, 10 minutes)
 DEPTH_FLOOR_USD = 5.0   # Numerical stability floor for depth normalization ($5 for low-cap alts)
 BEST_ASK_FLOOR_USD = 2.5 # Numerical stability floor for best ask ($2.50 for low-cap alts)
+KOREAN_LEADERS: Set[str] = {"upbit", "bithumb"}
 
 
 class KoreanEngine:
@@ -63,6 +64,7 @@ class KoreanEngine:
         trade_confirm_lookback_sec: float = getattr(C, "TRADE_CONFIRM_LOOKBACK_SEC", 2.0),
         min_trade_confirm_floor_usd: float = 5.0,
         require_trade_confirmation: bool = False,
+        require_korean_confirmation: bool = getattr(C, "REQUIRE_KOREAN_CONFIRMATION", False),
         pool_state: Any = None,
         profile_manager: Any = None,
         thresholds_file: Optional[str] = None,
@@ -85,6 +87,7 @@ class KoreanEngine:
         self.trade_confirm_lookback_sec = trade_confirm_lookback_sec
         self.min_trade_confirm_floor_usd = min_trade_confirm_floor_usd
         self.require_trade_confirmation = require_trade_confirmation
+        self.require_korean_confirmation = require_korean_confirmation
         self.pool_state = pool_state
         self.profile_manager = profile_manager
 
@@ -102,13 +105,16 @@ class KoreanEngine:
         self._buys_lock = threading.Lock()
         self._upbit_recent_buys: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=200))
         self._has_upbit_trades: Dict[str, bool] = defaultdict(bool)
+        self._bithumb_recent_buys: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=200))
+        self._has_bithumb_trades: Dict[str, bool] = defaultdict(bool)
 
-        # Upbit normalisation state per coin:
+        # Korean leader normalisation state per coin:
         # coin -> {"depth_ask": float, "best_ask_usd": float, "spread_bps": float, "t": float}
         self._upbit_norm: Dict[str, Dict[str, float]] = {}
+        self._bithumb_norm: Dict[str, Dict[str, float]] = {}
 
-        # Pair states: (coin, follower_exchange) -> PairState
-        self._pairs: Dict[Tuple[str, str], PairState] = {}
+        # Pair states: (coin, follower_exchange) or (coin, follower_exchange, leader_exchange) -> PairState
+        self._pairs: Dict[Tuple[Any, ...], PairState] = {}
 
         # Active signals tracking: coin -> list of active SunriseSignal
         self._active_signals: Dict[str, List[SunriseSignal]] = defaultdict(list)
@@ -117,9 +123,12 @@ class KoreanEngine:
         # Telemetry counters
         self.counters = {
             "ticks_upbit": 0,
+            "ticks_bithumb": 0,
             "ticks_followers": 0,
             "trades_upbit": 0,
+            "trades_bithumb": 0,
             "cancels_blocked": 0,
+            "korean_unconfirmed_blocked": 0,
             "signals_triggered": 0,
             "signals_battle": 0,
             "signals_incubator": 0,
@@ -241,16 +250,19 @@ class KoreanEngine:
                 except Exception as e:
                     log.warning(f"[engine] Error reloading profile_manager: {e}")
 
-    def get_pair_threshold_config(self, coin: str, follower_ex: str) -> Dict[str, Any]:
-        pk = f"{coin.upper()}:upbit-{follower_ex.lower()}"
-        return self._thresholds.get(pk, {})
+    def get_pair_threshold_config(self, coin: str, follower_ex: str, leader_ex: str = "upbit") -> Dict[str, Any]:
+        pk = f"{coin.upper()}:{leader_ex.lower()}-{follower_ex.lower()}"
+        if pk in self._thresholds:
+            return self._thresholds[pk]
+        pk_upbit = f"{coin.upper()}:upbit-{follower_ex.lower()}"
+        return self._thresholds.get(pk_upbit, {})
 
-    def _get_or_create_pair_state(self, coin: str, follower_ex: str) -> PairState:
-        pair_key = (coin, follower_ex)
+    def _get_or_create_pair_state(self, coin: str, follower_ex: str, leader_ex: str = "upbit") -> PairState:
+        pair_key = (coin, follower_ex) if leader_ex == "upbit" else (coin, follower_ex, leader_ex)
         with self._engine_lock:
             st = self._pairs.get(pair_key)
             if st is None:
-                cfg = self.get_pair_threshold_config(coin, follower_ex)
+                cfg = self.get_pair_threshold_config(coin, follower_ex, leader_ex)
                 sp_sig = float(cfg.get("spike_sigma", 2.5))
                 st = self._pairs[pair_key] = PairState(
                     coin, follower_ex, self.warmup_samples, spike_sigma=sp_sig
@@ -270,22 +282,40 @@ class KoreanEngine:
 
         if ex == "upbit":
             self.counters["ticks_upbit"] += 1
-            self._eval_lead_lag(coin, snap, prev_snap, now)
-            self._update_upbit_norm(coin, snap, now)
+            self._eval_lead_lag(coin, snap, prev_snap, now, leader_ex="upbit")
+            self._update_norm(coin, snap, now, venue="upbit")
+            self._track_active_signals_for_coin(coin, now)
+        elif ex == "bithumb":
+            self.counters["ticks_bithumb"] += 1
+            self._eval_lead_lag(coin, snap, prev_snap, now, leader_ex="bithumb")
+            self._update_norm(coin, snap, now, venue="bithumb")
             self._track_active_signals_for_coin(coin, now)
         else:
             with self._engine_lock:
                 self._coin_followers[coin].add(ex)
             self.counters["ticks_followers"] += 1
+
+            # Learn Upbit baseline
             upbit_snap = self._books.get(("upbit", coin))
             if upbit_snap is not None and (now - self._recv_ts.get(("upbit", coin), 0.0)) <= 2.0:
-                st = self._get_or_create_pair_state(coin, ex)
+                st = self._get_or_create_pair_state(coin, ex, leader_ex="upbit")
                 if upbit_snap.mid_price > 0 and snap.mid_price > 0:
                     raw_diff_bps = (upbit_snap.mid_price - snap.mid_price) / snap.mid_price * 1e4
                     with self._engine_lock:
                         has_open = (st.open_signal is not None)
                     if not has_open:
                         st.learn(raw_diff_bps, now)
+
+            # Learn Bithumb baseline
+            bithumb_snap = self._books.get(("bithumb", coin))
+            if bithumb_snap is not None and (now - self._recv_ts.get(("bithumb", coin), 0.0)) <= 2.0:
+                st_b = self._get_or_create_pair_state(coin, ex, leader_ex="bithumb")
+                if bithumb_snap.mid_price > 0 and snap.mid_price > 0:
+                    raw_diff_bps_b = (bithumb_snap.mid_price - snap.mid_price) / snap.mid_price * 1e4
+                    with self._engine_lock:
+                        has_open_b = (st_b.open_signal is not None)
+                    if not has_open_b:
+                        st_b.learn(raw_diff_bps_b, now)
 
             self._track_follower_move(coin, ex, snap, now)
 
@@ -312,9 +342,22 @@ class KoreanEngine:
             if is_taker_buy and trade_usd > 0.0:
                 self._upbit_recent_buys[c].append((ts, trade_usd))
 
+    def on_bithumb_trade(self, coin: str, trade_usd: float, is_taker_buy: bool, ts: float) -> None:
+        """
+        Real-time trade stream ingestion from Bithumb.
+        Records taker buys to verify Bithumb liquidity sweeps and volume explosions.
+        Thread-safe across concurrent WebSocket worker threads.
+        """
+        c = coin.upper()
+        with self._buys_lock:
+            self.counters["trades_bithumb"] = self.counters.get("trades_bithumb", 0) + 1
+            self._has_bithumb_trades[c] = True
+            if is_taker_buy and trade_usd > 0.0:
+                self._bithumb_recent_buys[c].append((ts, trade_usd))
+
     def get_recent_upbit_buys(self, coin: str, cutoff: float) -> Tuple[float, bool]:
         """
-        Thread-safe retrieval and pruning of recent taker buys for a coin.
+        Thread-safe retrieval and pruning of recent taker buys for a coin on Upbit.
         Returns (recent_buys_usd, has_trades).
         Prevents race conditions (IndexError / deque mutation during iteration).
         """
@@ -329,15 +372,32 @@ class KoreanEngine:
             has_trades = self._has_upbit_trades.get(c, False)
             return recent_buys_usd, has_trades
 
-    # ----------------------------------------------------------- Upbit Norm
-    def _update_upbit_norm(self, coin: str, snap: OrderBookDepth5, now: float) -> None:
-        nrm = self._upbit_norm.get(coin)
+    def get_recent_bithumb_buys(self, coin: str, cutoff: float) -> Tuple[float, bool]:
+        """
+        Thread-safe retrieval and pruning of recent taker buys for a coin on Bithumb.
+        Returns (recent_buys_usd, has_trades).
+        """
+        c = coin.upper()
+        with self._buys_lock:
+            buys_deque = self._bithumb_recent_buys.get(c)
+            recent_buys_usd = 0.0
+            if buys_deque:
+                while buys_deque and buys_deque[0][0] < cutoff:
+                    buys_deque.popleft()
+                recent_buys_usd = sum(b[1] for b in buys_deque)
+            has_trades = self._has_bithumb_trades.get(c, False)
+            return recent_buys_usd, has_trades
+
+    # ----------------------------------------------------------- Korean Norm (EWMA)
+    def _update_norm(self, coin: str, snap: OrderBookDepth5, now: float, venue: str = "upbit") -> None:
+        norm_map = self._bithumb_norm if venue == "bithumb" else self._upbit_norm
+        nrm = norm_map.get(coin)
         cur_depth = snap.depth_ask_usd
         cur_best_ask_usd = snap.best_ask_usd
         cur_spread = snap.spread_bps
 
         if nrm is None:
-            self._upbit_norm[coin] = UpbitNormState(
+            norm_map[coin] = UpbitNormState(
                 depth_ask=max(cur_depth, DEPTH_FLOOR_USD),
                 best_ask_usd=max(cur_best_ask_usd, BEST_ASK_FLOOR_USD),
                 spread_bps=max(cur_spread, 1.0),
@@ -346,7 +406,7 @@ class KoreanEngine:
             return
 
         if isinstance(nrm, dict):
-            nrm = self._upbit_norm[coin] = UpbitNormState(
+            nrm = norm_map[coin] = UpbitNormState(
                 depth_ask=float(nrm["depth_ask"]),
                 best_ask_usd=float(nrm["best_ask_usd"]),
                 spread_bps=float(nrm["spread_bps"]),
@@ -365,46 +425,60 @@ class KoreanEngine:
         nrm.best_ask_usd = max((1.0 - a) * nrm.best_ask_usd + a * clamped_best_ask, BEST_ASK_FLOOR_USD)
         nrm.spread_bps = max((1.0 - a) * nrm.spread_bps + a * clamped_spread, 0.5)
 
+    def _update_upbit_norm(self, coin: str, snap: OrderBookDepth5, now: float) -> None:
+        self._update_norm(coin, snap, now, venue="upbit")
+
+    def _update_bithumb_norm(self, coin: str, snap: OrderBookDepth5, now: float) -> None:
+        self._update_norm(coin, snap, now, venue="bithumb")
     # ----------------------------------------------------------- Signal Logic
     def _eval_lead_lag(
         self,
         coin: str,
-        upbit_snap: OrderBookDepth5,
-        prev_upbit_snap: Optional[OrderBookDepth5],
+        leader_snap: OrderBookDepth5,
+        prev_leader_snap: Optional[OrderBookDepth5],
         now: float,
+        leader_ex: str = "upbit",
+        upbit_snap: Optional[OrderBookDepth5] = None,
+        prev_upbit_snap: Optional[OrderBookDepth5] = None,
     ) -> None:
-        nrm = self._upbit_norm.get(coin)
-        if not nrm or prev_upbit_snap is None:
+        if leader_snap is None and upbit_snap is not None:
+            leader_snap = upbit_snap
+        if prev_leader_snap is None and prev_upbit_snap is not None:
+            prev_leader_snap = prev_upbit_snap
+
+        norm_map = self._bithumb_norm if leader_ex == "bithumb" else self._upbit_norm
+        nrm = norm_map.get(coin)
+        if not nrm or prev_leader_snap is None:
             return
 
         if (
-            upbit_snap.best_ask <= 0
-            or upbit_snap.best_bid <= 0
-            or prev_upbit_snap.best_ask <= 0
-            or prev_upbit_snap.best_bid <= 0
+            leader_snap.best_ask <= 0
+            or leader_snap.best_bid <= 0
+            or prev_leader_snap.best_ask <= 0
+            or prev_leader_snap.best_bid <= 0
         ):
             return
 
-        norm_depth = nrm["depth_ask"]
-        norm_best_ask_usd = nrm["best_ask_usd"]
-        norm_spread = nrm["spread_bps"]
+        norm_depth = nrm["depth_ask"] if isinstance(nrm, dict) else nrm.depth_ask
+        norm_best_ask_usd = nrm["best_ask_usd"] if isinstance(nrm, dict) else nrm.best_ask_usd
+        norm_spread = nrm["spread_bps"] if isinstance(nrm, dict) else nrm.spread_bps
 
-        cur_depth = upbit_snap.depth_ask_usd
-        cur_spread = upbit_snap.spread_bps
+        cur_depth = leader_snap.depth_ask_usd
+        cur_spread = leader_snap.spread_bps
 
         trigger_type: Optional[str] = None
         drain_ratio = 0.0
         swept_usd = 0.0
         blowout_ratio = cur_spread / max(norm_spread, 0.5)
 
-        ask_lifted = upbit_snap.best_ask > prev_upbit_snap.best_ask * (1.0 + 1e-7)
-        ask_held = abs(upbit_snap.best_ask - prev_upbit_snap.best_ask) <= prev_upbit_snap.best_ask * 1e-7
-        bid_non_decreasing = upbit_snap.best_bid >= prev_upbit_snap.best_bid * (1.0 - 1e-7)
+        ask_lifted = leader_snap.best_ask > prev_leader_snap.best_ask * (1.0 + 1e-7)
+        ask_held = abs(leader_snap.best_ask - prev_leader_snap.best_ask) <= prev_leader_snap.best_ask * 1e-7
+        bid_non_decreasing = leader_snap.best_bid >= prev_leader_snap.best_bid * (1.0 - 1e-7)
 
         # 1. True Depth Drain
         if ask_lifted and bid_non_decreasing:
-            swept_top_level = prev_upbit_snap.best_ask_usd
-            top5_loss = max(0.0, prev_upbit_snap.depth_ask_usd - cur_depth)
+            swept_top_level = prev_leader_snap.best_ask_usd
+            top5_loss = max(0.0, prev_leader_snap.depth_ask_usd - cur_depth)
             swept_usd = max(top5_loss, swept_top_level)
             drain_ratio = max(
                 swept_usd / max(norm_depth, DEPTH_FLOOR_USD),
@@ -414,8 +488,8 @@ class KoreanEngine:
                 trigger_type = "depth_drain"
 
         elif ask_held and bid_non_decreasing:
-            best_ask_loss = prev_upbit_snap.best_ask_usd - upbit_snap.best_ask_usd
-            top5_loss = prev_upbit_snap.depth_ask_usd - cur_depth
+            best_ask_loss = prev_leader_snap.best_ask_usd - leader_snap.best_ask_usd
+            top5_loss = prev_leader_snap.depth_ask_usd - cur_depth
             if best_ask_loss > 0 and top5_loss > 0:
                 if best_ask_loss >= 0.5 * top5_loss:
                     swept_usd = top5_loss
@@ -431,18 +505,19 @@ class KoreanEngine:
             and blowout_ratio >= self.blowout_threshold
         ):
             trigger_type = "spread_blowout"
-            swept_usd = max(prev_upbit_snap.best_ask_usd, max(0.0, prev_upbit_snap.depth_ask_usd - cur_depth))
+            swept_usd = max(prev_leader_snap.best_ask_usd, max(0.0, prev_leader_snap.depth_ask_usd - cur_depth))
 
         # Cancel vs. Sweep Discrimination (Anti-Ghosting Guard)
-        # If Upbit trade feed is available or trade confirmation is required,
-        # verify that the liquidity drop was backed by real taker buys rather than MM cancels/quote pullbacks.
         recent_buys_usd = 0.0
         is_cancel_blocked = False
         saved_trigger_type = trigger_type
         saved_swept_usd = swept_usd
         if trigger_type is not None:
             cutoff = now - getattr(self, "trade_confirm_lookback_sec", 2.0)
-            recent_buys_usd, has_trades = self.get_recent_upbit_buys(coin, cutoff)
+            if leader_ex == "bithumb":
+                recent_buys_usd, has_trades = self.get_recent_bithumb_buys(coin, cutoff)
+            else:
+                recent_buys_usd, has_trades = self.get_recent_upbit_buys(coin, cutoff)
 
             should_verify_trades = self.require_trade_confirmation or has_trades
             if should_verify_trades:
@@ -453,7 +528,7 @@ class KoreanEngine:
                     self.counters["cancels_blocked"] = self.counters.get("cancels_blocked", 0) + 1
                     is_cancel_blocked = True
                     log.debug(
-                        f"[engine] Blocked false sweep / MM cancel on Upbit {coin}: "
+                        f"[engine] Blocked false sweep / MM cancel on {leader_ex.capitalize()} {coin}: "
                         f"swept_usd=${swept_usd:.1f}, but recent taker buys=${recent_buys_usd:.1f} "
                         f"(needed ${min_buys_needed:.1f})"
                     )
@@ -461,21 +536,33 @@ class KoreanEngine:
                     swept_usd = 0.0
                     drain_ratio = 0.0
 
+            if leader_ex == "bithumb" and trigger_type is not None:
+                min_bithumb_swept = getattr(C, "BITHUMB_MIN_SWEPT_USD", 3000.0)
+                if swept_usd < min_bithumb_swept and recent_buys_usd < min_bithumb_swept:
+                    trigger_type = None
+
         with self._engine_lock:
             follower_exchanges = set(self._coin_followers.get(coin, set()))
             if not follower_exchanges:
-                follower_exchanges = {ex for (ex, c) in list(self._books.keys()) if ex != "upbit" and c == coin}
+                follower_exchanges = {ex for (ex, c) in list(self._books.keys()) if ex not in KOREAN_LEADERS and c == coin}
                 if follower_exchanges:
                     self._coin_followers[coin] = follower_exchanges
 
-        # Strategy 2: Check Fade the Fakeout on blocked cancels or micro-sweeps
+        # Strategy 2: Check Fade the Fakeout on blocked cancels or micro-sweeps (on Upbit)
         fade_trig = trigger_type or saved_trigger_type
         fade_swept = swept_usd or saved_swept_usd
-        if fade_trig is not None:
+        if fade_trig is not None and leader_ex == "upbit":
+            # Check if Bithumb cross-confirms this move (dual-Korean pump check)
+            b_snap = self._books.get(("bithumb", coin))
+            bithumb_confirms = False
+            if b_snap and b_snap.mid_price > 0 and leader_snap.mid_price > 0:
+                bithumb_confirms = (b_snap.mid_price >= leader_snap.mid_price * 0.9995)
+
             is_fake, fade_reason = self.strat_fade.is_fakeout_pattern(
                 is_cancel_blocked=is_cancel_blocked,
                 swept_usd=fade_swept,
                 upbit_spread_bps=cur_spread,
+                korean_confirmed=bithumb_confirms,
             )
             if is_fake:
                 f_snaps = {f_ex: self._books.get((f_ex, coin)) for f_ex in follower_exchanges if self._books.get((f_ex, coin)) is not None}
@@ -483,11 +570,11 @@ class KoreanEngine:
                     coin=coin,
                     trigger_type=fade_trig,
                     swept_usd=fade_swept,
-                    upbit_snap=upbit_snap,
+                    upbit_snap=leader_snap,
                     follower_snaps=f_snaps,
                     now=now,
                     fade_reason=fade_reason,
-                    is_stable_pair_fn=lambda c, f_ex, t: self._get_or_create_pair_state(c, f_ex).is_stable(t),
+                    is_stable_pair_fn=lambda c, f_ex, t: self._get_or_create_pair_state(c, f_ex, leader_ex="upbit").is_stable(t),
                     recv_ts_map=self._recv_ts,
                 )
 
@@ -498,21 +585,18 @@ class KoreanEngine:
                 continue
 
             book_age_sec = now - f_recv
-            # Decouple baseline learning from entry age guard:
-            # Baseline learning requires reasonably contemporaneous quotes (<= 2.0s)
             if book_age_sec > 2.0:
                 continue
 
-            st = self._get_or_create_pair_state(coin, follower_ex)
+            st = self._get_or_create_pair_state(coin, follower_ex, leader_ex=leader_ex)
 
-            upbit_mid = upbit_snap.mid_price
+            lead_mid = leader_snap.mid_price
             f_mid = f_snap.mid_price
-            if upbit_mid <= 0 or f_mid <= 0:
+            if lead_mid <= 0 or f_mid <= 0:
                 continue
 
-            raw_diff_bps = (upbit_mid - f_mid) / f_mid * 1e4
+            raw_diff_bps = (lead_mid - f_mid) / f_mid * 1e4
 
-            # Entry check delegated to _check_entry (single gatekeeper for HFT staleness)
             with self._engine_lock:
                 has_open = (st.open_signal is not None)
 
@@ -521,7 +605,7 @@ class KoreanEngine:
                     coin=coin,
                     follower_ex=follower_ex,
                     st=st,
-                    upbit_snap=upbit_snap,
+                    upbit_snap=leader_snap,
                     f_snap=f_snap,
                     f_book_age_ms=book_age_sec * 1000.0,
                     norm_depth=norm_depth,
@@ -532,6 +616,8 @@ class KoreanEngine:
                     blowout_ratio=blowout_ratio,
                     now=now,
                     recent_buys_usd=recent_buys_usd,
+                    leader_ex=leader_ex,
+                    leader_snap=leader_snap,
                 )
 
             with self._engine_lock:
@@ -545,25 +631,30 @@ class KoreanEngine:
         coin: str,
         follower_ex: str,
         st: PairState,
-        upbit_snap: OrderBookDepth5,
-        f_snap: OrderBookDepth5,
-        f_book_age_ms: float,
-        norm_depth: float,
-        norm_spread: float,
-        swept_usd: float,
-        trigger_type: str,
-        drain_ratio: float,
-        blowout_ratio: float,
-        now: float,
+        upbit_snap: Optional[OrderBookDepth5] = None,
+        f_snap: Optional[OrderBookDepth5] = None,
+        f_book_age_ms: float = 0.0,
+        norm_depth: float = 0.0,
+        norm_spread: float = 0.0,
+        swept_usd: float = 0.0,
+        trigger_type: str = "depth_drain",
+        drain_ratio: float = 0.0,
+        blowout_ratio: float = 0.0,
+        now: float = 0.0,
         recent_buys_usd: float = 0.0,
+        leader_ex: str = "upbit",
+        leader_snap: Optional[OrderBookDepth5] = None,
     ) -> None:
-        pair_cfg = self.get_pair_threshold_config(coin, follower_ex)
+        leader_snap_to_use = leader_snap if leader_snap is not None else upbit_snap
+        if leader_snap_to_use is None or f_snap is None:
+            return
+        pair_cfg = self.get_pair_threshold_config(coin, follower_ex, leader_ex=leader_ex)
         seq_num = next(self._seq)
         sig = self.strat_lead_lag.evaluate_entry(
             coin=coin,
             follower_ex=follower_ex,
             st=st,
-            upbit_snap=upbit_snap,
+            upbit_snap=leader_snap_to_use,
             f_snap=f_snap,
             f_book_age_ms=f_book_age_ms,
             norm_depth=norm_depth,
@@ -582,6 +673,36 @@ class KoreanEngine:
         if sig is None:
             return
 
+        # Check cross-Korean confirmation and spread
+        other_ex = "bithumb" if leader_ex == "upbit" else "upbit"
+        other_snap = self._books.get((other_ex, coin))
+        has_other_korean = (other_snap is not None and other_snap.mid_price > 0 and leader_snap_to_use.mid_price > 0)
+        if has_other_korean:
+            sig.korean_co_listed = True
+            cutoff = now - 2.0
+            min_confirm_usd = float(getattr(C, "MIN_KOREAN_CONFIRM_USD", 0.0))
+            if leader_ex == "upbit":
+                recent_other_buys, _ = self.get_recent_bithumb_buys(coin, cutoff)
+                sig.korean_spread_bps = round((other_snap.mid_price - leader_snap_to_use.mid_price) / leader_snap_to_use.mid_price * 1e4, 1)
+                sig.korean_confirmed = (other_snap.mid_price >= leader_snap_to_use.mid_price * 0.9995) or (recent_other_buys > min_confirm_usd)
+            else:
+                recent_other_buys, _ = self.get_recent_upbit_buys(coin, cutoff)
+                sig.korean_spread_bps = round((leader_snap_to_use.mid_price - other_snap.mid_price) / other_snap.mid_price * 1e4, 1)
+                sig.korean_confirmed = (leader_snap_to_use.mid_price >= other_snap.mid_price * 0.9995) or (recent_other_buys > min_confirm_usd)
+
+            # Cross-Korean Confirmation Gate:
+            # In live Battle mode (real money execution), block unconfirmed pumps if require_korean_confirmation is on.
+            # In Incubator/Telemetry mode (default), record all signals to collect empirical evidence for quantitative reports.
+            req_confirm = getattr(self, "require_korean_confirmation", getattr(C, "REQUIRE_KOREAN_CONFIRMATION", False))
+            strict_gate = getattr(C, "STRICT_KOREAN_GATE", False)
+            if not sig.korean_confirmed and ((sig.is_actionable and req_confirm) or strict_gate):
+                self.counters["korean_unconfirmed_blocked"] = self.counters.get("korean_unconfirmed_blocked", 0) + 1
+                log.debug(
+                    f"[engine] Blocked unconfirmed {leader_ex.capitalize()} signal on {coin}: "
+                    f"peer {other_ex} did not confirm (spread={sig.korean_spread_bps:+.1f} bps, actionable={sig.is_actionable})"
+                )
+                return
+
         with self._engine_lock:
             if st.open_signal is not None:
                 return
@@ -589,19 +710,26 @@ class KoreanEngine:
             self._active_signals[coin].append(sig)
 
         self.counters["signals_triggered"] += 1
+        dual_icon = "⚡" if sig.korean_confirmed else ""
+        dual_suffix = "+DUAL" if sig.korean_confirmed else ""
         if sig.is_actionable:
             self.counters["signals_battle"] += 1
-            tag = "[SIGNAL-BATTLE] ⚔️"
+            tag = f"[SIGNAL-BATTLE ({leader_ex.upper()}{dual_suffix})] ⚔️{dual_icon}"
         else:
             self.counters["signals_incubator"] += 1
-            tag = "[SIGNAL-INCUBATOR] 🧪"
+            tag = f"[SIGNAL-INCUBATOR ({leader_ex.upper()}{dual_suffix})] 🧪{dual_icon}"
 
-        buys_str = f", UpBuys: ${sig.leader_recent_buys_usd:.0f}" if sig.leader_recent_buys_usd > 0 else ""
+        buys_str = f", Buys: ${sig.leader_recent_buys_usd:.0f}" if sig.leader_recent_buys_usd > 0 else ""
+        kr_str = (
+            f" | KR-Conf: {sig.korean_confirmed} ({sig.korean_spread_bps:+.1f}bps)"
+            if sig.korean_co_listed
+            else " | KR-Solo"
+        )
         log.info(
-            f"{tag} {sig.coin} ({sig.follower_contract}) | Upbit -> {sig.follower_exchange} | "
+            f"{tag} {sig.coin} ({sig.follower_contract}) | {leader_ex} -> {sig.follower_exchange} | "
             f"Trig: {sig.trigger_type} (Swept: ${sig.leader_swept_usd:.0f}{buys_str}) | "
-            f"Edge: +{sig.net_exec_edge_bps:.1f} bps | Z: {sig.dev_z:.1f}σ | "
-            f"Size: ${sig.suggested_size_usd:.0f} (Cap15%: ${sig.stealth_capacity_usd:.0f})"
+            f"Edge: +{sig.gross_exec_edge_bps:.1f} bps | Z: {sig.dev_z:.1f}σ | "
+            f"Size: ${sig.suggested_size_usd:.0f} (Cap15%: ${sig.stealth_capacity_usd:.0f}){kr_str}"
         )
 
     # ----------------------------------------------------------- Tracking & Closure
@@ -610,32 +738,32 @@ class KoreanEngine:
             signals = list(self._active_signals.get(coin, []))
         if not signals:
             return
-        upbit_snap = self._books.get(("upbit", coin))
-        if not upbit_snap:
-            return
         for sig in signals:
             if sig.closed:
                 continue
+            lead_snap = self._books.get((sig.leader_exchange, coin)) or self._books.get(("upbit", coin))
+            if not lead_snap:
+                continue
             f_snap = self._books.get((sig.follower_exchange, coin))
             if f_snap is not None:
-                self._track_one_signal(sig, upbit_snap, f_snap, now)
+                self._track_one_signal(sig, lead_snap, f_snap, now)
 
     def _track_follower_move(self, coin: str, follower_ex: str, f_snap: OrderBookDepth5, now: float) -> None:
         with self._engine_lock:
             signals = list(self._active_signals.get(coin, []))
         if not signals:
             return
-        upbit_snap = self._books.get(("upbit", coin))
-        if not upbit_snap:
-            return
         for sig in signals:
             if sig.follower_exchange == follower_ex and not sig.closed:
-                self._track_one_signal(sig, upbit_snap, f_snap, now)
+                lead_snap = self._books.get((sig.leader_exchange, coin)) or self._books.get(("upbit", coin))
+                if not lead_snap:
+                    continue
+                self._track_one_signal(sig, lead_snap, f_snap, now)
 
     def _track_one_signal(
         self,
         sig: SunriseSignal,
-        upbit_snap: OrderBookDepth5,
+        leader_snap: OrderBookDepth5,
         f_snap: OrderBookDepth5,
         now: float,
     ) -> None:
@@ -651,8 +779,8 @@ class KoreanEngine:
                 if sig.follower_mid > 0
                 else 0.0
             )
-            up_mid_move = (
-                (upbit_snap.mid_price - sig.leader_mid) / sig.leader_mid * 1e4
+            lead_mid_move = (
+                (leader_snap.mid_price - sig.leader_mid) / sig.leader_mid * 1e4
                 if sig.leader_mid > 0
                 else 0.0
             )
@@ -674,7 +802,7 @@ class KoreanEngine:
 
             # 4. Remaining dislocation edge
             cur_diff_bps = (
-                (upbit_snap.mid_price - f_snap.mid_price) / f_snap.mid_price * 1e4
+                (leader_snap.mid_price - f_snap.mid_price) / f_snap.mid_price * 1e4
                 if f_snap.mid_price > 0
                 else 0.0
             )
@@ -683,21 +811,21 @@ class KoreanEngine:
             if not sig.path or dt > sig.path[-1][0]:
                 sig.path.append([
                     dt,
-                    round(up_mid_move, 2),
+                    round(lead_mid_move, 2),
                     round(f_mid_move, 2),
                     cur_net_pnl,
                     round(rem_edge, 2),
                 ])
 
             # Closure & Stop-Loss evaluation:
-            pair_cfg = self.get_pair_threshold_config(sig.coin, sig.follower_exchange)
+            pair_cfg = self.get_pair_threshold_config(sig.coin, sig.follower_exchange, leader_ex=sig.leader_exchange)
             hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
             default_decay = max(self.alpha_decay_sec, hold_sec * 0.5) if hold_sec > self.max_hold_sec else self.alpha_decay_sec
             pair_decay_sec = float(pair_cfg.get("alpha_decay_sec", default_decay))
             sigma = max(sig.pair_sigma_bps, 2.0)
 
-            upbit_drop_bps = (
-                (sig.leader_mid - upbit_snap.mid_price) / sig.leader_mid * 1e4
+            leader_drop_bps = (
+                (sig.leader_mid - leader_snap.mid_price) / sig.leader_mid * 1e4
                 if sig.leader_mid > 0
                 else 0.0
             )
@@ -711,7 +839,7 @@ class KoreanEngine:
                 hold_sec=hold_sec,
                 pair_decay_sec=pair_decay_sec,
                 sigma=sigma,
-                upbit_drop_bps=upbit_drop_bps,
+                upbit_drop_bps=leader_drop_bps,
                 cur_dislocation_bps=cur_dislocation_bps,
                 stop_invalidation_bps=self.stop_invalidation_bps,
                 stop_adverse_pnl_bps=self.stop_adverse_pnl_bps,
@@ -759,6 +887,8 @@ class KoreanEngine:
 
             pair_key = (sig.coin, sig.follower_exchange)
             st = self._pairs.get(pair_key)
+            if not st:
+                st = self._pairs.get((sig.coin, sig.follower_exchange, sig.leader_exchange))
             if st and st.open_signal is not None and getattr(st.open_signal, "id", None) == sig.id:
                 st.open_signal = None
 

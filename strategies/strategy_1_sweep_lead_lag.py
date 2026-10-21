@@ -360,10 +360,11 @@ class KoreanLeadLagStrategy:
         init_exec_move_bps = (init_exit_px - f_entry_px) / f_entry_px * 1e4
         init_net_pnl_bps = round(init_exec_move_bps - self.roundtrip_fee_bps, 2)
 
+        lead_ex = getattr(upbit_snap, "exchange", "upbit") or "upbit"
         sig = SunriseSignal(
             id=f"sun_{int(now)}_{seq_num:04d}",
             coin=coin,
-            leader_exchange="upbit",
+            leader_exchange=lead_ex,
             follower_exchange=follower_ex,
             follower_contract=f_snap.raw_symbol,
             open_ts=round(now, 3),
