@@ -149,6 +149,7 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
             upbit_snap=upbit_snap,
             now=now,
             norm_spread_bps=15.0,
+            is_warmed_up=True,
         )
 
         self.assertIsNotNone(void)
@@ -199,6 +200,7 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
             upbit_snap=None,
             now=now,
             norm_spread_bps=15.0,
+            is_warmed_up=True,
         )
         self.assertIsNotNone(void)
 
@@ -296,6 +298,7 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
             upbit_snap=None,
             now=now,
             norm_spread_bps=15.0,
+            is_warmed_up=True,
         )
         self.assertIsNotNone(void)
 
@@ -322,7 +325,7 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
         coin = "O"
         f_snap = make_snap("pionex", "O", [(0.40, 2000.0)], [(0.404, 2000.0)], now, "O_USDT_PERP")
 
-        void = self.maker_strat.check_void_opportunity("pionex", coin, f_snap, None, now, norm_spread_bps=15.0)
+        void = self.maker_strat.check_void_opportunity("pionex", coin, f_snap, None, now, norm_spread_bps=15.0, is_warmed_up=True)
         self.assertIsNotNone(void)
 
         # Calling sweep_timeouts beyond TTL cancels resting order
@@ -619,6 +622,7 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
             upbit_snap=upbit_snap2,
             now=now,
             norm_spread_bps=15.0,
+            is_warmed_up=True,
         )
         self.assertIsNotNone(placed)
         self.assertEqual(shared_counters["maker_voids_triggered"], 1)
@@ -704,6 +708,7 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
             upbit_snap=upbit_snap,
             now=now,
             norm_spread_bps=15.0,
+            is_warmed_up=True,
         )
 
         self.assertIsNotNone(void)
@@ -859,11 +864,11 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
             cooldown_sec=0.0,
         )
         f_snap1 = make_snap("bybit", "AAA", [(1.0, 100.0)], [(1.01, 100.0)], now) # 100 bps spread
-        void1 = strat_s3.check_void_opportunity("bybit", "AAA", f_snap1, upbit_snap, now, norm_spread_bps=20.0)
+        void1 = strat_s3.check_void_opportunity("bybit", "AAA", f_snap1, upbit_snap, now, norm_spread_bps=20.0, is_warmed_up=True)
         self.assertIsNotNone(void1)
 
         f_snap2 = make_snap("bybit", "BBB", [(1.0, 100.0)], [(1.01, 100.0)], now)
-        void2 = strat_s3.check_void_opportunity("bybit", "BBB", f_snap2, upbit_snap, now, norm_spread_bps=20.0)
+        void2 = strat_s3.check_void_opportunity("bybit", "BBB", f_snap2, upbit_snap, now, norm_spread_bps=20.0, is_warmed_up=True)
         # Capped at 1 active void
         self.assertIsNone(void2)
 
@@ -892,7 +897,7 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
         # Tight spread (10 bps) with Upbit leading by 50 bps
         f_snap = make_snap("bybit", "AAA", [(1.0, 100.0)], [(1.001, 100.0)], now)
         upbit_snap = make_snap("upbit", "AAA", [(1.005, 100.0)], [(1.006, 100.0)], now)
-        strat_s3.check_void_opportunity("bybit", "AAA", f_snap, upbit_snap, now, norm_spread_bps=10.0)
+        strat_s3.check_void_opportunity("bybit", "AAA", f_snap, upbit_snap, now, norm_spread_bps=10.0, is_warmed_up=True)
 
         # Trigger timeout after 6 seconds without subsequent ticks
         strat_s3.sweep_timeouts(now + 6.0)

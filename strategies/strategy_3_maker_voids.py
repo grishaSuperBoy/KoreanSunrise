@@ -4,8 +4,8 @@ strategies/strategy_3_maker_voids.py - Strategy 3: Maker Liquidity Harvesting & 
 Microstructure Simulation:
 When volatility or a cross-venue burst occurs, designated market makers (DMM) on follower perps
 briefly pull quotes or widen spreads.
-This paper-trading telemetry module simulates passive maker limit orders or predatory taker void sweeps
-inside widened spreads to evaluate theoretical capture against synthetic order book depth.
+This paper-trading telemetry module simulates passive maker limit orders or predatory taker lag-arb sweeps
+to evaluate theoretical capture against synthetic order book depth.
 (No live orders are placed; simulated fills and PnL are evaluated via order book snapshots).
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ class ActiveMakerVoid:
     coin: str
     follower_exchange: str
     follower_contract: str
-    side: str                          # "ask" / "bid" (classic maker) or "buy" / "sell" (taker hunter)
+    side: str                          # "ask" / "bid" (classic maker) or "buy" / "sell" (taker lag-arb)
     open_ts: float
 
     # Pricing & Order placement
@@ -44,7 +44,7 @@ class ActiveMakerVoid:
     fill_ts: Optional[float] = None
     fill_px: Optional[float] = None
     ttl_sec: float = 3.0               # Max resting time before cancelling unfilled limit order
-    max_hold_sec: float = 10.0          # Max hold time after fill
+    max_hold_sec: float = 10.0         # Max hold time after fill
     maker_rebate_bps: float = 0.0      # Realistic maker rebate on alts (0.0% by default)
     taker_fee_bps: float = 5.0         # Realistic exit taker fee (market exit on normalization)
 
@@ -59,7 +59,7 @@ class ActiveMakerVoid:
 
 class MakerVoidStrategy:
     """
-    Simulates and tracks theoretical maker limit or taker sweep executions on widened follower spreads.
+    Simulates and tracks theoretical maker limit or taker lag-arb executions on follower books.
     """
 
     def __init__(
@@ -76,7 +76,6 @@ class MakerVoidStrategy:
         max_hold_sec: float = 10.0,
         max_follower_book_age_sec: float = 1.5,
         stop_invalidation_bps: float = 15.0,
-        stop_adverse_pnl_bps: float = 25.0,
         max_spread_bps: float = 120.0,
         target_pnl_bps: float = 15.0,
         cooldown_sec: float = 30.0,
@@ -98,7 +97,6 @@ class MakerVoidStrategy:
         self.max_hold_sec = max_hold_sec
         self.max_follower_book_age_sec = max_follower_book_age_sec
         self.stop_invalidation_bps = stop_invalidation_bps
-        self.stop_adverse_pnl_bps = stop_adverse_pnl_bps
         self.max_spread_bps = max_spread_bps
         self.target_pnl_bps = target_pnl_bps
         self.cooldown_sec = cooldown_sec
@@ -136,23 +134,28 @@ class MakerVoidStrategy:
         now: float,
         norm_spread_bps: float = 20.0,
         recv_ts: Optional[float] = None,
-        is_warmed_up: bool = True,
+        is_warmed_up: bool = False,
     ) -> Optional[ActiveMakerVoid]:
         """
-        Detects if follower order book has experienced a spread blowout or liquidity void.
-        Compares the follower's instantaneous spread against its own baseline EWMA spread (norm_spread_bps).
+        Detects if follower order book presents a tradeable opportunity.
+
+        Maker mode: passive post-only inside a widened spread (classic liquidity harvesting).
+        Hunter mode: taker lag-arb crossing a TIGHT spread when Upbit leads by a large dislocation.
+
+        NOTE: `is_warmed_up` defaults to False for fail-safe behavior. Engine MUST pass it
+        explicitly once the follower-spread baseline EWMA has accumulated enough samples.
         """
         with self._lock:
-            # 0a. Warmup Guard: skip void detection until follower spread baseline has collected warmup samples
+            # 0a. Warmup Guard: skip detection until follower spread baseline is reliable
             if not is_warmed_up:
                 return None
 
-            # 0b. Staleness Guard: reject stale book snapshots (> max_follower_book_age_sec)
+            # 0b. Staleness Guard: reject stale book snapshots
             snap_ts = recv_ts if recv_ts is not None else float(getattr(f_snap, "ts", now) or now)
             if (now - snap_ts) > self.max_follower_book_age_sec:
                 return None
 
-            # 0b. Portfolio Exposure Guard: cap total active voids and exposure budget
+            # 0c. Portfolio Exposure Guard
             active_voids = [v for v in self._open_voids.values() if not v.closed]
             if len(active_voids) >= self.max_active_voids:
                 return None
@@ -166,7 +169,7 @@ class MakerVoidStrategy:
             if f_bid <= 0 or f_ask <= 0:
                 return None
 
-            # Cooldown guard: at least cooldown_sec between void postings for same (follower_ex, coin)
+            # Cooldown guard
             pair_key = (follower_ex, coin)
             if (now - self._last_void_ts.get(pair_key, 0.0)) < self.cooldown_sec:
                 return None
@@ -177,16 +180,12 @@ class MakerVoidStrategy:
 
             if self.hunter_mode:
                 # Taker Lag-Arb Trigger (Tight Spread + Large Lag):
-                # Takers MUST cross the spread! Entering a wide spread produces an instant
-                # structural MTM loss of (-spread - 2*fees).
-                # Therefore, Taker Hunter triggers ONLY on:
-                # 1. Tight spread: f_spread <= 20.0 bps (cheap to cross)
-                # 2. Hard DEX ceiling: reject AsterDex spreads > 20.0 bps
-                # 3. Large dislocation lag: |upbit_mid - follower_mid| / follower_mid * 1e4 >= 40.0 bps
-                # 4. Net positive edge: edge > spread/2 + roundtrip_fee + 10.0 margin
+                # Takers MUST cross the spread. Entering a WIDE spread produces an immediate
+                # structural MTM loss of (-spread - 2*fees). Therefore we require:
+                # 1. Tight spread (<= 20 bps) — cheap to cross
+                # 2. Large dislocation (>= 40 bps) — real lag to capture
+                # 3. Net edge covers spread/2 + roundtrip_fee + 10 bps margin
                 if f_spread > 20.0:
-                    return None
-                if follower_ex.lower() == "asterdex" and f_spread > 20.0:
                     return None
                 if upbit_mid <= 0 or follower_mid <= 0:
                     return None
@@ -199,24 +198,22 @@ class MakerVoidStrategy:
                 required_edge = (f_spread / 2.0) + roundtrip_fee + 10.0
 
                 if dislocation_bps > 0:
-                    # Upbit is leading higher -> Taker BUY by sweeping ask
+                    # Upbit leading higher -> BUY, sweeping ask
                     side = "buy"
                     target_limit_px = f_ask
                     maker_edge_bps = (upbit_mid - f_ask) / f_ask * 1e4
-                    if maker_edge_bps < required_edge:
-                        return None
-                    order_type = "taker_void_sweep"
                 else:
-                    # Upbit is leading lower -> Taker SELL by hitting bid
+                    # Upbit leading lower -> SELL, hitting bid
                     side = "sell"
                     target_limit_px = f_bid
-                    maker_edge_bps = (f_bid - upbit_mid) / upbit_mid * 1e4
-                    if maker_edge_bps < required_edge:
-                        return None
-                    order_type = "taker_void_sweep"
+                    maker_edge_bps = (f_bid - upbit_mid) / f_bid * 1e4
+
+                if maker_edge_bps < required_edge:
+                    return None
+                order_type = "taker_void_sweep"
             else:
                 # Classic Maker Mode (Post-Only inside Widened Spreads):
-                # 1. Spread must be blown out (>= 25 bps AND >= 1.4x baseline spread)
+                # 1. Spread must be blown out (>= min_spread_bps AND >= 1.4x baseline)
                 if f_spread < max(self.min_spread_bps, norm_spread_bps * 1.4):
                     return None
 
@@ -225,7 +222,7 @@ class MakerVoidStrategy:
                     if not self.allow_asterdex_maker or f_spread > 45.0:
                         return None
 
-                # 3. Toxic pool / broken book safety ceiling
+                # 3. Toxic pool ceiling
                 if f_spread > self.max_spread_bps:
                     return None
 
@@ -287,10 +284,13 @@ class MakerVoidStrategy:
             self._open_voids[key] = void
             self._last_void_ts[pair_key] = now
             self.counters["maker_voids_triggered"] += 1
+            # NOTE on counters: in hunter_mode, every trigger is an immediate taker fill,
+            # so maker_voids_filled always equals maker_voids_triggered for taker_void_sweep
+            # orders. This is intentional — a taker order fills atomically.
             if self.hunter_mode:
                 self.counters["maker_voids_filled"] += 1
                 log.info(
-                    f"[TAKER-HUNTER] ⚡ Swept {side.upper()} on {coin} ({void.follower_contract}) @ {follower_ex} | "
+                    f"[TAKER-LAGARB] ⚡ Swept {side.upper()} on {coin} ({void.follower_contract}) @ {follower_ex} | "
                     f"Taker Px: {target_limit_px} | Edge: +{maker_edge_bps:.1f} bps | Spread: {f_spread:.1f} bps"
                 )
             else:
@@ -309,9 +309,7 @@ class MakerVoidStrategy:
         norm_spread_bps: float = 20.0,
         recv_ts: Optional[float] = None,
     ) -> None:
-        """
-        Monitors fill crossing and exit lifecycle for active maker void orders.
-        """
+        """Monitors fill crossing and exit lifecycle for active void orders."""
         with self._lock:
             snap_ts = recv_ts if recv_ts is not None else float(getattr(f_snap, "ts", now) or now)
             if (now - snap_ts) > self.max_follower_book_age_sec:
@@ -348,7 +346,6 @@ class MakerVoidStrategy:
                         self.counters["maker_voids_filled"] += 1
                         log.info(f"[MAKER-FILL] ⚡ Order FILLED on {coin} {side.upper()} @ {void.target_limit_px} on {follower_ex}!")
                     elif dt >= void.ttl_sec:
-                        # Resting timeout: cancel unfilled order cleanly without fees
                         void.closed = True
                         void.close_ts = round(now, 3)
                         void.duration_sec = round(dt, 3)
@@ -365,14 +362,12 @@ class MakerVoidStrategy:
                     dt_fill = max(0.0, now - (void.fill_ts or void.open_ts))
 
                     if getattr(void, "order_type", "maker_post_only") == "taker_void_sweep":
-                        # Taker Void Hunter PnL model:
                         if side == "buy":
                             gross_pnl_bps = (cur_bid - void.fill_px) / void.fill_px * 1e4
                         else:
                             gross_pnl_bps = (void.fill_px - cur_ask) / void.fill_px * 1e4
                         net_pnl_bps = gross_pnl_bps - (void.taker_fee_bps * 2.0)
                     else:
-                        # Realistic Maker PnL model: maker rebate on entry, taker fee on exit
                         if side == "ask":
                             gross_pnl_bps = (void.fill_px - cur_ask) / void.fill_px * 1e4
                         else:
@@ -381,27 +376,28 @@ class MakerVoidStrategy:
 
                     close_reason: Optional[str] = None
 
-                    # 1. Take-Profit: Target Net PnL reached (>= target_pnl_bps) or Spread restored to normal
+                    # 1. Take-Profit
                     if net_pnl_bps >= self.target_pnl_bps:
                         close_reason = "target_profit"
                         self.counters["maker_voids_restored"] += 1
                     elif cur_spread <= max(15.0, norm_spread_bps * 1.15) and net_pnl_bps > 0:
                         close_reason = "restored"
                         self.counters["maker_voids_restored"] += 1
-                    # 2. Hard Invalidation stop
-                    # In taker hunter mode, account for initial entry crossing cost (spread + fees)
-                    if getattr(void, "order_type", "") == "taker_void_sweep":
-                        stop_thresh = -(void.spread_open_bps + (void.taker_fee_bps * 2.0) + self.stop_invalidation_bps)
                     else:
-                        stop_thresh = -self.stop_invalidation_bps
+                        # 2. Hard Invalidation stop
+                        # Taker entries start MTM at (-spread - 2*fees); threshold must cover that.
+                        if getattr(void, "order_type", "") == "taker_void_sweep":
+                            stop_thresh = -(void.spread_open_bps + (void.taker_fee_bps * 2.0) + self.stop_invalidation_bps)
+                        else:
+                            stop_thresh = -self.stop_invalidation_bps
 
-                    if net_pnl_bps <= stop_thresh:
-                        close_reason = "stop_invalidation"
-                        self.counters["maker_voids_stopped"] += 1
-                    # 3. Timeout
-                    elif dt_fill >= void.max_hold_sec:
-                        close_reason = "timeout"
-                        self.counters["maker_voids_timeout"] += 1
+                        if net_pnl_bps <= stop_thresh:
+                            close_reason = "stop_invalidation"
+                            self.counters["maker_voids_stopped"] += 1
+                        # 3. Timeout
+                        elif dt_fill >= void.max_hold_sec:
+                            close_reason = "timeout"
+                            self.counters["maker_voids_timeout"] += 1
 
                     if close_reason:
                         void.closed = True
@@ -418,8 +414,7 @@ class MakerVoidStrategy:
 
     def sweep_timeouts(self, now: float) -> None:
         """
-        Sweeps and cancels/closes expired maker void orders if stream ticks stopped arriving.
-        Prevents open limit orders or filled positions from hanging indefinitely.
+        Sweeps and cancels/closes expired void orders if stream ticks stopped arriving.
         """
         with self._lock:
             to_remove: List[Tuple[str, str, str]] = []
@@ -430,7 +425,6 @@ class MakerVoidStrategy:
                 dt = max(0.0, now - void.open_ts)
                 if not void.maker_filled:
                     if dt >= void.ttl_sec:
-                        # Resting timeout without fill: cancel cleanly with 0 PnL
                         void.closed = True
                         void.close_ts = round(now, 3)
                         void.duration_sec = round(dt, 3)
@@ -442,12 +436,17 @@ class MakerVoidStrategy:
                 else:
                     dt_fill = max(0.0, now - (void.fill_ts or void.open_ts))
                     if dt_fill >= void.max_hold_sec:
-                        # Max hold expired without subsequent follower tick: close with fee deduction
                         void.closed = True
                         void.close_ts = round(now, 3)
                         void.duration_sec = round(dt, 3)
                         void.close_reason = "timeout_no_follower_data"
-                        void.net_pnl_bps = round(void.maker_rebate_bps - void.taker_fee_bps, 2)
+                        # CRITICAL: taker entries carry an immediate structural loss equal to
+                        # (spread at entry + 2*roundtrip taker fee). Reporting only "-fee" would
+                        # silently understate losses by the full spread.
+                        if getattr(void, "order_type", "") == "taker_void_sweep":
+                            void.net_pnl_bps = round(-(void.spread_open_bps + void.taker_fee_bps * 2.0), 2)
+                        else:
+                            void.net_pnl_bps = round(void.maker_rebate_bps - void.taker_fee_bps, 2)
                         self.counters["maker_voids_timeout"] += 1
                         self._emit_void(void)
                         to_remove.append(key)
