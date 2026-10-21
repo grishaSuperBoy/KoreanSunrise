@@ -693,14 +693,14 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
             hunter_mode=True,
         )
 
-        # Follower spread blown out to 60 bps (10.00 / 10.06), but Upbit mid is 10.10 (higher!)
-        f_wide = make_snap("asterdex", coin, [(10.00, 3000.0)], [(10.06, 3000.0)], now, "TIA-USDT")
-        upbit_snap = make_snap("upbit", coin, [(10.09, 1000.0)], [(10.11, 1000.0)], now)
+        # Follower spread is tight (15 bps: 10.00 / 10.015), but Upbit mid is 10.08 (lag > 60 bps!)
+        f_tight = make_snap("asterdex", coin, [(10.00, 3000.0)], [(10.015, 3000.0)], now, "TIA-USDT")
+        upbit_snap = make_snap("upbit", coin, [(10.07, 1000.0)], [(10.09, 1000.0)], now)
 
         void = hunter_strat.check_void_opportunity(
             follower_ex="asterdex",
             coin=coin,
-            f_snap=f_wide,
+            f_snap=f_tight,
             upbit_snap=upbit_snap,
             now=now,
             norm_spread_bps=15.0,
@@ -710,10 +710,10 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
         self.assertEqual(void.side, "buy")
         self.assertEqual(void.order_type, "taker_void_sweep")
         self.assertTrue(void.maker_filled) # Immediate taker execution
-        self.assertEqual(void.fill_px, 10.06)
+        self.assertEqual(void.fill_px, 10.015)
 
-        # Follower market surges up: bid moves to 10.10, ask to 10.11
-        f_surge = make_snap("asterdex", coin, [(10.10, 5000.0)], [(10.11, 5000.0)], now + 0.8, "TIA-USDT")
+        # Follower market converges up to Upbit: bid moves to 10.08, ask to 10.09
+        f_surge = make_snap("asterdex", coin, [(10.08, 5000.0)], [(10.09, 5000.0)], now + 0.8, "TIA-USDT")
         hunter_strat.on_follower_tick("asterdex", coin, f_surge, now + 0.8, norm_spread_bps=15.0)
 
         self.assertEqual(len(emitted_hunter), 1)
@@ -889,8 +889,10 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
             hunter_mode=True,
             counters=counters,
         )
-        f_snap = make_snap("bybit", "AAA", [(1.0, 100.0)], [(1.01, 100.0)], now)
-        strat_s3.check_void_opportunity("bybit", "AAA", f_snap, None, now, norm_spread_bps=20.0)
+        # Tight spread (10 bps) with Upbit leading by 50 bps
+        f_snap = make_snap("bybit", "AAA", [(1.0, 100.0)], [(1.001, 100.0)], now)
+        upbit_snap = make_snap("upbit", "AAA", [(1.005, 100.0)], [(1.006, 100.0)], now)
+        strat_s3.check_void_opportunity("bybit", "AAA", f_snap, upbit_snap, now, norm_spread_bps=10.0)
 
         # Trigger timeout after 6 seconds without subsequent ticks
         strat_s3.sweep_timeouts(now + 6.0)

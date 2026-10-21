@@ -166,22 +166,6 @@ class MakerVoidStrategy:
             if f_bid <= 0 or f_ask <= 0:
                 return None
 
-            # Spread must be blown out (>= 25 bps AND >= 1.4x baseline spread)
-            if f_spread < max(self.min_spread_bps, norm_spread_bps * 1.4):
-                return None
-
-            # AsterDex DEX safety guard:
-            # Passive maker orders on DEX pools with synthetic/wide spreads face 100% adverse selection.
-            # Only allow if explicitly enabled AND spread is tight (<= 45.0 bps).
-            # (In hunter_mode, we are the predatory taker, so AsterDex is our prime target!)
-            if not self.hunter_mode and follower_ex.lower() == "asterdex":
-                if not self.allow_asterdex_maker or f_spread > 45.0:
-                    return None
-
-            # Toxic pool / broken book safety ceiling (reject DEX spreads > max_spread_bps)
-            if f_spread > self.max_spread_bps:
-                return None
-
             # Cooldown guard: at least cooldown_sec between void postings for same (follower_ex, coin)
             pair_key = (follower_ex, coin)
             if (now - self._last_void_ts.get(pair_key, 0.0)) < self.cooldown_sec:
@@ -189,31 +173,62 @@ class MakerVoidStrategy:
 
             upbit_mid = float(getattr(upbit_snap, "mid_price", 0.0) or 0.0) if upbit_snap else 0.0
             follower_mid = float(getattr(f_snap, "mid_price", 0.0) or (0.5 * (f_bid + f_ask)))
-
-            # Determine side and execution edge
             half_spread_edge = 0.5 * f_spread
 
             if self.hunter_mode:
-                # Toxic Taker Void Hunter (Inverted S3):
-                # Never post passive limit against the Korean momentum.
-                # Aggressively SWEEP the unadjusted follower quote inside the blown-out spread!
-                if upbit_mid > follower_mid and upbit_mid > 0:
+                # Taker Lag-Arb Trigger (Tight Spread + Large Lag):
+                # Takers MUST cross the spread! Entering a wide spread produces an instant
+                # structural MTM loss of (-spread - 2*fees).
+                # Therefore, Taker Hunter triggers ONLY on:
+                # 1. Tight spread: f_spread <= 20.0 bps (cheap to cross)
+                # 2. Hard DEX ceiling: reject AsterDex spreads > 20.0 bps
+                # 3. Large dislocation lag: |upbit_mid - follower_mid| / follower_mid * 1e4 >= 40.0 bps
+                # 4. Net positive edge: edge > spread/2 + roundtrip_fee + 10.0 margin
+                if f_spread > 20.0:
+                    return None
+                if follower_ex.lower() == "asterdex" and f_spread > 20.0:
+                    return None
+                if upbit_mid <= 0 or follower_mid <= 0:
+                    return None
+
+                dislocation_bps = (upbit_mid - follower_mid) / follower_mid * 1e4
+                if abs(dislocation_bps) < 40.0:
+                    return None
+
+                roundtrip_fee = self.taker_fee_bps * 2.0
+                required_edge = (f_spread / 2.0) + roundtrip_fee + 10.0
+
+                if dislocation_bps > 0:
+                    # Upbit is leading higher -> Taker BUY by sweeping ask
                     side = "buy"
                     target_limit_px = f_ask
-                    maker_edge_bps = max(half_spread_edge, (upbit_mid - f_ask) / f_ask * 1e4)
-                    order_type = "taker_void_sweep"
-                elif upbit_mid < follower_mid and upbit_mid > 0:
-                    side = "sell"
-                    target_limit_px = f_bid
-                    maker_edge_bps = max(half_spread_edge, (f_bid - upbit_mid) / upbit_mid * 1e4)
+                    maker_edge_bps = (upbit_mid - f_ask) / f_ask * 1e4
+                    if maker_edge_bps < required_edge:
+                        return None
                     order_type = "taker_void_sweep"
                 else:
-                    side = "buy"
-                    target_limit_px = f_ask
-                    maker_edge_bps = half_spread_edge
+                    # Upbit is leading lower -> Taker SELL by hitting bid
+                    side = "sell"
+                    target_limit_px = f_bid
+                    maker_edge_bps = (f_bid - upbit_mid) / upbit_mid * 1e4
+                    if maker_edge_bps < required_edge:
+                        return None
                     order_type = "taker_void_sweep"
             else:
-                # Classic Maker Post-Only
+                # Classic Maker Mode (Post-Only inside Widened Spreads):
+                # 1. Spread must be blown out (>= 25 bps AND >= 1.4x baseline spread)
+                if f_spread < max(self.min_spread_bps, norm_spread_bps * 1.4):
+                    return None
+
+                # 2. AsterDex DEX safety guard (reject synthetic/wide spreads)
+                if follower_ex.lower() == "asterdex":
+                    if not self.allow_asterdex_maker or f_spread > 45.0:
+                        return None
+
+                # 3. Toxic pool / broken book safety ceiling
+                if f_spread > self.max_spread_bps:
+                    return None
+
                 order_type = "maker_post_only"
                 if upbit_mid > follower_mid and upbit_mid > 0:
                     side = "ask"
@@ -374,7 +389,13 @@ class MakerVoidStrategy:
                         close_reason = "restored"
                         self.counters["maker_voids_restored"] += 1
                     # 2. Hard Invalidation stop
-                    elif net_pnl_bps <= -self.stop_invalidation_bps:
+                    # In taker hunter mode, account for initial entry crossing cost (spread + fees)
+                    if getattr(void, "order_type", "") == "taker_void_sweep":
+                        stop_thresh = -(void.spread_open_bps + (void.taker_fee_bps * 2.0) + self.stop_invalidation_bps)
+                    else:
+                        stop_thresh = -self.stop_invalidation_bps
+
+                    if net_pnl_bps <= stop_thresh:
                         close_reason = "stop_invalidation"
                         self.counters["maker_voids_stopped"] += 1
                     # 3. Timeout

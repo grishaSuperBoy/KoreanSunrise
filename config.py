@@ -88,9 +88,9 @@ MAX_FADE_FOLLOWER_DEPTH_USD = float(os.getenv("MAX_FADE_FOLLOWER_DEPTH_USD", "35
 FADE_COOLDOWN_SEC = float(os.getenv("FADE_COOLDOWN_SEC", "30.0"))            # Anti-machinegun cooldown per pair (sec)
 S2_INVERT_TO_LONG = os.getenv("S2_INVERT_TO_LONG", "true").lower() in ("true", "1", "yes") # True: Invert S2 short to early long sniper on MM quote cancellations
 
-# Strategy 3: Toxic Taker Void Hunter / Inverted Maker
+# Strategy 3: Maker Liquidity Harvesting (Passive Post-Only inside Widened Spreads)
 MAX_MAKER_SPREAD_BPS = float(os.getenv("MAX_MAKER_SPREAD_BPS", "120.0"))     # Max spread ceiling to reject toxic/dead DEX pools
-S3_HUNTER_MODE = os.getenv("S3_HUNTER_MODE", "true").lower() in ("true", "1", "yes") # True: Invert passive maker to predatory taker void hunter sweeping dislocated quotes
+S3_HUNTER_MODE = os.getenv("S3_HUNTER_MODE", "false").lower() in ("true", "1", "yes") # False (Default): Passive Maker Void. True: Taker mode (must use tight spread + large lag)
 
 # AsterDex DEX Adaptation & Safety
 MAX_ASTERDEX_SPREAD_BPS = float(os.getenv("MAX_ASTERDEX_SPREAD_BPS", "45.0")) # Hard spread ceiling on AsterDex (blocks 250-350 bps defensive walls)
