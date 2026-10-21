@@ -1,11 +1,12 @@
 """
 strategies/strategy_3_maker_voids.py - Strategy 3: Maker Liquidity Harvesting & Spread Voids.
 
-Microstructure Physics:
+Microstructure Simulation:
 When volatility or a cross-venue burst occurs, designated market makers (DMM) on follower perps
-briefly pull quotes or widen spreads by 30-100 bps.
-Instead of paying aggressive taker fees, this strategy posts passive Maker Post-Only limit orders
-directly inside the widened spread. It captures the spread + maker fee rebates as the book normalizes.
+briefly pull quotes or widen spreads.
+This paper-trading telemetry module simulates passive maker limit orders or predatory taker void sweeps
+inside widened spreads to evaluate theoretical capture against synthetic order book depth.
+(No live orders are placed; simulated fills and PnL are evaluated via order book snapshots).
 """
 from __future__ import annotations
 
@@ -25,17 +26,18 @@ class ActiveMakerVoid:
     coin: str
     follower_exchange: str
     follower_contract: str
-    side: str                          # "ask" (sell limit) or "bid" (buy limit)
+    side: str                          # "ask" / "bid" (classic maker) or "buy" / "sell" (taker hunter)
     open_ts: float
 
     # Pricing & Order placement
     best_bid_at_open: float
     best_ask_at_open: float
     spread_open_bps: float
-    target_limit_px: float             # Post-Only Limit price inside the spread
+    target_limit_px: float             # Post-Only Limit price inside the spread or taker entry
     ref_lead_mid: float
     maker_edge_bps: float
     suggested_size_usd: float
+    order_type: str = "maker_post_only" # "maker_post_only" or "taker_void_sweep"
 
     # Execution state
     maker_filled: bool = False
@@ -43,7 +45,7 @@ class ActiveMakerVoid:
     fill_px: Optional[float] = None
     ttl_sec: float = 3.0               # Max resting time before cancelling unfilled limit order
     max_hold_sec: float = 10.0          # Max hold time after fill
-    maker_rebate_bps: float = 1.5      # Maker fee rebate (or 0% maker fee)
+    maker_rebate_bps: float = 0.0      # Realistic maker rebate on alts (0.0% by default)
     taker_fee_bps: float = 5.0         # Realistic exit taker fee (market exit on normalization)
 
     # Outcome
@@ -57,7 +59,7 @@ class ActiveMakerVoid:
 
 class MakerVoidStrategy:
     """
-    Executes and tracks passive Maker Post-Only limit orders capturing widened spreads.
+    Simulates and tracks theoretical maker limit or taker sweep executions on widened follower spreads.
     """
 
     def __init__(
@@ -68,16 +70,20 @@ class MakerVoidStrategy:
         stealth_depth_fraction: float = 0.15,
         min_spread_bps: float = 25.0,
         min_maker_edge_bps: float = 5.0,
-        maker_rebate_bps: float = 1.5,
+        maker_rebate_bps: float = 0.0,
         taker_fee_bps: float = 5.0,
         resting_ttl_sec: float = 3.0,
         max_hold_sec: float = 10.0,
+        max_follower_book_age_sec: float = 1.5,
         stop_invalidation_bps: float = 15.0,
         stop_adverse_pnl_bps: float = 25.0,
         max_spread_bps: float = 120.0,
         target_pnl_bps: float = 15.0,
         cooldown_sec: float = 30.0,
         allow_asterdex_maker: bool = False,
+        hunter_mode: bool = False,
+        max_active_voids: int = 10,
+        max_total_exposure_usd: float = 5000.0,
         counters: Optional[Dict[str, int]] = None,
     ):
         self.emit = emit_callback
@@ -90,12 +96,16 @@ class MakerVoidStrategy:
         self.taker_fee_bps = taker_fee_bps
         self.resting_ttl_sec = resting_ttl_sec
         self.max_hold_sec = max_hold_sec
+        self.max_follower_book_age_sec = max_follower_book_age_sec
         self.stop_invalidation_bps = stop_invalidation_bps
         self.stop_adverse_pnl_bps = stop_adverse_pnl_bps
         self.max_spread_bps = max_spread_bps
         self.target_pnl_bps = target_pnl_bps
         self.cooldown_sec = cooldown_sec
         self.allow_asterdex_maker = allow_asterdex_maker
+        self.hunter_mode = hunter_mode
+        self.max_active_voids = max_active_voids
+        self.max_total_exposure_usd = max_total_exposure_usd
 
         # (follower_ex, coin, side) -> ActiveMakerVoid
         self._open_voids: Dict[Tuple[str, str, str], ActiveMakerVoid] = {}
@@ -108,6 +118,7 @@ class MakerVoidStrategy:
             "maker_voids_restored": 0,
             "maker_voids_unfilled": 0,
             "maker_voids_stopped": 0,
+            "maker_voids_timeout": 0,
         }
         if counters is not None:
             for k, v in default_counters.items():
@@ -124,11 +135,31 @@ class MakerVoidStrategy:
         upbit_snap: Optional[Any],
         now: float,
         norm_spread_bps: float = 20.0,
+        recv_ts: Optional[float] = None,
+        is_warmed_up: bool = True,
     ) -> Optional[ActiveMakerVoid]:
         """
         Detects if follower order book has experienced a spread blowout or liquidity void.
+        Compares the follower's instantaneous spread against its own baseline EWMA spread (norm_spread_bps).
         """
         with self._lock:
+            # 0a. Warmup Guard: skip void detection until follower spread baseline has collected warmup samples
+            if not is_warmed_up:
+                return None
+
+            # 0b. Staleness Guard: reject stale book snapshots (> max_follower_book_age_sec)
+            snap_ts = recv_ts if recv_ts is not None else float(getattr(f_snap, "ts", now) or now)
+            if (now - snap_ts) > self.max_follower_book_age_sec:
+                return None
+
+            # 0b. Portfolio Exposure Guard: cap total active voids and exposure budget
+            active_voids = [v for v in self._open_voids.values() if not v.closed]
+            if len(active_voids) >= self.max_active_voids:
+                return None
+            total_exposure = sum(v.suggested_size_usd for v in active_voids)
+            if total_exposure >= self.max_total_exposure_usd:
+                return None
+
             f_bid = float(getattr(f_snap, "best_bid", 0.0) or 0.0)
             f_ask = float(getattr(f_snap, "best_ask", 0.0) or 0.0)
             f_spread = float(getattr(f_snap, "spread_bps", 0.0) or 0.0)
@@ -142,7 +173,8 @@ class MakerVoidStrategy:
             # AsterDex DEX safety guard:
             # Passive maker orders on DEX pools with synthetic/wide spreads face 100% adverse selection.
             # Only allow if explicitly enabled AND spread is tight (<= 45.0 bps).
-            if follower_ex.lower() == "asterdex":
+            # (In hunter_mode, we are the predatory taker, so AsterDex is our prime target!)
+            if not self.hunter_mode and follower_ex.lower() == "asterdex":
                 if not self.allow_asterdex_maker or f_spread > 45.0:
                     return None
 
@@ -158,21 +190,43 @@ class MakerVoidStrategy:
             upbit_mid = float(getattr(upbit_snap, "mid_price", 0.0) or 0.0) if upbit_snap else 0.0
             follower_mid = float(getattr(f_snap, "mid_price", 0.0) or (0.5 * (f_bid + f_ask)))
 
-            # Determine side and maker edge
+            # Determine side and execution edge
             half_spread_edge = 0.5 * f_spread
 
-            if upbit_mid > follower_mid and upbit_mid > 0:
-                side = "ask"
-                target_limit_px = f_ask - 0.5 * (f_ask - f_bid)
-                maker_edge_bps = max(half_spread_edge, (upbit_mid - target_limit_px) / target_limit_px * 1e4)
-            elif upbit_mid < follower_mid and upbit_mid > 0:
-                side = "bid"
-                target_limit_px = f_bid + 0.5 * (f_ask - f_bid)
-                maker_edge_bps = max(half_spread_edge, (target_limit_px - upbit_mid) / target_limit_px * 1e4)
+            if self.hunter_mode:
+                # Toxic Taker Void Hunter (Inverted S3):
+                # Never post passive limit against the Korean momentum.
+                # Aggressively SWEEP the unadjusted follower quote inside the blown-out spread!
+                if upbit_mid > follower_mid and upbit_mid > 0:
+                    side = "buy"
+                    target_limit_px = f_ask
+                    maker_edge_bps = max(half_spread_edge, (upbit_mid - f_ask) / f_ask * 1e4)
+                    order_type = "taker_void_sweep"
+                elif upbit_mid < follower_mid and upbit_mid > 0:
+                    side = "sell"
+                    target_limit_px = f_bid
+                    maker_edge_bps = max(half_spread_edge, (f_bid - upbit_mid) / upbit_mid * 1e4)
+                    order_type = "taker_void_sweep"
+                else:
+                    side = "buy"
+                    target_limit_px = f_ask
+                    maker_edge_bps = half_spread_edge
+                    order_type = "taker_void_sweep"
             else:
-                side = "ask"
-                target_limit_px = f_ask - 0.5 * (f_ask - f_bid)
-                maker_edge_bps = half_spread_edge
+                # Classic Maker Post-Only
+                order_type = "maker_post_only"
+                if upbit_mid > follower_mid and upbit_mid > 0:
+                    side = "ask"
+                    target_limit_px = f_ask - 0.5 * (f_ask - f_bid)
+                    maker_edge_bps = max(half_spread_edge, (upbit_mid - target_limit_px) / target_limit_px * 1e4)
+                elif upbit_mid < follower_mid and upbit_mid > 0:
+                    side = "bid"
+                    target_limit_px = f_bid + 0.5 * (f_ask - f_bid)
+                    maker_edge_bps = max(half_spread_edge, (target_limit_px - upbit_mid) / target_limit_px * 1e4)
+                else:
+                    side = "ask"
+                    target_limit_px = f_ask - 0.5 * (f_ask - f_bid)
+                    maker_edge_bps = half_spread_edge
 
             if maker_edge_bps < self.min_maker_edge_bps:
                 return None
@@ -181,13 +235,15 @@ class MakerVoidStrategy:
             if key in self._open_voids:
                 return None
 
-            if side == "ask" and hasattr(f_snap, "top_n_ask_depth_usd"):
+            if side in ("ask", "buy") and hasattr(f_snap, "top_n_ask_depth_usd"):
                 top3_depth = float(f_snap.top_n_ask_depth_usd(3))
-            elif side == "bid" and hasattr(f_snap, "top_n_bid_depth_usd"):
+            elif side in ("bid", "sell") and hasattr(f_snap, "top_n_bid_depth_usd"):
                 top3_depth = float(f_snap.top_n_bid_depth_usd(3))
             else:
                 top3_depth = 100.0
             size_usd = min(self.max_position_budget_usd, max(self.min_order_usd, round(top3_depth * self.stealth_depth_fraction, 2)))
+            if total_exposure + size_usd > self.max_total_exposure_usd:
+                return None
 
             seq_num = next(self._seq)
             void = ActiveMakerVoid(
@@ -196,6 +252,7 @@ class MakerVoidStrategy:
                 follower_exchange=follower_ex,
                 follower_contract=getattr(f_snap, "raw_symbol", f"{coin}USDT"),
                 side=side,
+                order_type=order_type,
                 open_ts=round(now, 3),
                 best_bid_at_open=round(f_bid, 8),
                 best_ask_at_open=round(f_ask, 8),
@@ -208,14 +265,24 @@ class MakerVoidStrategy:
                 max_hold_sec=self.max_hold_sec,
                 maker_rebate_bps=self.maker_rebate_bps,
                 taker_fee_bps=self.taker_fee_bps,
+                maker_filled=True if self.hunter_mode else False,
+                fill_ts=round(now, 3) if self.hunter_mode else None,
+                fill_px=round(target_limit_px, 8) if self.hunter_mode else None,
             )
             self._open_voids[key] = void
             self._last_void_ts[pair_key] = now
             self.counters["maker_voids_triggered"] += 1
-            log.info(
-                f"[MAKER-VOID] 🛡️ Posted Post-Only {side.upper()} on {coin} ({void.follower_contract}) @ {follower_ex} | "
-                f"Limit Px: {target_limit_px} | Edge: +{maker_edge_bps:.1f} bps | Spread: {f_spread:.1f} bps"
-            )
+            if self.hunter_mode:
+                self.counters["maker_voids_filled"] += 1
+                log.info(
+                    f"[TAKER-HUNTER] ⚡ Swept {side.upper()} on {coin} ({void.follower_contract}) @ {follower_ex} | "
+                    f"Taker Px: {target_limit_px} | Edge: +{maker_edge_bps:.1f} bps | Spread: {f_spread:.1f} bps"
+                )
+            else:
+                log.info(
+                    f"[MAKER-VOID] 🛡️ Posted Post-Only {side.upper()} on {coin} ({void.follower_contract}) @ {follower_ex} | "
+                    f"Limit Px: {target_limit_px} | Edge: +{maker_edge_bps:.1f} bps | Spread: {f_spread:.1f} bps"
+                )
             return void
 
     def on_follower_tick(
@@ -225,11 +292,16 @@ class MakerVoidStrategy:
         f_snap: Any,
         now: float,
         norm_spread_bps: float = 20.0,
+        recv_ts: Optional[float] = None,
     ) -> None:
         """
         Monitors fill crossing and exit lifecycle for active maker void orders.
         """
         with self._lock:
+            snap_ts = recv_ts if recv_ts is not None else float(getattr(f_snap, "ts", now) or now)
+            if (now - snap_ts) > self.max_follower_book_age_sec:
+                return
+
             cur_bid = float(getattr(f_snap, "best_bid", 0.0) or 0.0)
             cur_ask = float(getattr(f_snap, "best_ask", 0.0) or 0.0)
             cur_spread = float(getattr(f_snap, "spread_bps", 0.0) or 0.0)
@@ -238,15 +310,17 @@ class MakerVoidStrategy:
 
             to_remove: List[Tuple[str, str, str]] = []
 
-            for side in ("ask", "bid"):
-                key = (follower_ex, coin, side)
+            for key in list(self._open_voids.keys()):
+                if key[0] != follower_ex or key[1] != coin:
+                    continue
                 void = self._open_voids.get(key)
                 if void is None or void.closed:
                     continue
 
+                side = void.side
                 dt = max(0.0, now - void.open_ts)
 
-                # Check fill crossing
+                # Check fill crossing (for classic maker post-only)
                 if not void.maker_filled:
                     is_filled = (
                         (side == "ask" and cur_bid >= void.target_limit_px)
@@ -274,15 +348,21 @@ class MakerVoidStrategy:
                 # Position is FILLED: monitor exit & spread restoration
                 if void.maker_filled:
                     dt_fill = max(0.0, now - (void.fill_ts or void.open_ts))
-                    # If we sold as Maker Ask: profit when cur_ask is below fill_px + rebate
-                    # If we bought as Maker Bid: profit when cur_bid is above fill_px + rebate
-                    if side == "ask":
-                        gross_pnl_bps = (void.fill_px - cur_ask) / void.fill_px * 1e4
-                    else:
-                        gross_pnl_bps = (cur_bid - void.fill_px) / void.fill_px * 1e4
 
-                    # Realistic PnL model: maker rebate on entry, taker fee on exit
-                    net_pnl_bps = gross_pnl_bps + void.maker_rebate_bps - void.taker_fee_bps
+                    if getattr(void, "order_type", "maker_post_only") == "taker_void_sweep":
+                        # Taker Void Hunter PnL model:
+                        if side == "buy":
+                            gross_pnl_bps = (cur_bid - void.fill_px) / void.fill_px * 1e4
+                        else:
+                            gross_pnl_bps = (void.fill_px - cur_ask) / void.fill_px * 1e4
+                        net_pnl_bps = gross_pnl_bps - (void.taker_fee_bps * 2.0)
+                    else:
+                        # Realistic Maker PnL model: maker rebate on entry, taker fee on exit
+                        if side == "ask":
+                            gross_pnl_bps = (void.fill_px - cur_ask) / void.fill_px * 1e4
+                        else:
+                            gross_pnl_bps = (cur_bid - void.fill_px) / void.fill_px * 1e4
+                        net_pnl_bps = gross_pnl_bps + void.maker_rebate_bps - void.taker_fee_bps
 
                     close_reason: Optional[str] = None
 
@@ -300,6 +380,7 @@ class MakerVoidStrategy:
                     # 3. Timeout
                     elif dt_fill >= void.max_hold_sec:
                         close_reason = "timeout"
+                        self.counters["maker_voids_timeout"] += 1
 
                     if close_reason:
                         void.closed = True
@@ -346,7 +427,7 @@ class MakerVoidStrategy:
                         void.duration_sec = round(dt, 3)
                         void.close_reason = "timeout_no_follower_data"
                         void.net_pnl_bps = round(void.maker_rebate_bps - void.taker_fee_bps, 2)
-                        self.counters["maker_voids_stopped"] += 1
+                        self.counters["maker_voids_timeout"] += 1
                         self._emit_void(void)
                         to_remove.append(key)
 
@@ -358,7 +439,7 @@ class MakerVoidStrategy:
         rec = {
             "id": void.id,
             "strategy": "maker_void",
-            "order_type": "maker_post_only",
+            "order_type": getattr(void, "order_type", "maker_post_only"),
             "side": void.side,
             "coin": void.coin,
             "follower_exchange": void.follower_exchange,

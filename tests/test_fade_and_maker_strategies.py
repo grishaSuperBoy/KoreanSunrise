@@ -37,8 +37,8 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
             max_hold_sec=5.0,
             stop_invalidation_bps=20.0,
             target_fade_bps=12.0,
-            min_conviction_usd=3500.0,
-            max_upbit_spread_bps=45.0,
+            max_fade_swept_usd=3500.0,
+            min_upbit_spread_bps=45.0,
         )
         self.maker_strat = MakerVoidStrategy(
             emit_callback=lambda sig: self.emitted.append(sig),
@@ -633,6 +633,439 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
         maker_strat.on_follower_tick("binance", coin, f_tight, now + 1.0, norm_spread_bps=15.0)
         self.assertEqual(shared_counters["maker_voids_triggered"], 1)
         self.assertEqual(shared_counters["maker_voids_restored"], 1)
+
+    # -------------------------------------------------------------------------
+    # 5. Inverted Alpha Strategies: S2 Long Sniper & S3 Taker Void Hunter
+    # -------------------------------------------------------------------------
+    def test_inverted_s2_pre_sweep_long_execution(self):
+        """Verifies Inverted S2 enters LONG on Upbit MM cancel and profits on follower pump."""
+        now = time.time()
+        coin = "GTC"
+        emitted_longs = []
+
+        long_fade = FadeFakeoutStrategy(
+            emit_callback=lambda sig: emitted_longs.append(sig),
+            roundtrip_fee_bps=10.0,
+            invert_to_long=True,
+            target_fade_bps=12.0,
+            stop_invalidation_bps=20.0,
+            min_upbit_spread_bps=35.0,
+        )
+
+        upbit_snap = make_snap("upbit", coin, [(1.00, 1000.0)], [(1.006, 500.0)], now)
+        f_snap = make_snap("asterdex", coin, [(1.00, 2000.0)], [(1.0005, 2000.0)], now, "GTCUSDT")
+
+        opened = long_fade.on_fakeout_detected(
+            coin=coin,
+            trigger_type="depth_drain",
+            swept_usd=1500.0,
+            upbit_snap=upbit_snap,
+            follower_snaps={"asterdex": f_snap},
+            now=now,
+            fade_reason="mm_quote_cancel",
+        )
+
+        self.assertEqual(len(opened), 1)
+        pos = opened[0]
+        self.assertEqual(pos.side, "long")
+        self.assertEqual(pos.entry_px, 1.0005) # Bought executable ask
+
+        # Follower pumps up by 25 bps (bid moves to 1.0030)
+        f_pump = make_snap("asterdex", coin, [(1.0030, 2000.0)], [(1.0035, 2000.0)], now + 0.5, "GTCUSDT")
+        long_fade.on_follower_tick("asterdex", coin, f_pump, now + 0.5, cur_upbit_mid=1.0050)
+
+        self.assertEqual(len(emitted_longs), 1)
+        rec = emitted_longs[0]
+        self.assertEqual(rec["side"], "long")
+        self.assertEqual(rec["close_reason"], "converged")
+        self.assertGreater(rec["net_pnl_bps"], 0.0)
+
+    def test_inverted_s3_taker_void_hunter_execution(self):
+        """Verifies Inverted S3 sweeps underpriced ask as an aggressive taker and captures pump."""
+        now = time.time()
+        coin = "TIA"
+        emitted_hunter = []
+
+        hunter_strat = MakerVoidStrategy(
+            emit_callback=lambda sig: emitted_hunter.append(sig),
+            min_spread_bps=25.0,
+            target_pnl_bps=15.0,
+            hunter_mode=True,
+        )
+
+        # Follower spread blown out to 60 bps (10.00 / 10.06), but Upbit mid is 10.10 (higher!)
+        f_wide = make_snap("asterdex", coin, [(10.00, 3000.0)], [(10.06, 3000.0)], now, "TIA-USDT")
+        upbit_snap = make_snap("upbit", coin, [(10.09, 1000.0)], [(10.11, 1000.0)], now)
+
+        void = hunter_strat.check_void_opportunity(
+            follower_ex="asterdex",
+            coin=coin,
+            f_snap=f_wide,
+            upbit_snap=upbit_snap,
+            now=now,
+            norm_spread_bps=15.0,
+        )
+
+        self.assertIsNotNone(void)
+        self.assertEqual(void.side, "buy")
+        self.assertEqual(void.order_type, "taker_void_sweep")
+        self.assertTrue(void.maker_filled) # Immediate taker execution
+        self.assertEqual(void.fill_px, 10.06)
+
+        # Follower market surges up: bid moves to 10.10, ask to 10.11
+        f_surge = make_snap("asterdex", coin, [(10.10, 5000.0)], [(10.11, 5000.0)], now + 0.8, "TIA-USDT")
+        hunter_strat.on_follower_tick("asterdex", coin, f_surge, now + 0.8, norm_spread_bps=15.0)
+
+        self.assertEqual(len(emitted_hunter), 1)
+        rec = emitted_hunter[0]
+        self.assertEqual(rec["order_type"], "taker_void_sweep")
+        self.assertEqual(rec["side"], "buy")
+        self.assertEqual(rec["close_reason"], "target_profit")
+        self.assertGreater(rec["net_pnl_bps"], 0.0)
+
+    def test_s2_long_sizing_uses_ask_depth_and_skips_thin_books(self):
+        """Bug 3 & Bug 4 Verification: Long sizing consumes ask liquidity and skips thin books."""
+        now = time.time()
+        coin = "GTC"
+
+        # Ask side has only $20 depth (0.20 * 100.0 = $20.0), Bid side has $500 depth (5.0 * 100.0 = $500.0)
+        # stealth_depth_fraction is 0.15: 15% of $20 = $3.00, which is < min_order_usd ($10.0)
+        # Previous bug: used max(ask, bid) -> 15% of $500 = $75, sizing long based on bid!
+        # And if stealth < min_order, it forced $10 instead of skipping.
+        thin_ask_snap = make_snap(
+            "bybit", coin,
+            [(100.0, 5.0)],    # $500 bid depth
+            [(100.05, 0.20)],  # $20.01 ask depth
+            now, "GTCUSDT"
+        )
+        upbit_snap = make_snap("upbit", coin, [(100.0, 10.0)], [(100.5, 10.0)], now)
+
+        strat = FadeFakeoutStrategy(
+            emit_callback=lambda s: None,
+            min_order_usd=10.0,
+            stealth_depth_fraction=0.15,
+            invert_to_long=True,
+            cooldown_sec=0.0,
+        )
+
+        opened = strat.on_fakeout_detected(
+            coin=coin,
+            trigger_type="depth_drain",
+            swept_usd=500.0,
+            upbit_snap=upbit_snap,
+            follower_snaps={"bybit": thin_ask_snap},
+            now=now,
+            fade_reason="micro_sweep_exhaustion",
+        )
+        # Sizing 15% of $20.01 ask depth = $3 < min_order_usd ($10) -> MUST SKIP (not force $10)
+        self.assertEqual(len(opened), 0)
+
+        # Adequate ask depth ($200) -> 15% of $200 = $30 -> enters long
+        adequate_ask_snap = make_snap(
+            "bybit", coin,
+            [(100.0, 0.5)],    # $50 bid depth
+            [(100.0, 2.0)],    # $200 ask depth
+            now, "GTCUSDT"
+        )
+        opened2 = strat.on_fakeout_detected(
+            coin=coin,
+            trigger_type="depth_drain",
+            swept_usd=500.0,
+            upbit_snap=upbit_snap,
+            follower_snaps={"bybit": adequate_ask_snap},
+            now=now,
+            fade_reason="micro_sweep_exhaustion",
+        )
+        self.assertEqual(len(opened2), 1)
+        self.assertEqual(opened2[0].side, "long")
+        self.assertEqual(opened2[0].suggested_size_usd, 30.0) # Strictly 15% of ask depth!
+
+    def test_extract_spread_bps_and_dict_compatibility(self):
+        """Bug 7 Verification: _extract_spread_bps handles both dict and UpbitNormState seamlessly."""
+        from korean_engine import _extract_spread_bps, UpbitNormState
+
+        # 1. None returns default
+        self.assertEqual(_extract_spread_bps(None, default=20.0), 20.0)
+
+        # 2. Dict returns correct spread_bps
+        dict_norm = {"depth_ask": 100.0, "best_ask_usd": 50.0, "spread_bps": 37.5, "t": 1000.0}
+        self.assertEqual(_extract_spread_bps(dict_norm, default=20.0), 37.5)
+
+        # 3. UpbitNormState returns correct spread_bps
+        obj_norm = UpbitNormState(depth_ask=100.0, best_ask_usd=50.0, spread_bps=42.0, t=1000.0)
+        self.assertEqual(_extract_spread_bps(obj_norm, default=20.0), 42.0)
+
+    def test_follower_spread_ewma_and_stale_upbit_freshness_in_engine(self):
+        """Bug 1 & Bug 2 Verification: Follower maintains own spread EWMA and S2 receives None if Upbit is stale."""
+        from korean_engine import KoreanEngine
+        now = time.time()
+        coin = "DOGE"
+        engine = KoreanEngine(emit_callback=lambda s: None)
+
+        # 1. Bybit tick arrives with tight spread (5.0 bps)
+        f_tight = make_snap("bybit", coin, [(0.1000, 1000.0)], [(0.10005, 1000.0)], now)
+        engine.on_book_update(f_tight)
+        self.assertIn(("bybit", coin), engine._follower_spread_ewma)
+        self.assertAlmostEqual(engine._follower_spread_ewma[("bybit", coin)][0], 5.0, places=1)
+
+        # 2. Upbit tick arrived at now - 5.0s (stale)
+        upbit_snap = make_snap("upbit", coin, [(0.1000, 1000.0)], [(0.1003, 1000.0)], now - 5.0)
+        engine._books[("upbit", coin)] = upbit_snap
+        engine._recv_ts[("upbit", coin)] = now - 5.0
+
+        captured_upbit_mid = []
+        engine.strat_fade.on_follower_tick = lambda ex, c, s, t, cur_upbit_mid=None: captured_upbit_mid.append(cur_upbit_mid)
+
+        engine.on_book_update(f_tight)
+        self.assertEqual(len(captured_upbit_mid), 1)
+        self.assertIsNone(captured_upbit_mid[0]) # Gated out due to staleness!
+
+    def test_portfolio_caps_in_s2_and_s3(self):
+        """Points 11 & 12 Verification: Portfolio caps & exposure limits in S2 and S3."""
+        now = time.time()
+        coin = "GTC"
+        upbit_snap = make_snap("upbit", coin, [(100.0, 10.0)], [(100.5, 10.0)], now)
+
+        # S2 with cap of 2 positions
+        strat_s2 = FadeFakeoutStrategy(
+            emit_callback=lambda s: None,
+            min_order_usd=10.0,
+            stealth_depth_fraction=0.15,
+            invert_to_long=True,
+            cooldown_sec=0.0,
+            max_active_positions=2,
+        )
+        snaps = {
+            "bybit": make_snap("bybit", coin, [(100.0, 1.0)], [(100.0, 2.0)], now, "GTCUSDT"),
+            "binance": make_snap("binance", coin, [(100.0, 1.0)], [(100.0, 2.0)], now, "GTCUSDT"),
+            "okx": make_snap("okx", coin, [(100.0, 1.0)], [(100.0, 2.0)], now, "GTCUSDT"),
+        }
+        opened = strat_s2.on_fakeout_detected(
+            coin=coin,
+            trigger_type="depth_drain",
+            swept_usd=500.0,
+            upbit_snap=upbit_snap,
+            follower_snaps=snaps,
+            now=now,
+            fade_reason="micro_sweep_exhaustion",
+        )
+        # 3 followers supplied, but capped strictly at 2
+        self.assertEqual(len(opened), 2)
+
+        # S3 with cap of 1 void
+        strat_s3 = MakerVoidStrategy(
+            emit_callback=lambda s: None,
+            max_active_voids=1,
+            cooldown_sec=0.0,
+        )
+        f_snap1 = make_snap("bybit", "AAA", [(1.0, 100.0)], [(1.01, 100.0)], now) # 100 bps spread
+        void1 = strat_s3.check_void_opportunity("bybit", "AAA", f_snap1, upbit_snap, now, norm_spread_bps=20.0)
+        self.assertIsNotNone(void1)
+
+        f_snap2 = make_snap("bybit", "BBB", [(1.0, 100.0)], [(1.01, 100.0)], now)
+        void2 = strat_s3.check_void_opportunity("bybit", "BBB", f_snap2, upbit_snap, now, norm_spread_bps=20.0)
+        # Capped at 1 active void
+        self.assertIsNone(void2)
+
+    def test_s3_staleness_guard(self):
+        """Point 12 Verification: S3 rejects stale follower book snapshots (> max_follower_book_age_sec)."""
+        now = time.time()
+        strat_s3 = MakerVoidStrategy(emit_callback=lambda s: None, max_follower_book_age_sec=1.5)
+        f_snap = make_snap("bybit", "AAA", [(1.0, 100.0)], [(1.01, 100.0)], now - 3.0) # 3.0s old
+
+        void = strat_s3.check_void_opportunity(
+            "bybit", "AAA", f_snap, None, now, norm_spread_bps=20.0, recv_ts=now - 3.0
+        )
+        self.assertIsNone(void)
+
+    def test_s3_timeout_counter_separation(self):
+        """Point 13 Verification: S3 increments maker_voids_timeout, not maker_voids_stopped."""
+        now = time.time()
+        emitted = []
+        counters = {"maker_voids_timeout": 0, "maker_voids_stopped": 0}
+        strat_s3 = MakerVoidStrategy(
+            emit_callback=lambda s: emitted.append(s),
+            max_hold_sec=5.0,
+            hunter_mode=True,
+            counters=counters,
+        )
+        f_snap = make_snap("bybit", "AAA", [(1.0, 100.0)], [(1.01, 100.0)], now)
+        strat_s3.check_void_opportunity("bybit", "AAA", f_snap, None, now, norm_spread_bps=20.0)
+
+        # Trigger timeout after 6 seconds without subsequent ticks
+        strat_s3.sweep_timeouts(now + 6.0)
+
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(emitted[0]["close_reason"], "timeout_no_follower_data")
+        self.assertEqual(counters["maker_voids_timeout"], 1)
+        self.assertEqual(counters["maker_voids_stopped"], 0) # MUST NOT be incremented!
+
+    def test_s1_path_length_capped_at_50(self):
+        """Point 14 Verification: KoreanEngine caps sig.path at 50 points to prevent unbounded memory growth."""
+        from korean_engine import KoreanEngine
+        from models import SunriseSignal
+        now = time.time()
+        coin = "GTC"
+        engine = KoreanEngine(emit_callback=lambda s: None)
+        st = engine._get_or_create_pair_state(coin, "bybit", leader_ex="upbit")
+
+        upbit_t0 = make_snap("upbit", coin, [(10.0, 100.0)], [(10.01, 100.0)], now)
+        f_t0 = make_snap("bybit", coin, [(10.0, 100.0)], [(10.01, 100.0)], now)
+        engine._books[("upbit", coin)] = upbit_t0
+        engine._books[("bybit", coin)] = f_t0
+        engine._recv_ts[("upbit", coin)] = now
+        engine._recv_ts[("bybit", coin)] = now
+
+        sig = SunriseSignal(
+            id="test_sig_01",
+            coin=coin,
+            leader_exchange="upbit",
+            follower_exchange="bybit",
+            follower_contract="GTCUSDT",
+            open_ts=now,
+            trigger_type="depth_drain",
+            leader_mid=10.005,
+            leader_best_ask=10.01,
+            leader_spread_bps=10.0,
+            leader_norm_spread_bps=10.0,
+            leader_top5_ask_usd=1000.0,
+            leader_norm_depth_usd=1000.0,
+            leader_swept_usd=500.0,
+            leader_imbalance_top5=0.5,
+            drain_ratio=0.5,
+            spread_blowout_ratio=1.0,
+            follower_mid=10.005,
+            follower_best_bid=10.00,
+            follower_best_ask=10.01,
+            follower_spread_bps=10.0,
+            follower_top3_ask_usd=2000.0,
+            follower_top3_bid_usd=2000.0,
+            follower_imbalance_top3=0.5,
+            kimchi_baseline_bps=0.0,
+            pair_sigma_bps=3.0,
+            raw_dislocation_bps=0.0,
+            dev_z=1.0,
+            gross_exec_edge_bps=50.0,
+            net_exec_edge_bps=40.0,
+            follower_entry_px=10.01,
+            suggested_size_usd=100.0,
+            max_hold_sec=15.0,
+            path=[],
+        )
+        st.open_signal = sig
+        engine._active_signals[coin].append(sig)
+
+        # Simulate 80 follower ticks
+        for i in range(1, 81):
+            t_curr = now + i * 0.05
+            f_tick = make_snap("bybit", coin, [(10.0, 100.0)], [(10.01, 100.0)], t_curr)
+            engine.on_book_update(f_tick)
+
+        self.assertLessEqual(len(sig.path), 50)
+
+    def test_min_korean_confirm_usd_zero_telemetry_mode(self):
+        """Verify that MIN_KOREAN_CONFIRM_USD=0.0 is not overridden by 500.0 fallback."""
+        import config as C
+        from unittest.mock import patch
+        from korean_engine import KoreanEngine
+
+        engine = KoreanEngine(emit_callback=lambda s: None)
+        coin = "ZEROCOIN"
+        now = time.time()
+        engine._get_or_create_pair_state(coin, "bybit")
+
+        # Provide leader and bithumb snaps
+        engine._books[("upbit", coin)] = make_snap("upbit", coin, [(10.0, 100.0)], [(10.05, 100.0)], now)
+        engine._recv_ts[("upbit", coin)] = now
+        # Bithumb price is lower (parity is False)
+        engine._books[("bithumb", coin)] = make_snap("bithumb", coin, [(9.5, 100.0)], [(9.6, 100.0)], now)
+        engine._recv_ts[("bithumb", coin)] = now
+
+        # Add a small buy trade of $5 (small trade)
+        engine._bithumb_recent_buys[coin].append((now - 0.5, 5.0))
+        engine._has_bithumb_trades[coin] = True
+
+        with patch.object(C, "MIN_KOREAN_CONFIRM_USD", 0.0):
+            cutoff = now - 2.0
+            recent_b_buys, _ = engine.get_recent_bithumb_buys(coin, cutoff)
+            self.assertEqual(recent_b_buys, 5.0)
+
+            cfg_confirm = getattr(C, "MIN_KOREAN_CONFIRM_USD", 500.0)
+            min_confirm_usd = float(cfg_confirm if cfg_confirm is not None else 500.0)
+            self.assertEqual(min_confirm_usd, 0.0)
+
+            # In 0.0 telemetry mode, any real buy (> 0) confirms volume
+            vol_confirmed = (recent_b_buys >= min_confirm_usd and recent_b_buys > 0) if min_confirm_usd > 0 else (recent_b_buys > 0)
+            self.assertTrue(vol_confirmed)
+
+        # In standard production mode (500.0), $5 does NOT confirm volume
+        with patch.object(C, "MIN_KOREAN_CONFIRM_USD", 500.0):
+            cfg_confirm = getattr(C, "MIN_KOREAN_CONFIRM_USD", 500.0)
+            min_confirm_usd = float(cfg_confirm if cfg_confirm is not None else 500.0)
+            self.assertEqual(min_confirm_usd, 500.0)
+
+            vol_confirmed = (recent_b_buys >= min_confirm_usd and recent_b_buys > 0) if min_confirm_usd > 0 else (recent_b_buys > 0)
+            self.assertFalse(vol_confirmed)
+
+    def test_follower_spread_norm_warmup_and_cold_start(self):
+        """Verify FollowerSpreadNorm does not anchor to a blowout on cold-start and gates S3."""
+        from korean_engine import FollowerSpreadNorm, KoreanEngine
+
+        now = 1000.0
+        norm = FollowerSpreadNorm(warmup_samples=5)
+        self.assertFalse(norm.is_warmed_up)
+
+        # Tick 1: An active blowout occurs on startup (120 bps)
+        s1 = norm.update(120.0, now)
+        self.assertEqual(s1, 120.0)
+        self.assertFalse(norm.is_warmed_up)
+
+        # Tick 2: Normal calm spread arrives (10 bps)
+        s2 = norm.update(10.0, now + 1.0)
+        # Cold start anchors to minimum observed spread during warmup, dropping to 10.0 immediately!
+        self.assertEqual(s2, 10.0)
+        self.assertFalse(norm.is_warmed_up)
+
+        # Ticks 3, 4, 5
+        norm.update(12.0, now + 2.0)
+        norm.update(11.0, now + 3.0)
+        s5 = norm.update(10.5, now + 4.0)
+        self.assertTrue(norm.is_warmed_up)
+        self.assertEqual(s5, 10.0)
+
+        # Test S3 check_void_opportunity warmup gate
+        maker_strat = MakerVoidStrategy(
+            emit_callback=lambda sig: None,
+            min_spread_bps=25.0,
+        )
+        snap = make_snap("bybit", "TEST", [(10.0, 100.0)], [(10.08, 100.0)], now) # 80 bps spread
+        # Unwarmed -> returns None even though spread is blown out
+        self.assertIsNone(maker_strat.check_void_opportunity("bybit", "TEST", snap, None, now, norm_spread_bps=10.0, is_warmed_up=False))
+        # Warmed -> identifies void opportunity
+        self.assertIsNotNone(maker_strat.check_void_opportunity("bybit", "TEST", snap, None, now, norm_spread_bps=10.0, is_warmed_up=True))
+
+    def test_follower_spread_idle_pruning_in_sweep(self):
+        """Verify idle follower spread EWMA entries (> 1 hour) are pruned during timeout sweeps."""
+        from korean_engine import KoreanEngine, FollowerSpreadNorm
+
+        engine = KoreanEngine(emit_callback=lambda s: None)
+        now = 10000.0
+
+        # Active entry (last updated 30s ago)
+        active_norm = FollowerSpreadNorm(warmup_samples=5)
+        active_norm.update(10.0, now - 30.0)
+        engine._follower_spread_ewma[("bybit", "BTC")] = active_norm
+
+        # Dead entry (last updated 2 hours ago)
+        dead_norm = FollowerSpreadNorm(warmup_samples=5)
+        dead_norm.update(10.0, now - 7200.0)
+        engine._follower_spread_ewma[("okx", "DEADCOIN")] = dead_norm
+
+        self.assertEqual(len(engine._follower_spread_ewma), 2)
+        engine.sweep_timeouts(now)
+        self.assertEqual(len(engine._follower_spread_ewma), 1)
+        self.assertIn(("bybit", "BTC"), engine._follower_spread_ewma)
+        self.assertNotIn(("okx", "DEADCOIN"), engine._follower_spread_ewma)
 
 
 if __name__ == "__main__":

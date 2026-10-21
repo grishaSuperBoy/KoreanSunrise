@@ -69,11 +69,15 @@ class KoreanSunriseService:
         self.stream_manager: Optional[StreamManager] = None
         self.api_server: Optional[APIServer] = None
         if getattr(C, "API_SERVER_ENABLED", True):
+            token = getattr(C, "API_AUTH_TOKEN", None)
+            if not token:
+                log.error("[FATAL] API_SERVER_ENABLED=True but API_AUTH_TOKEN environment variable is not configured!")
+                raise RuntimeError("API_AUTH_TOKEN must be explicitly set when API_SERVER_ENABLED is True.")
             self.api_server = APIServer(
                 service=self,
                 host=getattr(C, "API_SERVER_HOST", "0.0.0.0"),
                 port=getattr(C, "API_SERVER_PORT", 8089),
-                token=getattr(C, "API_AUTH_TOKEN", "vitali_secret_key_2026"),
+                token=token,
             )
         self.running = False
         self._shutdown_event = asyncio.Event()

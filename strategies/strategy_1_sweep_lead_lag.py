@@ -5,7 +5,7 @@ Microstructure Physics:
 South Korea's crypto market (Upbit) is isolated by strict capital controls and features high retail volume.
 When an aggressive taker buy sweeps the ask side on Upbit spot, international perpetual futures
 (Binance, Bybit, Pionex, Hyperliquid, BingX, KuCoin, OKX) lag by 50ms - 2.5s.
-This strategy executes taker LONG on follower perps in the direction of the sweep before the global spread closes.
+This paper-trading signal generator simulates hypothetical taker LONG entries on follower perps to evaluate theoretical execution edge before global spreads close.
 """
 from __future__ import annotations
 

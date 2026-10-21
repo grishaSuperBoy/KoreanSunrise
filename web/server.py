@@ -39,12 +39,12 @@ class APIServer:
         service: Any,
         host: str = "0.0.0.0",
         port: int = 8089,
-        token: str = "vitali_secret_key_2026",
+        token: Optional[str] = None,
     ):
         self.service = service
         self.host = host
         self.port = port
-        self.token = token
+        self.token = token if token is not None else os.getenv("API_AUTH_TOKEN", "")
         self._csrf_secret: str = secrets.token_hex(16)
         self._server: Optional[http.server.ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None

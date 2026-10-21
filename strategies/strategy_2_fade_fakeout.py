@@ -1,10 +1,12 @@
 """
-strategies/strategy_2_fade_fakeout.py - Strategy 2: Fade the Fakeout (Anti-Sweep / Inverse Alpha Strategy).
+strategies/strategy_2_fade_fakeout.py - Strategy 2: Fade the Fakeout / Pre-Sweep Sniper.
 
-Microstructure Physics:
-On illiquid alts and meme tokens, 89.7% of Upbit micro-sweeps (< $3,500 swept or MM quote pulls/cancels)
-fail to sustain momentum. The Upbit mid price mean-reverts back down by -30 to -45 bps within 0.1 to 5.0 seconds.
-This strategy enters SHORT on follower perpetual contracts to capture the predictable mean-reversion collapse.
+Microstructure Simulation:
+On illiquid alts and meme tokens, micro-sweeps (< $3,500 swept or MM quote pulls/cancels)
+frequently fail to sustain follow-through momentum.
+This paper-trading telemetry module simulates hypothetical position tracking against local
+order book depth to measure transient dislocation and mean-reversion characteristics.
+(No live orders are placed; simulated fills are evaluated via top-of-book VWAP).
 """
 from __future__ import annotations
 
@@ -16,6 +18,13 @@ import threading
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 log = logging.getLogger("strategy.fade")
+
+# Heavy institutional majors where MMs cancel quotes rapidly at high frequency
+# (Filtered out in inverted pre-sweep long mode to prevent quote-jitter spam)
+JITTER_MAJORS: Set[str] = {
+    "BTC", "ETH", "SOL", "DOT", "FIL", "TAO", "LIT", "RENDER",
+    "AAVE", "UNI", "INJ", "PENDLE", "JTO", "ENS", "GMT", "AXL", "DATA", "ICP", "ZRO"
+}
 
 
 @dataclass
@@ -34,8 +43,9 @@ class ActiveFadePosition:
     # Pricing
     entry_upbit_mid: float
     entry_follower_mid: float
-    entry_px: float                   # Executable Short entry price (best_bid or VWAP bid)
+    entry_px: float                   # Executable entry price (VWAP ask for long, VWAP bid for short)
     suggested_size_usd: float
+    side: str = "short"               # "short" (classic fade) or "long" (inverted pre-sweep sniper)
 
     # Parameters
     max_hold_sec: float = 7.5
@@ -58,7 +68,7 @@ class ActiveFadePosition:
 
 class FadeFakeoutStrategy:
     """
-    Executes and tracks short positions fading unconfirmed or fake Upbit sweeps.
+    Simulates and tracks hypothetical positions fading unconfirmed sweeps or sniping early momentum.
     """
 
     def __init__(
@@ -72,12 +82,13 @@ class FadeFakeoutStrategy:
         max_follower_book_age_sec: float = 1.5,
         stop_invalidation_bps: float = 30.0,
         target_fade_bps: float = 15.0,
-        min_conviction_usd: Optional[float] = None,
-        max_upbit_spread_bps: Optional[float] = None,
         min_upbit_spread_bps: float = 35.0,
         max_fade_swept_usd: float = 2000.0,
         max_follower_depth_usd: float = 3500.0,
         cooldown_sec: float = 30.0,
+        invert_to_long: bool = False,
+        max_active_positions: int = 10,
+        max_total_exposure_usd: float = 5000.0,
         counters: Optional[Dict[str, int]] = None,
     ):
         self.emit = emit_callback
@@ -89,16 +100,13 @@ class FadeFakeoutStrategy:
         self.max_follower_book_age_sec = max_follower_book_age_sec
         self.stop_invalidation_bps = stop_invalidation_bps
         self.target_fade_bps = target_fade_bps
-        self.min_conviction_usd = min_conviction_usd
+        self.min_upbit_spread_bps = min_upbit_spread_bps
         self.max_fade_swept_usd = max_fade_swept_usd
         self.max_follower_depth_usd = max_follower_depth_usd
         self.cooldown_sec = cooldown_sec
-
-        if max_upbit_spread_bps is not None:
-            self.min_upbit_spread_bps = max_upbit_spread_bps
-        else:
-            self.min_upbit_spread_bps = min_upbit_spread_bps
-        self.max_upbit_spread_bps = self.min_upbit_spread_bps
+        self.invert_to_long = invert_to_long
+        self.max_active_positions = max_active_positions
+        self.max_total_exposure_usd = max_total_exposure_usd
 
         self._active: Dict[str, List[ActiveFadePosition]] = {}
         self._last_fade_ts: Dict[Tuple[str, str], float] = {}
@@ -166,6 +174,18 @@ class FadeFakeoutStrategy:
         Guards against stale quotes and dislocated baselines.
         """
         with self._lock:
+            # Jitter Guard: in inverted long mode, reject high-frequency majors that generate noise
+            if self.invert_to_long and coin.upper() in JITTER_MAJORS:
+                return []
+
+            # 0. Portfolio Exposure Guard: cap total active positions and exposure
+            current_active = sum(len([p for p in plist if not p.closed]) for plist in self._active.values())
+            if current_active >= self.max_active_positions:
+                return []
+            current_exposure = sum(sum(p.suggested_size_usd for p in plist if not p.closed) for plist in self._active.values())
+            if current_exposure >= self.max_total_exposure_usd:
+                return []
+
             opened: List[ActiveFadePosition] = []
             upbit_mid = float(getattr(upbit_snap, "mid_price", 0.0) or 0.0)
             upbit_spread = float(getattr(upbit_snap, "spread_bps", 0.0) or 0.0)
@@ -173,6 +193,9 @@ class FadeFakeoutStrategy:
             for follower_ex, f_snap in follower_snaps.items():
                 if follower_ex == "upbit" or f_snap is None:
                     continue
+
+                if current_active + len(opened) >= self.max_active_positions:
+                    break
 
                 # 1. Cooldown Guard: at least cooldown_sec between fades on same (coin, follower_ex)
                 pair_key = (coin, follower_ex)
@@ -207,18 +230,35 @@ class FadeFakeoutStrategy:
                     continue
 
                 # 4. Thin Depth Guard: Follower book must be illiquid (top3 depth <= max_follower_depth_usd)
-                top3_bid_usd = float(f_snap.top_n_bid_depth_usd(3) if hasattr(f_snap, "top_n_bid_depth_usd") else 0.0)
-                if top3_bid_usd > self.max_follower_depth_usd:
-                    continue
+                if self.invert_to_long:
+                    top3_ask_usd = float(f_snap.top_n_ask_depth_usd(3) if hasattr(f_snap, "top_n_ask_depth_usd") else 0.0)
+                    if top3_ask_usd > self.max_follower_depth_usd:
+                        continue
+                    stealth_size = min(self.max_position_budget_usd, round(top3_ask_usd * self.stealth_depth_fraction, 2))
+                    if stealth_size < self.min_order_usd:
+                        continue
+                    # Inverted: Long entry at executable ask
+                    entry_px = f_snap.vwap_ask_usd(stealth_size) if hasattr(f_snap, "vwap_ask_usd") else f_ask
+                    if entry_px <= 0:
+                        entry_px = f_ask
+                    side = "long"
+                else:
+                    top3_bid_usd = float(f_snap.top_n_bid_depth_usd(3) if hasattr(f_snap, "top_n_bid_depth_usd") else 0.0)
+                    if top3_bid_usd > self.max_follower_depth_usd:
+                        continue
+                    stealth_size = min(self.max_position_budget_usd, round(top3_bid_usd * self.stealth_depth_fraction, 2))
+                    if stealth_size < self.min_order_usd:
+                        continue
+                    # Classic: Short entry at executable bid
+                    entry_px = f_snap.vwap_bid_usd(stealth_size) if hasattr(f_snap, "vwap_bid_usd") else f_bid
+                    if entry_px <= 0:
+                        entry_px = f_bid
+                    side = "short"
 
-                stealth_size = min(self.max_position_budget_usd, round(top3_bid_usd * self.stealth_depth_fraction, 2))
-                if stealth_size < self.min_order_usd:
+                # Check portfolio total exposure budget
+                if current_exposure + stealth_size > self.max_total_exposure_usd:
                     continue
-
-                # Short entry at executable bid
-                entry_px = f_snap.vwap_bid_usd(stealth_size) if hasattr(f_snap, "vwap_bid_usd") else f_bid
-                if entry_px <= 0:
-                    entry_px = f_bid
+                current_exposure += stealth_size
 
                 seq_num = next(self._seq)
                 pos = ActiveFadePosition(
@@ -236,6 +276,7 @@ class FadeFakeoutStrategy:
                     entry_follower_mid=round(f_mid, 8),
                     entry_px=round(entry_px, 8),
                     suggested_size_usd=round(stealth_size, 2),
+                    side=side,
                     max_hold_sec=self.max_hold_sec,
                     stop_invalidation_bps=self.stop_invalidation_bps,
                     target_fade_bps=self.target_fade_bps,
@@ -283,48 +324,84 @@ class FadeFakeoutStrategy:
                     continue
 
                 dt = max(0.0, now - pos.open_ts)
-                # Short PnL: entry - current ask (cost to buy back)
-                gross_pnl_bps = (pos.entry_px - cur_ask) / pos.entry_px * 1e4
-                net_pnl_bps = gross_pnl_bps - pos.roundtrip_fee_bps
-
-                # Excursion tracking
-                if net_pnl_bps > pos.mfe_exec_pnl_bps:
-                    pos.mfe_exec_pnl_bps = net_pnl_bps
-                if net_pnl_bps < pos.mae_exec_pnl_bps:
-                    pos.mae_exec_pnl_bps = net_pnl_bps
-
-                # Trajectory
                 lead_move = ((cur_upbit_mid - pos.entry_upbit_mid) / pos.entry_upbit_mid * 1e4) if cur_upbit_mid else 0.0
                 foll_move = (cur_mid - pos.entry_follower_mid) / pos.entry_follower_mid * 1e4
-                if len(pos.path) < 50:
-                    pos.path.append([round(dt, 3), round(lead_move, 2), round(foll_move, 2), round(net_pnl_bps, 2)])
 
-                # Exit Evaluation
                 close_reason: Optional[str] = None
 
-                # 1. Take-Profit Convergence: Leader reverted down by >= 15 bps or Short captured >= target_fade_bps
-                if net_pnl_bps >= pos.target_fade_bps or (lead_move <= -15.0 and net_pnl_bps > 0.0):
-                    close_reason = "converged"
-                    self.counters["fade_signals_converged"] += 1
-                # 2. Invalidation Stop: follower price moved up against our short by >= stop_invalidation_bps or severe drawdown
-                elif foll_move >= pos.stop_invalidation_bps or net_pnl_bps <= -max(pos.stop_invalidation_bps + pos.roundtrip_fee_bps + 15.0, 45.0):
-                    close_reason = "stop_invalidation"
-                    self.counters["fade_signals_stopped"] += 1
-                # 3. Timeout / Decay
-                elif dt >= pos.max_hold_sec:
-                    close_reason = "timeout"
-                    self.counters["fade_signals_timeout"] += 1
+                if getattr(pos, "side", "short") == "long":
+                    # Inverted Long PnL: exit at current bid
+                    gross_pnl_bps = (cur_bid - pos.entry_px) / pos.entry_px * 1e4
+                    net_pnl_bps = gross_pnl_bps - pos.roundtrip_fee_bps
 
-                if close_reason:
-                    pos.closed = True
-                    pos.close_ts = round(now, 3)
-                    pos.duration_sec = round(dt, 3)
-                    pos.close_reason = close_reason
-                    pos.exit_px = round(cur_ask, 8)
-                    pos.net_pnl_bps = round(net_pnl_bps, 2)
-                    self._emit_position(pos)
+                    # Excursion tracking
+                    if net_pnl_bps > pos.mfe_exec_pnl_bps:
+                        pos.mfe_exec_pnl_bps = net_pnl_bps
+                    if net_pnl_bps < pos.mae_exec_pnl_bps:
+                        pos.mae_exec_pnl_bps = net_pnl_bps
+
+                    if len(pos.path) < 50:
+                        pos.path.append([round(dt, 3), round(lead_move, 2), round(foll_move, 2), round(net_pnl_bps, 2)])
+
+                    # Exit Evaluation
+                    if net_pnl_bps >= pos.target_fade_bps or (lead_move >= 15.0 and net_pnl_bps > 0.0):
+                        close_reason = "converged"
+                        self.counters["fade_signals_converged"] += 1
+                    elif foll_move <= -pos.stop_invalidation_bps or net_pnl_bps <= -max(pos.stop_invalidation_bps + pos.roundtrip_fee_bps + 15.0, 45.0):
+                        close_reason = "stop_invalidation"
+                        self.counters["fade_signals_stopped"] += 1
+                    elif dt >= pos.max_hold_sec:
+                        close_reason = "timeout"
+                        self.counters["fade_signals_timeout"] += 1
+
+                    if close_reason:
+                        pos.closed = True
+                        pos.close_ts = round(now, 3)
+                        pos.duration_sec = round(dt, 3)
+                        pos.close_reason = close_reason
+                        pos.exit_px = round(cur_bid, 8)
+                        pos.net_pnl_bps = round(net_pnl_bps, 2)
+                        self._emit_position(pos)
+                    else:
+                        alive.append(pos)
                 else:
-                    alive.append(pos)
+                    # Classic Short PnL: entry - current ask (cost to buy back)
+                    gross_pnl_bps = (pos.entry_px - cur_ask) / pos.entry_px * 1e4
+                    net_pnl_bps = gross_pnl_bps - pos.roundtrip_fee_bps
+
+                    # Excursion tracking
+                    if net_pnl_bps > pos.mfe_exec_pnl_bps:
+                        pos.mfe_exec_pnl_bps = net_pnl_bps
+                    if net_pnl_bps < pos.mae_exec_pnl_bps:
+                        pos.mae_exec_pnl_bps = net_pnl_bps
+
+                    if len(pos.path) < 50:
+                        pos.path.append([round(dt, 3), round(lead_move, 2), round(foll_move, 2), round(net_pnl_bps, 2)])
+
+                    # Exit Evaluation
+                    # 1. Take-Profit Convergence: Leader reverted down by >= 15 bps or Short captured >= target_fade_bps
+                    if net_pnl_bps >= pos.target_fade_bps or (lead_move <= -15.0 and net_pnl_bps > 0.0):
+                        close_reason = "converged"
+                        self.counters["fade_signals_converged"] += 1
+                    # 2. Invalidation Stop: follower price moved up against our short by >= stop_invalidation_bps or severe drawdown
+                    elif foll_move >= pos.stop_invalidation_bps or net_pnl_bps <= -max(pos.stop_invalidation_bps + pos.roundtrip_fee_bps + 15.0, 45.0):
+                        close_reason = "stop_invalidation"
+                        self.counters["fade_signals_stopped"] += 1
+                    # 3. Timeout / Decay
+                    elif dt >= pos.max_hold_sec:
+                        close_reason = "timeout"
+                        self.counters["fade_signals_timeout"] += 1
+
+                    if close_reason:
+                        pos.closed = True
+                        pos.close_ts = round(now, 3)
+                        pos.duration_sec = round(dt, 3)
+                        pos.close_reason = close_reason
+                        pos.exit_px = round(cur_ask, 8)
+                        pos.net_pnl_bps = round(net_pnl_bps, 2)
+                        self._emit_position(pos)
+                    else:
+                        alive.append(pos)
 
             self._active[coin] = alive
 
@@ -370,7 +447,7 @@ class FadeFakeoutStrategy:
         rec = {
             "id": pos.id,
             "strategy": "fade_fakeout",
-            "side": "short",
+            "side": getattr(pos, "side", "short"),
             "coin": pos.coin,
             "leader_exchange": pos.leader_exchange,
             "follower_exchange": pos.follower_exchange,
@@ -393,6 +470,6 @@ class FadeFakeoutStrategy:
         }
         self.emit(rec)
         log.info(
-            f"[FADE-EXIT] 🏁 {pos.coin} Short closed on {pos.follower_exchange} | "
+            f"[FADE-EXIT] 🏁 {pos.coin} {getattr(pos, 'side', 'short').upper()} closed on {pos.follower_exchange} | "
             f"Net: {pos.net_pnl_bps:+.2f} bps | Reason: {pos.close_reason} | Dur: {pos.duration_sec:.2f}s"
         )

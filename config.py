@@ -21,7 +21,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 API_SERVER_ENABLED = os.getenv("API_SERVER_ENABLED", "true").lower() in ("true", "1", "yes")
 API_SERVER_HOST = os.getenv("API_SERVER_HOST", "0.0.0.0")
 API_SERVER_PORT = int(os.getenv("API_SERVER_PORT", "8089"))
-API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "vitali_secret_key_2026")
+API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN")
 
 # Exclude heavy majors & stablecoins so we focus purely on alts / shitcoins.
 # (Can be overridden via env EXCLUDE_COINS="BTC,ETH,USDT,USDC")
@@ -49,8 +49,10 @@ STEALTH_DEPTH_FRACTION = 0.15   # Max 15% of top 3 ask levels on follower order 
 TRADE_CONFIRM_LOOKBACK_SEC = 2.0 # Maximum 2.0s lookback for taker trade confirmation against MM quote cancellations
 
 # Execution Fees & Warmup Safety
+# NOTE: 5.0 bps single-leg / 10.0 bps roundtrip represents an idealized VIP0 taker tier.
+# On illiquid altcoins, effective taker fees and adverse crossing spreads may be wider.
 TAKER_FEE_BPS = 5.0             # Single-leg VIP0 taker fee (bps) on Binance/Bybit
-ROUNDTRIP_FEE_BPS = 10.0        # Entry + Exit taker fee (bps) for net realized PnL
+ROUNDTRIP_FEE_BPS = 10.0        # Theoretical entry + exit taker fee (bps) for net simulated PnL
 MIN_WARMUP_SAMPLES = 30         # Minimum 1s MAD samples before firing signals
 MAX_SIGNAL_HOLD_SEC = 30.0      # Maximum holding horizon before timeout closure (adaptive ceiling)
 MAX_FOLLOWER_BOOK_AGE_SEC = 1.50 # Maximum 1.5s staleness for follower book snapshots — generous enough for slow alts, still blocks stale 15s+ feeds
@@ -64,18 +66,31 @@ BITHUMB_ENABLED = os.getenv("BITHUMB_ENABLED", "true").lower() in ("true", "1", 
 BITHUMB_MIN_SWEPT_USD = float(os.getenv("BITHUMB_MIN_SWEPT_USD", "3000.0"))
 REQUIRE_KOREAN_CONFIRMATION = os.getenv("REQUIRE_KOREAN_CONFIRMATION", "false").lower() in ("true", "1", "yes")
 STRICT_KOREAN_GATE = os.getenv("STRICT_KOREAN_GATE", "false").lower() in ("true", "1", "yes")
-MIN_KOREAN_CONFIRM_USD = float(os.getenv("MIN_KOREAN_CONFIRM_USD", "0.0")) # Min taker volume ($) on peer Korean exchange for confirmation (0.0 for incubator, 500.0+ for battle)
+MIN_KOREAN_CONFIRM_USD = float(os.getenv("MIN_KOREAN_CONFIRM_USD", "500.0")) # Min taker volume ($) on peer Korean exchange for volume confirmation ($500+ in production; set 0.0 for open telemetry-only research)
+
+# Per-Strategy Risk & Exposure Limits:
+# Applied to each sub-strategy (S2 Fade/Sniper and S3 Maker/Taker Voids) individually
+# to prevent cross-strategy execution starvation. (Total portfolio max = 2x these limits).
+MAX_STRATEGY_CONCURRENT_POSITIONS = int(os.getenv("MAX_STRATEGY_CONCURRENT_POSITIONS", os.getenv("MAX_PORTFOLIO_CONCURRENT_POSITIONS", "10")))
+MAX_STRATEGY_EXPOSURE_USD = float(os.getenv("MAX_STRATEGY_EXPOSURE_USD", os.getenv("MAX_PORTFOLIO_EXPOSURE_USD", "5000.0")))
+# Backward-compatibility aliases
+MAX_PORTFOLIO_CONCURRENT_POSITIONS = MAX_STRATEGY_CONCURRENT_POSITIONS
+MAX_PORTFOLIO_EXPOSURE_USD = MAX_STRATEGY_EXPOSURE_USD
+MAKER_REBATE_BPS = float(os.getenv("MAKER_REBATE_BPS", "0.0")) # Realistic maker rebate on alts (0.0 bps default; 0% rebate on non-VIP alts)
+FOLLOWER_SPREAD_WARMUP_SAMPLES = int(os.getenv("FOLLOWER_SPREAD_WARMUP_SAMPLES", "5")) # Min order book ticks required before follower spread baseline is active
 
 ALPHA_DECAY_SEC = 15.0          # Model C: Alpha decay timeout if PnL <= 0 (fallback if not in matrix)
 
-# Strategy 2: Fade the Fakeout (Short on Micro-Sweeps & Gaps)
+# Strategy 2: Pre-Sweep Early Long / Inverted Fade (Long on MM Quote Pulls & Micro-Bursts)
 MAX_FADE_SWEPT_USD = float(os.getenv("MAX_FADE_SWEPT_USD", "2000.0"))        # Max Upbit sweep volume ($2,000) to consider a micro-sweep
 MIN_FADE_SPREAD_BPS = float(os.getenv("MIN_FADE_SPREAD_BPS", "35.0"))        # Min Upbit spread (35 bps) to confirm an illiquid gap
 MAX_FADE_FOLLOWER_DEPTH_USD = float(os.getenv("MAX_FADE_FOLLOWER_DEPTH_USD", "3500.0")) # Max follower depth ($3,500) to ensure thin book
 FADE_COOLDOWN_SEC = float(os.getenv("FADE_COOLDOWN_SEC", "30.0"))            # Anti-machinegun cooldown per pair (sec)
+S2_INVERT_TO_LONG = os.getenv("S2_INVERT_TO_LONG", "true").lower() in ("true", "1", "yes") # True: Invert S2 short to early long sniper on MM quote cancellations
 
-# Strategy 3: Maker Liquidity Harvesting
+# Strategy 3: Toxic Taker Void Hunter / Inverted Maker
 MAX_MAKER_SPREAD_BPS = float(os.getenv("MAX_MAKER_SPREAD_BPS", "120.0"))     # Max spread ceiling to reject toxic/dead DEX pools
+S3_HUNTER_MODE = os.getenv("S3_HUNTER_MODE", "true").lower() in ("true", "1", "yes") # True: Invert passive maker to predatory taker void hunter sweeping dislocated quotes
 
 # AsterDex DEX Adaptation & Safety
 MAX_ASTERDEX_SPREAD_BPS = float(os.getenv("MAX_ASTERDEX_SPREAD_BPS", "45.0")) # Hard spread ceiling on AsterDex (blocks 250-350 bps defensive walls)

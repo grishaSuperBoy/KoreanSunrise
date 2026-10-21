@@ -33,10 +33,79 @@ log = logging.getLogger("engine")
 
 DEV_SAMPLE_DT = 1.0     # Fixed 1s time grid for robust MAD window
 NORM_TAU = 600.0        # EWMA time constant for Upbit depth and spread normalization (sec)
+FOLLOWER_SPREAD_TAU = 120.0 # Responsive 2-minute EWMA time constant for follower spread baselines
 BASELINE_TAU = 600.0    # EWMA time constant for cross-venue basis baseline (sec, 10 minutes)
 DEPTH_FLOOR_USD = 5.0   # Numerical stability floor for depth normalization ($5 for low-cap alts)
 BEST_ASK_FLOOR_USD = 2.5 # Numerical stability floor for best ask ($2.50 for low-cap alts)
 KOREAN_LEADERS: Set[str] = {"upbit", "bithumb"}
+
+
+def _extract_spread_bps(norm_obj: Any, default: float = 20.0) -> float:
+    """Robust extractor for spread_bps supporting both UpbitNormState and dict structures."""
+    if norm_obj is None:
+        return default
+    if isinstance(norm_obj, dict):
+        return float(norm_obj.get("spread_bps", default))
+    val = getattr(norm_obj, "spread_bps", default)
+    return float(val if val is not None else default)
+
+
+class FollowerSpreadNorm:
+    """
+    EWMA baseline for a follower venue's own spread with cold-start warmup protection.
+
+    Cold-start robustness:
+    If the first tick arrives during an active spread blowout / void, anchoring immediately
+    to the first raw tick would calibrate the baseline to the anomaly.
+    Instead:
+    - We accumulate the first WARMUP_SAMPLES observations (default 5).
+    - During warmup, baseline is anchored to the minimum observed spread.
+    - `is_warmed_up` is exposed so S3 Maker/Taker can gate execution.
+    """
+    __slots__ = ("spread_bps", "last_ts", "n_obs", "_warmup_spreads", "warmup_samples")
+
+    def __init__(self, warmup_samples: int = 5):
+        self.spread_bps: float = 20.0
+        self.last_ts: float = 0.0
+        self.n_obs: int = 0
+        self._warmup_spreads: List[float] = []
+        self.warmup_samples: int = warmup_samples
+
+    @property
+    def is_warmed_up(self) -> bool:
+        return self.n_obs >= self.warmup_samples
+
+    def update(self, spread_bps: float, now: float, tau: float = FOLLOWER_SPREAD_TAU) -> float:
+        clamped_cur = max(spread_bps, 0.5)
+        self.n_obs += 1
+
+        if self.n_obs == 1:
+            self.spread_bps = clamped_cur
+            self.last_ts = now
+            self._warmup_spreads = [clamped_cur]
+            return self.spread_bps
+
+        dt = max(0.0, now - self.last_ts)
+        self.last_ts = now
+
+        if len(self._warmup_spreads) < self.warmup_samples:
+            self._warmup_spreads.append(clamped_cur)
+            # Anchor to minimum observed spread during warmup to prevent locking into a blowout
+            self.spread_bps = min(self._warmup_spreads)
+            return self.spread_bps
+
+        a = 1.0 - math.exp(-dt / tau)
+        clamped_update = min(clamped_cur, self.spread_bps * 5.0)
+        self.spread_bps = max((1.0 - a) * self.spread_bps + a * clamped_update, 0.5)
+        return self.spread_bps
+
+    def __getitem__(self, idx: int) -> float:
+        """Tuple backward-compatibility: (spread_bps, last_ts)."""
+        if idx == 0:
+            return self.spread_bps
+        elif idx == 1:
+            return self.last_ts
+        raise IndexError(f"FollowerSpreadNorm index out of range: {idx}")
 
 
 class KoreanEngine:
@@ -113,6 +182,10 @@ class KoreanEngine:
         self._upbit_norm: Dict[str, Dict[str, float]] = {}
         self._bithumb_norm: Dict[str, Dict[str, float]] = {}
 
+        # Follower exchange own spread baseline EWMA per (follower_ex, coin):
+        # (follower_ex, coin) -> FollowerSpreadNorm
+        self._follower_spread_ewma: Dict[Tuple[str, str], FollowerSpreadNorm] = {}
+
         # Pair states: (coin, follower_exchange) or (coin, follower_exchange, leader_exchange) -> PairState
         self._pairs: Dict[Tuple[Any, ...], PairState] = {}
 
@@ -147,6 +220,7 @@ class KoreanEngine:
             "maker_voids_restored": 0,
             "maker_voids_unfilled": 0,
             "maker_voids_stopped": 0,
+            "maker_voids_timeout": 0,
         }
 
         # Multi-Strategy Quantitative Suite:
@@ -167,7 +241,7 @@ class KoreanEngine:
             profile_manager=self.profile_manager,
         )
 
-        # Strategy 2: Fade the Fakeout (Shorting False/Unconfirmed Sweeps)
+        # Strategy 2: Pre-Sweep Early Long / Inverted Fade
         self.strat_fade = FadeFakeoutStrategy(
             emit_callback=self._on_strategy_emit,
             roundtrip_fee_bps=self.roundtrip_fee_bps,
@@ -178,18 +252,25 @@ class KoreanEngine:
             min_upbit_spread_bps=getattr(C, "MIN_FADE_SPREAD_BPS", 35.0),
             max_follower_depth_usd=getattr(C, "MAX_FADE_FOLLOWER_DEPTH_USD", 3500.0),
             cooldown_sec=getattr(C, "FADE_COOLDOWN_SEC", 30.0),
+            invert_to_long=getattr(C, "S2_INVERT_TO_LONG", True),
+            max_active_positions=getattr(C, "MAX_PORTFOLIO_CONCURRENT_POSITIONS", 10),
+            max_total_exposure_usd=getattr(C, "MAX_PORTFOLIO_EXPOSURE_USD", 5000.0),
             counters=self.counters,
         )
 
-        # Strategy 3: Maker Liquidity Harvesting (Passive Maker Post-Only on Widened Spreads)
+        # Strategy 3: Toxic Taker Void Hunter / Inverted Maker
         self.strat_maker = MakerVoidStrategy(
             emit_callback=self._on_strategy_emit,
             min_order_usd=self.min_order_usd,
             max_position_budget_usd=self.max_position_budget_usd,
             stealth_depth_fraction=self.stealth_fraction,
+            maker_rebate_bps=getattr(C, "MAKER_REBATE_BPS", 0.0),
             taker_fee_bps=self.taker_fee_bps,
             max_spread_bps=getattr(C, "MAX_MAKER_SPREAD_BPS", 120.0),
             allow_asterdex_maker=getattr(C, "ASTERDEX_MAKER_ENABLED", False),
+            hunter_mode=getattr(C, "S3_HUNTER_MODE", True),
+            max_active_voids=getattr(C, "MAX_PORTFOLIO_CONCURRENT_POSITIONS", 10),
+            max_total_exposure_usd=getattr(C, "MAX_PORTFOLIO_EXPOSURE_USD", 5000.0),
             counters=self.counters,
         )
 
@@ -319,15 +400,34 @@ class KoreanEngine:
 
             self._track_follower_move(coin, ex, snap, now)
 
-            # Multi-strategy follower updates:
-            # Strategy 2: Fade the Fakeout
-            cur_upbit_mid = upbit_snap.mid_price if upbit_snap else None
+            # Update follower's own baseline spread EWMA (venues have different baseline spreads)
+            # Protected by _engine_lock against concurrent feed updates (Item 6)
+            f_key = (ex, coin)
+            cur_f_spread = max(snap.spread_bps, 0.5)
+            with self._engine_lock:
+                f_norm = self._follower_spread_ewma.get(f_key)
+                if f_norm is None:
+                    warmup_n = int(getattr(C, "FOLLOWER_SPREAD_WARMUP_SAMPLES", 5))
+                    f_norm = FollowerSpreadNorm(warmup_samples=warmup_n)
+                    self._follower_spread_ewma[f_key] = f_norm
+                f_norm_spread = f_norm.update(cur_f_spread, now)
+                is_f_warmed = f_norm.is_warmed_up
+
+            # Multi-strategy follower updates (invoked outside _engine_lock per Lock Hierarchy Contract):
+            # Strategy 2: Fade the Fakeout (guarded with freshness <= 2.0s to avoid stale Upbit mid)
+            upbit_age = now - self._recv_ts.get(("upbit", coin), 0.0)
+            cur_upbit_mid = upbit_snap.mid_price if (upbit_snap and upbit_age <= 2.0) else None
             self.strat_fade.on_follower_tick(ex, coin, snap, now, cur_upbit_mid=cur_upbit_mid)
 
-            # Strategy 3: Maker Liquidity Harvesting
-            norm_spread = float(getattr(self._upbit_norm.get(coin), "spread_bps", 20.0) or 20.0)
-            self.strat_maker.on_follower_tick(ex, coin, snap, now, norm_spread_bps=norm_spread)
-            self.strat_maker.check_void_opportunity(ex, coin, snap, upbit_snap, now, norm_spread_bps=norm_spread)
+            # Strategy 3: Maker Liquidity Harvesting / Taker Hunter (using follower's own EWMA spread baseline and freshness check)
+            f_recv = self._recv_ts.get((ex, coin), now)
+            self.strat_maker.on_follower_tick(ex, coin, snap, now, norm_spread_bps=f_norm_spread, recv_ts=f_recv)
+            self.strat_maker.check_void_opportunity(
+                ex, coin, snap, upbit_snap, now,
+                norm_spread_bps=f_norm_spread,
+                recv_ts=f_recv,
+                is_warmed_up=is_f_warmed,
+            )
 
     def on_upbit_trade(self, coin: str, trade_usd: float, is_taker_buy: bool, ts: float) -> None:
         """
@@ -426,10 +526,17 @@ class KoreanEngine:
         nrm.spread_bps = max((1.0 - a) * nrm.spread_bps + a * clamped_spread, 0.5)
 
     def _update_upbit_norm(self, coin: str, snap: OrderBookDepth5, now: float) -> None:
+        """Public / test fixture API: update Upbit normalized baseline (used in test suites)."""
         self._update_norm(coin, snap, now, venue="upbit")
 
     def _update_bithumb_norm(self, coin: str, snap: OrderBookDepth5, now: float) -> None:
+        """Public / test fixture API: update Bithumb normalized baseline (used in test suites)."""
         self._update_norm(coin, snap, now, venue="bithumb")
+
+    def get_norm_spread_bps(self, coin: str, venue: str = "upbit", default: float = 20.0) -> float:
+        """Public inspection API: retrieves normalized spread in bps for a leader venue safely across object/dict states."""
+        norm_map = self._bithumb_norm if venue.lower() == "bithumb" else self._upbit_norm
+        return _extract_spread_bps(norm_map.get(coin), default=default)
     # ----------------------------------------------------------- Signal Logic
     def _eval_lead_lag(
         self,
@@ -459,9 +566,14 @@ class KoreanEngine:
         ):
             return
 
-        norm_depth = nrm["depth_ask"] if isinstance(nrm, dict) else nrm.depth_ask
-        norm_best_ask_usd = nrm["best_ask_usd"] if isinstance(nrm, dict) else nrm.best_ask_usd
-        norm_spread = nrm["spread_bps"] if isinstance(nrm, dict) else nrm.spread_bps
+        # Test fixture compatibility: unit tests (e.g. test_korean_engine_strategy) inject raw dict mocks into _upbit_norm
+        if isinstance(nrm, dict):
+            norm_depth = float(nrm.get("depth_ask", DEPTH_FLOOR_USD))
+            norm_best_ask_usd = float(nrm.get("best_ask_usd", BEST_ASK_FLOOR_USD))
+        else:
+            norm_depth = nrm.depth_ask
+            norm_best_ask_usd = nrm.best_ask_usd
+        norm_spread = _extract_spread_bps(nrm, default=20.0)
 
         cur_depth = leader_snap.depth_ask_usd
         cur_spread = leader_snap.spread_bps
@@ -552,20 +664,46 @@ class KoreanEngine:
         fade_trig = trigger_type or saved_trigger_type
         fade_swept = swept_usd or saved_swept_usd
         if fade_trig is not None and leader_ex == "upbit":
-            # Check if Bithumb cross-confirms this move (dual-Korean pump check)
+            # Cross-Korean dual-pump check:
+            # S2 ASYMMETRY DESIGN CONTRACT (Strict Anti-Pump Shield):
+            # S2 detects fakeouts and quote cancellations to fade/sniper. To protect from
+            # fading/shorting into a genuine nationwide Korean rally, S2 requires strict
+            # dual confirmation (price parity AND volume burst). Only when BOTH price parity
+            # AND aggressive taker volume are present on Bithumb is it considered an undeniable
+            # dual-exchange pump, suppressing the fakeout fade.
             b_snap = self._books.get(("bithumb", coin))
-            bithumb_confirms = False
-            if b_snap and b_snap.mid_price > 0 and leader_snap.mid_price > 0:
-                bithumb_confirms = (b_snap.mid_price >= leader_snap.mid_price * 0.9995)
+            cutoff = now - 2.0
+            recent_b_buys, _ = self.get_recent_bithumb_buys(coin, cutoff)
+            cfg_confirm = getattr(C, "MIN_KOREAN_CONFIRM_USD", 500.0)
+            min_confirm_usd = float(cfg_confirm if cfg_confirm is not None else 500.0)
+            bithumb_price_parity = bool(b_snap and b_snap.mid_price > 0 and leader_snap.mid_price > 0 and b_snap.mid_price >= leader_snap.mid_price * 0.9995)
+            vol_confirmed = (recent_b_buys >= min_confirm_usd and recent_b_buys > 0) if min_confirm_usd > 0 else (recent_b_buys > 0)
+            korean_dual_pump = (bithumb_price_parity and vol_confirmed)
 
             is_fake, fade_reason = self.strat_fade.is_fakeout_pattern(
                 is_cancel_blocked=is_cancel_blocked,
                 swept_usd=fade_swept,
                 upbit_spread_bps=cur_spread,
-                korean_confirmed=bithumb_confirms,
+                korean_confirmed=korean_dual_pump,
             )
             if is_fake:
                 f_snaps = {f_ex: self._books.get((f_ex, coin)) for f_ex in follower_exchanges if self._books.get((f_ex, coin)) is not None}
+
+                # LOCK HIERARCHY CONTRACT:
+                # _is_pair_stable_for_fade is invoked as a predicate inside strat_fade while holding strat_fade._lock.
+                # _get_or_create_pair_state acquires self._engine_lock.
+                # Established lock acquisition order: strat_fade._lock -> self._engine_lock -> PairState._lock.
+                # RULE: Never call strat_fade or strat_maker methods from inside a 'with self._engine_lock:'
+                # block in KoreanEngine to prevent ABBA deadlocks.
+                def _is_pair_stable_for_fade(c: str, f_ex: str, t: float) -> bool:
+                    pair_st = self._get_or_create_pair_state(c, f_ex, leader_ex="upbit")
+                    f_book = self._books.get((f_ex, c))
+                    upbit_book = self._books.get(("upbit", c)) or leader_snap
+                    cur_diff: Optional[float] = None
+                    if f_book and upbit_book and f_book.mid_price > 0 and upbit_book.mid_price > 0:
+                        cur_diff = (upbit_book.mid_price - f_book.mid_price) / f_book.mid_price * 1e4
+                    return pair_st.is_stable(t, current_diff_bps=cur_diff)
+
                 self.strat_fade.on_fakeout_detected(
                     coin=coin,
                     trigger_type=fade_trig,
@@ -574,7 +712,7 @@ class KoreanEngine:
                     follower_snaps=f_snaps,
                     now=now,
                     fade_reason=fade_reason,
-                    is_stable_pair_fn=lambda c, f_ex, t: self._get_or_create_pair_state(c, f_ex, leader_ex="upbit").is_stable(t),
+                    is_stable_pair_fn=_is_pair_stable_for_fade,
                     recv_ts_map=self._recv_ts,
                 )
 
@@ -680,15 +818,25 @@ class KoreanEngine:
         if has_other_korean:
             sig.korean_co_listed = True
             cutoff = now - 2.0
-            min_confirm_usd = float(getattr(C, "MIN_KOREAN_CONFIRM_USD", 0.0))
+            cfg_confirm = getattr(C, "MIN_KOREAN_CONFIRM_USD", 500.0)
+            min_confirm_usd = float(cfg_confirm if cfg_confirm is not None else 500.0)
+            # S1 ASYMMETRY DESIGN CONTRACT (Early Breakout Leader-Follower Sniper):
+            # S1 snipes global perps when Korean leaders break out.
+            # Confirmation is intentionally permissive (OR): either price parity exists
+            # OR taker buying is already active on the peer Korean venue, validating leadership.
             if leader_ex == "upbit":
                 recent_other_buys, _ = self.get_recent_bithumb_buys(coin, cutoff)
                 sig.korean_spread_bps = round((other_snap.mid_price - leader_snap_to_use.mid_price) / leader_snap_to_use.mid_price * 1e4, 1)
-                sig.korean_confirmed = (other_snap.mid_price >= leader_snap_to_use.mid_price * 0.9995) or (recent_other_buys > min_confirm_usd)
+                parity = (other_snap.mid_price >= leader_snap_to_use.mid_price * 0.9995)
+                # Volume confirmation requires non-dust flow (>= min_confirm_usd in prod, > 0 in telemetry mode)
+                vol_confirmed = (recent_other_buys >= min_confirm_usd and recent_other_buys > 0) if min_confirm_usd > 0 else (recent_other_buys > 0)
+                sig.korean_confirmed = parity or vol_confirmed
             else:
                 recent_other_buys, _ = self.get_recent_upbit_buys(coin, cutoff)
                 sig.korean_spread_bps = round((leader_snap_to_use.mid_price - other_snap.mid_price) / other_snap.mid_price * 1e4, 1)
-                sig.korean_confirmed = (leader_snap_to_use.mid_price >= other_snap.mid_price * 0.9995) or (recent_other_buys > min_confirm_usd)
+                parity = (leader_snap_to_use.mid_price >= other_snap.mid_price * 0.9995)
+                vol_confirmed = (recent_other_buys >= min_confirm_usd and recent_other_buys > 0) if min_confirm_usd > 0 else (recent_other_buys > 0)
+                sig.korean_confirmed = parity or vol_confirmed
 
             # Cross-Korean Confirmation Gate:
             # In live Battle mode (real money execution), block unconfirmed pumps if require_korean_confirmation is on.
@@ -808,7 +956,7 @@ class KoreanEngine:
             )
             rem_edge = (cur_diff_bps - sig.kimchi_baseline_bps) - self.taker_fee_bps
 
-            if not sig.path or dt > sig.path[-1][0]:
+            if (not sig.path or dt > sig.path[-1][0]) and len(sig.path) < 50:
                 sig.path.append([
                     dt,
                     round(lead_mid_move, 2),
@@ -940,3 +1088,9 @@ class KoreanEngine:
 
         # Strategy 3: Maker Liquidity Harvesting (sweep expired resting orders & filled voids)
         self.strat_maker.sweep_timeouts(now)
+
+        # Pruning of idle follower spread EWMA baselines (Item 2: idle > 1 hour)
+        with self._engine_lock:
+            dead_ewma = [k for k, v in self._follower_spread_ewma.items() if (now - v.last_ts) > 3600.0]
+            for k in dead_ewma:
+                del self._follower_spread_ewma[k]

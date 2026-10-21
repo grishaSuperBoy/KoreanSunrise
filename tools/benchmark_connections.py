@@ -727,7 +727,7 @@ async def run_benchmark_suite(
 
 def fetch_remote_benchmark(
     remote_url: str,
-    token: str = "vitali_secret_key_2026",
+    token: Optional[str] = None,
     fresh: bool = False,
     sync: bool = False,
     venues: Optional[List[str]] = None,
@@ -736,6 +736,8 @@ def fetch_remote_benchmark(
     use_color: bool = True,
     output_json_path: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    if token is None:
+        token = os.getenv("API_AUTH_TOKEN", "")
     params = []
     if fresh:
         params.append("fresh=1")
@@ -820,7 +822,7 @@ def main():
     parser.add_argument("--json", type=str, default="logs/benchmark_connections.json", help="Path to JSON output")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI color codes")
     parser.add_argument("--remote", type=str, default="", help="Query a remote running collector Web API (e.g. http://localhost:8089)")
-    parser.add_argument("--token", type=str, default=os.getenv("API_AUTH_TOKEN", "vitali_secret_key_2026"), help="API Auth Token for --remote")
+    parser.add_argument("--token", type=str, default=os.getenv("API_AUTH_TOKEN", ""), help="API Auth Token for --remote")
     parser.add_argument("--fresh", action="store_true", help="When using --remote, trigger fresh live benchmark run")
     parser.add_argument("--sync", action="store_true", help="When using --remote and --fresh, wait synchronously for benchmark completion")
 

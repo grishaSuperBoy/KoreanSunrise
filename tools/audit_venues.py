@@ -41,7 +41,7 @@ ALL_VENUES = [
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(HERE)
 DATA_ROOT = os.path.join(PROJECT_ROOT, "data")
-TOKEN = os.getenv("API_AUTH_TOKEN", "vitali_secret_key_2026")
+TOKEN = os.getenv("API_AUTH_TOKEN", "")
 
 
 def fetch_live_stats(port: int = 8089) -> Optional[Dict[str, Any]]:
