@@ -182,7 +182,9 @@ def run_formula(args):
             sp = float(s.get("follower_spread_bps", 0))
             rs = s.get("close_reason", "")
             dur = float(s.get("duration_sec", 0))
-            print(f"  {i:>2}. {c:<6} -> {ex:<10} | Ratio: {rat:>5.1f}x (Swept: ${sw:>7.0f} / Top3: ${top3:>5.0f}) | Net: {net:>+6.1f} bps | Спред: {sp:>4.1f}b | Причина: {rs:<17} | {dur:>5.2f}s")
+            reg = s.get("market_regime")
+            reg_str = f" | {reg}" if reg else ""
+            print(f"  {i:>2}. {c:<6} -> {ex:<10} | Ratio: {rat:>5.1f}x (Swept: ${sw:>7.0f} / Top3: ${top3:>5.0f}) | Net: {net:>+6.1f} bps | Спред: {sp:>4.1f}b | Причина: {rs:<17} | {dur:>5.2f}s{reg_str}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate Korean Whale Alpha Formula with Adaptive Tsunami Ratio")

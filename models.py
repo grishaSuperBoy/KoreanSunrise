@@ -288,6 +288,11 @@ class SunriseSignal:
     mfe_mid_move_bps: float = 0.0
     time_to_peak_sec: float = 0.0
 
+    # Market Regime telemetry
+    market_regime: str = "NEUTRAL"
+    market_breadth_pct: float = 50.0
+    btc_ret_300s_bps: float = 0.0
+
     path: List[List[float]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:

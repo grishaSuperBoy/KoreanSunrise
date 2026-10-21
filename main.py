@@ -99,6 +99,14 @@ class KoreanSunriseService:
                     for raw_sym, tup in v.items()
                 }
 
+        # Macro Benchmark Subscriptions: ensure BTC is streamed for real-time regime detection
+        if "KRW-BTC" not in upbit_krw_to_coin:
+            upbit_krw_to_coin["KRW-BTC"] = "BTC"
+        if "binance" in venue_sym_maps and "BTCUSDT" not in venue_sym_maps["binance"]:
+            venue_sym_maps["binance"]["BTCUSDT"] = ("BTC", 1.0, 1.0)
+        if "bybit" in venue_sym_maps and "BTCUSDT" not in venue_sym_maps["bybit"]:
+            venue_sym_maps["bybit"]["BTCUSDT"] = ("BTC", 1.0, 1.0)
+
         binance_sym_map = {k: (v[0], v[1]) for k, v in venue_sym_maps.get("binance", {}).items()}
         bybit_sym_map = {k: (v[0], v[1]) for k, v in venue_sym_maps.get("bybit", {}).items()}
 
@@ -210,8 +218,18 @@ class KoreanSunriseService:
         conn_str = " | ".join(parts)
         snap = self.pool_state.get_pool_snapshot()
         summary = snap["summary"]
+        reg_snap = self.engine.regime_detector.get_regime(time.time())
+        reg_icon = {
+            "STRONG_PUMP": "🚀 PUMP",
+            "BULL_DRIFT": "🟢 BULL",
+            "NEUTRAL": "⚖️ NEUTRAL",
+            "BEAR_DRIFT": "🟡 BEAR",
+            "FLASH_DUMP": "🩸 DUMP",
+        }.get(reg_snap.regime.value, reg_snap.regime.value)
         log.info(
-            f"[HEARTBEAT] KRW/USDT: {krw_rate:.1f} | "
+            f"[HEARTBEAT] Market: {reg_icon} (Breadth: {reg_snap.breadth_pct_300s:.1f}%, BTC: {reg_snap.btc_ret_300s_bps:+.1f}b) | "
+            f"Blocked Dumps: {c.get('regime_dump_blocked', 0)} | "
+            f"KRW/USDT: {krw_rate:.1f} | "
             f"Pool: Inc {summary['incubator']} | Battle {summary['battle']} (Active: {summary['battle_active']}) | "
             f"Ticks: Up {c['ticks_upbit']} (Trades: {c.get('trades_upbit', 0)}) / Bit {c.get('ticks_bithumb', 0)} (Trades: {c.get('trades_bithumb', 0)}) / Foll {c['ticks_followers']} | "
             f"Cancels: {c.get('cancels_blocked', 0)} / KR-Unconf: {c.get('korean_unconfirmed_blocked', 0)} | "

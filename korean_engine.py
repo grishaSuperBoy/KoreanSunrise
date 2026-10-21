@@ -18,6 +18,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 
 import config as C
 from models import OrderBookDepth5, SunriseSignal
+from pipeline.market_regime import MarketRegime, MarketRegimeDetector, MarketRegimeSnapshot
 from strategies import (
     ActiveFadePosition,
     ActiveMakerVoid,
@@ -221,7 +222,12 @@ class KoreanEngine:
             "maker_voids_unfilled": 0,
             "maker_voids_stopped": 0,
             "maker_voids_timeout": 0,
+            "regime_dump_blocked": 0,
+            "regime_pump_blocked_shorts": 0,
         }
+
+        # Macro Market Regime & Altcoin Breadth Engine
+        self.regime_detector = MarketRegimeDetector()
 
         # Multi-Strategy Quantitative Suite:
         # Strategy 1: Korean Sunrise Momentum (Upbit Sweep Lead-Lag)
@@ -354,6 +360,12 @@ class KoreanEngine:
         now = time.time()
         ex = snap.exchange.lower()
         coin = snap.symbol.upper()
+
+        if coin == "BTC":
+            self.regime_detector.on_btc_tick(snap.mid_price, now)
+        else:
+            self.regime_detector.on_alt_tick(coin, snap.mid_price, now)
+
         key = (ex, coin)
 
         with self._engine_lock:
@@ -435,6 +447,7 @@ class KoreanEngine:
         Records taker buys to verify liquidity sweeps and reject MM quote cancellations.
         Thread-safe across concurrent WebSocket worker threads.
         """
+        self.regime_detector.on_korean_trade(trade_usd, is_taker_buy, ts)
         c = coin.upper()
         with self._buys_lock:
             self.counters["trades_upbit"] = self.counters.get("trades_upbit", 0) + 1
@@ -448,6 +461,7 @@ class KoreanEngine:
         Records taker buys to verify Bithumb liquidity sweeps and volume explosions.
         Thread-safe across concurrent WebSocket worker threads.
         """
+        self.regime_detector.on_korean_trade(trade_usd, is_taker_buy, ts)
         c = coin.upper()
         with self._buys_lock:
             self.counters["trades_bithumb"] = self.counters.get("trades_bithumb", 0) + 1
@@ -680,12 +694,20 @@ class KoreanEngine:
             vol_confirmed = (recent_b_buys >= min_confirm_usd and recent_b_buys > 0) if min_confirm_usd > 0 else (recent_b_buys > 0)
             korean_dual_pump = (bithumb_price_parity and vol_confirmed)
 
-            is_fake, fade_reason = self.strat_fade.is_fakeout_pattern(
-                is_cancel_blocked=is_cancel_blocked,
-                swept_usd=fade_swept,
-                upbit_spread_bps=cur_spread,
-                korean_confirmed=korean_dual_pump,
-            )
+            # Macro Regime Shield: Block shorting fakeouts into a strong market pump wave
+            allowed_short, short_reason = self.regime_detector.is_short_allowed(now)
+            if not allowed_short:
+                self.counters["regime_pump_blocked_shorts"] = self.counters.get("regime_pump_blocked_shorts", 0) + 1
+                log.debug(f"[REGIME-SHIELD] S2 Fade Short blocked on {coin}: {short_reason}")
+                is_fake = False
+                fade_reason = None
+            else:
+                is_fake, fade_reason = self.strat_fade.is_fakeout_pattern(
+                    is_cancel_blocked=is_cancel_blocked,
+                    swept_usd=fade_swept,
+                    upbit_spread_bps=cur_spread,
+                    korean_confirmed=korean_dual_pump,
+                )
             if is_fake:
                 f_snaps = {f_ex: self._books.get((f_ex, coin)) for f_ex in follower_exchanges if self._books.get((f_ex, coin)) is not None}
 
@@ -786,6 +808,14 @@ class KoreanEngine:
         leader_snap_to_use = leader_snap if leader_snap is not None else upbit_snap
         if leader_snap_to_use is None or f_snap is None:
             return
+
+        # Macro Market Regime & Flash Dump Circuit Breaker
+        long_allowed, long_reason = self.regime_detector.is_long_allowed(now)
+        if not long_allowed:
+            self.counters["regime_dump_blocked"] = self.counters.get("regime_dump_blocked", 0) + 1
+            log.info(f"[REGIME-VETO] S1 Long blocked on {coin} @ {follower_ex}: {long_reason}")
+            return
+
         pair_cfg = self.get_pair_threshold_config(coin, follower_ex, leader_ex=leader_ex)
         seq_num = next(self._seq)
         sig = self.strat_lead_lag.evaluate_entry(
@@ -810,6 +840,12 @@ class KoreanEngine:
         )
         if sig is None:
             return
+
+        # Attach real-time market regime snapshot telemetry
+        reg_snap = self.regime_detector.get_regime(now)
+        sig.market_regime = reg_snap.regime.value
+        sig.market_breadth_pct = round(reg_snap.breadth_pct_300s, 1)
+        sig.btc_ret_300s_bps = round(reg_snap.btc_ret_300s_bps, 1)
 
         # Check cross-Korean confirmation and spread
         other_ex = "bithumb" if leader_ex == "upbit" else "upbit"
