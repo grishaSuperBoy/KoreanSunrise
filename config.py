@@ -87,8 +87,21 @@ ALPHA_DECAY_SEC = 15.0          # Model C: Alpha decay timeout if PnL <= 0 (fall
 # Strategy 1: Korean Momentum (Upbit Sweep Lead-Lag) + Moonbag / Runner Dual-Phase Mode
 S1_RUNNER_ENABLED = os.getenv("S1_RUNNER_ENABLED", "false").lower() in ("true", "1", "yes") # OFF by default
 S1_RUNNER_PORTION = float(os.getenv("S1_RUNNER_PORTION", "0.30"))                           # 30% held as trailing runner
-S1_RUNNER_TRAILING_DIST_BPS = float(os.getenv("S1_RUNNER_TRAILING_DIST_BPS", "20.0"))       # 20 bps pullback from peak
 S1_RUNNER_MAX_HOLD_SEC = float(os.getenv("S1_RUNNER_MAX_HOLD_SEC", "120.0"))               # 120s max runner hold
+
+# Runner activation gate — do not enable runner on micro-edge (< 20 bps)
+S1_RUNNER_MIN_PHASE1_BPS = float(os.getenv("S1_RUNNER_MIN_PHASE1_BPS", "20.0"))
+
+# Adaptive trailing (Dynamic distance based on peak profit and volatility sigma)
+S1_RUNNER_TRAIL_FACTOR = float(os.getenv("S1_RUNNER_TRAIL_FACTOR", "0.35"))
+S1_RUNNER_TRAIL_FLOOR_BPS = float(os.getenv("S1_RUNNER_TRAIL_FLOOR_BPS", "8.0"))
+S1_RUNNER_TRAIL_CAP_BPS = float(os.getenv("S1_RUNNER_TRAIL_CAP_BPS", "25.0"))
+S1_RUNNER_TRAIL_SIGMA_FACTOR = float(os.getenv("S1_RUNNER_TRAIL_SIGMA_FACTOR", "1.0"))
+
+# Time-based protection (Dynamic breakeven escalation & stall decay)
+S1_RUNNER_BREAKEVEN_ESCALATE_SEC = float(os.getenv("S1_RUNNER_BREAKEVEN_ESCALATE_SEC", "15.0"))
+S1_RUNNER_BREAKEVEN_LOCK_FRACTION = float(os.getenv("S1_RUNNER_BREAKEVEN_LOCK_FRACTION", "0.5"))
+S1_RUNNER_NO_PEAK_DECAY_SEC = float(os.getenv("S1_RUNNER_NO_PEAK_DECAY_SEC", "20.0"))
 
 # Strategy 2: Anti-Sweep Reversal (Fade the Fakeout) / Pre-Sweep Early Long
 MAX_FADE_SWEPT_USD = float(os.getenv("MAX_FADE_SWEPT_USD", "2000.0"))        # Max Upbit sweep volume ($2,000) to consider a micro-sweep

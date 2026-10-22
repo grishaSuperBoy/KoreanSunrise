@@ -297,9 +297,21 @@ class SunriseSignal:
     # Dual-Phase Runner / Moonbag telemetry
     runner_enabled: bool = False
     runner_active: bool = False
+
+    # Phase 1 (locked portion)
     phase1_pnl_bps: float = 0.0
+    phase1_close_ts: Optional[float] = None
+    phase1_mfe_bps: float = -999.0
+    phase1_mae_bps: float = 999.0
+
+    # Phase 2 (runner portion)
     runner_pnl_bps: float = 0.0
     runner_peak_pnl_bps: float = 0.0
+    runner_peak_ts: Optional[float] = None
+    runner_mfe_bps: float = -999.0
+    runner_mae_bps: float = 999.0
+    runner_trail_dist_bps: float = 0.0        # snapshot at close
+    runner_breakeven_floor_bps: float = 0.0   # snapshot at close
 
     path: List[List[float]] = field(default_factory=list)
 

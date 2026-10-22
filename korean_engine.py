@@ -1434,19 +1434,51 @@ class KoreanEngine:
 
             # Dual-Phase Moonbag / Runner Evaluation (Strategy 1)
             if getattr(sig, "runner_active", False):
-                sig.runner_peak_pnl_bps = max(sig.runner_peak_pnl_bps, cur_net_pnl)
+                # --- Peak & excursion tracking ---
+                if cur_net_pnl > sig.runner_peak_pnl_bps:
+                    sig.runner_peak_pnl_bps = cur_net_pnl
+                    sig.runner_peak_ts = now
+                if cur_net_pnl > sig.runner_mfe_bps:
+                    sig.runner_mfe_bps = cur_net_pnl
+                if cur_net_pnl < sig.runner_mae_bps:
+                    sig.runner_mae_bps = cur_net_pnl
+
+                runner_dt = now - (sig.phase1_close_ts or sig.open_ts)
+                since_peak = now - (sig.runner_peak_ts or sig.open_ts)
+
+                # --- Adaptive trailing distance ---
+                trail_factor = getattr(C, "S1_RUNNER_TRAIL_FACTOR", 0.35)
+                trail_floor = getattr(C, "S1_RUNNER_TRAIL_FLOOR_BPS", 8.0)
+                trail_cap = getattr(C, "S1_RUNNER_TRAIL_CAP_BPS", 25.0)
+                sigma_factor = getattr(C, "S1_RUNNER_TRAIL_SIGMA_FACTOR", 1.0)
+
+                adaptive_trail = sig.runner_peak_pnl_bps * trail_factor
+                sigma_floor = sigma * sigma_factor
+                trail_dist = max(trail_floor, sigma_floor, min(adaptive_trail, trail_cap))
+                sig.runner_trail_dist_bps = round(trail_dist, 2)
+
+                # --- Dynamic breakeven escalation ---
+                escalate_sec = getattr(C, "S1_RUNNER_BREAKEVEN_ESCALATE_SEC", 15.0)
+                lock_frac = getattr(C, "S1_RUNNER_BREAKEVEN_LOCK_FRACTION", 0.5)
+                if runner_dt >= escalate_sec:
+                    breakeven_floor = sig.runner_peak_pnl_bps * lock_frac
+                else:
+                    breakeven_floor = 0.0
+                sig.runner_breakeven_floor_bps = round(breakeven_floor, 2)
+
+                # --- Exit evaluation (priority order) ---
                 runner_exit_reason: Optional[str] = None
-                # Trailing stop drawback
-                if cur_net_pnl <= (sig.runner_peak_pnl_bps - getattr(C, "S1_RUNNER_TRAILING_DIST_BPS", 20.0)):
+
+                if cur_net_pnl <= (sig.runner_peak_pnl_bps - trail_dist):
                     runner_exit_reason = "runner_trailing_stop"
-                # Breakeven floor: runner cannot turn negative
-                elif cur_net_pnl <= 0.0:
-                    runner_exit_reason = "runner_breakeven"
-                # Maximum runner hold horizon
-                elif dt >= getattr(C, "S1_RUNNER_MAX_HOLD_SEC", 120.0):
-                    runner_exit_reason = "runner_timeout"
+                elif cur_net_pnl < breakeven_floor:
+                    runner_exit_reason = "runner_breakeven_lock"
+                elif since_peak >= getattr(C, "S1_RUNNER_NO_PEAK_DECAY_SEC", 20.0) and cur_net_pnl > 0.0:
+                    runner_exit_reason = "runner_dead_stall"
                 elif stop_type is not None:
                     runner_exit_reason = f"runner_{close_reason}"
+                elif runner_dt >= getattr(C, "S1_RUNNER_MAX_HOLD_SEC", 120.0):
+                    runner_exit_reason = "runner_timeout"
 
                 if runner_exit_reason is not None:
                     sig.runner_pnl_bps = cur_net_pnl
@@ -1459,20 +1491,41 @@ class KoreanEngine:
                 return
 
             if close_reason is not None:
-                # Transition to Phase 2 Runner if initial target achieved and runner mode enabled
-                if close_reason == "converged" and getattr(C, "S1_RUNNER_ENABLED", False) and not getattr(sig, "runner_active", False):
-                    sig.runner_enabled = True
-                    sig.runner_active = True
-                    sig.phase1_pnl_bps = cur_net_pnl
-                    sig.runner_peak_pnl_bps = cur_net_pnl
-                    sig.runner_pnl_bps = cur_net_pnl
-                    self.counters["signals_runner_activated"] = self.counters.get("signals_runner_activated", 0) + 1
-                    log.info(
-                        f"[S1-RUNNER] 🚀 Moonbag Runner activated on {sig.coin} ({sig.follower_exchange}): "
-                        f"Locked 70% @ {cur_net_pnl:+.1f} bps | Trailing 30% runner"
+                # Phase 1 → Phase 2 Runner transition with threshold gate
+                should_activate_runner = (
+                    close_reason == "converged"
+                    and getattr(C, "S1_RUNNER_ENABLED", False)
+                    and not getattr(sig, "runner_active", False)
+                )
+                if should_activate_runner:
+                    min_phase1 = getattr(C, "S1_RUNNER_MIN_PHASE1_BPS", 20.0)
+                    if cur_net_pnl >= min_phase1:
+                        sig.runner_enabled = True
+                        sig.runner_active = True
+                        sig.phase1_pnl_bps = cur_net_pnl
+                        sig.phase1_close_ts = now
+                        sig.phase1_mfe_bps = cur_net_pnl
+                        sig.phase1_mae_bps = cur_net_pnl
+                        sig.runner_pnl_bps = cur_net_pnl
+                        sig.runner_peak_pnl_bps = cur_net_pnl
+                        sig.runner_peak_ts = now
+                        sig.runner_mfe_bps = cur_net_pnl
+                        sig.runner_mae_bps = cur_net_pnl
+                        portion = getattr(C, "S1_RUNNER_PORTION", 0.30)
+                        self.counters["signals_runner_activated"] = self.counters.get("signals_runner_activated", 0) + 1
+                        log.info(
+                            f"[S1-RUNNER] 🚀 Activated on {sig.coin} ({sig.follower_exchange}): "
+                            f"Phase1 locked {(1.0-portion)*100:.0f}% @ {cur_net_pnl:+.1f} bps | "
+                            f"Runner {(portion)*100:.0f}% trailing (peak={sig.runner_peak_pnl_bps:+.1f})"
+                        )
+                        return
+                    # If phase1 too small — fall through to normal close below
+                    log.debug(
+                        f"[S1-RUNNER] Skipped activation on {sig.coin}: "
+                        f"phase1_pnl={cur_net_pnl:+.1f} < min_phase1={min_phase1:.1f}"
                     )
-                    return
 
+                # Normal close (either not converged, or runner activation skipped)
                 if stop_type is not None:
                     sig.stop_hit = True
                     sig.stop_type = stop_type
@@ -1505,6 +1558,7 @@ class KoreanEngine:
 
             if "runner" in reason:
                 self.counters["signals_runner_closed"] = self.counters.get("signals_runner_closed", 0) + 1
+                self.counters[f"signals_{reason}"] = self.counters.get(f"signals_{reason}", 0) + 1
             if reason == "converged":
                 self.counters["signals_converged"] += 1
             elif reason == "stop_invalidation":
@@ -1565,12 +1619,22 @@ class KoreanEngine:
 
                     should_close = False
                     close_reason = "runner_timeout" if is_runner else "timeout"
-                    if dt >= hold_sec:
-                        should_close = True
-                        close_reason = "runner_timeout" if is_runner else "timeout"
-                    elif not is_runner and dt >= pair_decay_sec and is_feed_stalled:
-                        should_close = True
-                        close_reason = "stop_decay"
+                    if is_runner:
+                        runner_dt = now - (sig.phase1_close_ts or sig.open_ts)
+                        since_peak = now - (sig.runner_peak_ts or sig.open_ts)
+                        if runner_dt >= hold_sec:
+                            should_close = True
+                            close_reason = "runner_timeout"
+                        elif since_peak >= getattr(C, "S1_RUNNER_NO_PEAK_DECAY_SEC", 20.0):
+                            should_close = True
+                            close_reason = "runner_dead_stall"
+                    else:
+                        if dt >= hold_sec:
+                            should_close = True
+                            close_reason = "timeout"
+                        elif dt >= pair_decay_sec and is_feed_stalled:
+                            should_close = True
+                            close_reason = "stop_decay"
 
                     if should_close:
                         f_snap = self._books.get((sig.follower_exchange, coin))
@@ -1590,6 +1654,33 @@ class KoreanEngine:
                         override_pnl = None
                         if is_runner:
                             cur_net_pnl = f_exec_move - self.roundtrip_fee_bps
+                            runner_dt = now - (sig.phase1_close_ts or sig.open_ts)
+                            since_peak = now - (sig.runner_peak_ts or sig.open_ts)
+
+                            # Re-evaluate trailing on stale data (best_bid may be old, but it's our best estimate)
+                            trail_factor = getattr(C, "S1_RUNNER_TRAIL_FACTOR", 0.35)
+                            trail_floor = getattr(C, "S1_RUNNER_TRAIL_FLOOR_BPS", 8.0)
+                            trail_cap = getattr(C, "S1_RUNNER_TRAIL_CAP_BPS", 25.0)
+                            sigma_factor = getattr(C, "S1_RUNNER_TRAIL_SIGMA_FACTOR", 1.0)
+                            sigma = max(sig.pair_sigma_bps, 2.0)
+
+                            adaptive_trail = sig.runner_peak_pnl_bps * trail_factor
+                            trail_dist = max(trail_floor, sigma * sigma_factor, min(adaptive_trail, trail_cap))
+
+                            escalate_sec = getattr(C, "S1_RUNNER_BREAKEVEN_ESCALATE_SEC", 15.0)
+                            lock_frac = getattr(C, "S1_RUNNER_BREAKEVEN_LOCK_FRACTION", 0.5)
+                            breakeven_floor = sig.runner_peak_pnl_bps * lock_frac if runner_dt >= escalate_sec else 0.0
+
+                            # Determine sweep exit reason (mirror tick-path priority)
+                            if cur_net_pnl <= (sig.runner_peak_pnl_bps - trail_dist):
+                                close_reason = "runner_trailing_stop"
+                            elif cur_net_pnl < breakeven_floor:
+                                close_reason = "runner_breakeven_lock"
+                            elif since_peak >= getattr(C, "S1_RUNNER_NO_PEAK_DECAY_SEC", 20.0) and cur_net_pnl > 0.0:
+                                close_reason = "runner_dead_stall"
+                            elif runner_dt >= getattr(C, "S1_RUNNER_MAX_HOLD_SEC", 120.0):
+                                close_reason = "runner_timeout"
+
                             portion = getattr(C, "S1_RUNNER_PORTION", 0.30)
                             override_pnl = round((1.0 - portion) * sig.phase1_pnl_bps + portion * cur_net_pnl, 2)
 
