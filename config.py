@@ -85,7 +85,7 @@ REGIME_BENCHMARK_EXCHANGE = os.getenv("REGIME_BENCHMARK_EXCHANGE", "binance").lo
 ALPHA_DECAY_SEC = 15.0          # Model C: Alpha decay timeout if PnL <= 0 (fallback if not in matrix)
 
 # Strategy 1: Korean Momentum (Upbit Sweep Lead-Lag) + Moonbag / Runner Dual-Phase Mode
-S1_RUNNER_ENABLED = os.getenv("S1_RUNNER_ENABLED", "false").lower() in ("true", "1", "yes") # OFF by default
+S1_RUNNER_ENABLED = os.getenv("S1_RUNNER_ENABLED", "true").lower() in ("true", "1", "yes") # ON by default
 S1_RUNNER_PORTION = float(os.getenv("S1_RUNNER_PORTION", "0.30"))                           # 30% held as trailing runner
 S1_RUNNER_MAX_HOLD_SEC = float(os.getenv("S1_RUNNER_MAX_HOLD_SEC", "120.0"))               # 120s max runner hold
 
@@ -117,7 +117,7 @@ S3_ALIGN_TREND = os.getenv("S3_ALIGN_TREND", "true").lower() in ("true", "1", "y
 S3_REQUIRE_UPBIT = os.getenv("S3_REQUIRE_UPBIT", "true").lower() in ("true", "1", "yes") # True: reject unanchored tokens without active Upbit/Bithumb feed
 
 # Strategy 4: Predatory Rebound Maker (Rubber Band)
-S4_RUBBER_BAND_ENABLED = os.getenv("S4_RUBBER_BAND_ENABLED", "false").lower() in ("true", "1", "yes") # OFF by default until user verification
+S4_RUBBER_BAND_ENABLED = os.getenv("S4_RUBBER_BAND_ENABLED", "true").lower() in ("true", "1", "yes") # ON by default
 MIN_RUBBER_BAND_DISLOCATION_BPS = float(os.getenv("MIN_RUBBER_BAND_DISLOCATION_BPS", "100.0")) # Min Upbit-Follower dislocation (+100 bps)
 RUBBER_BAND_MIN_Z_SCORE = float(os.getenv("RUBBER_BAND_MIN_Z_SCORE", "3.0"))                   # Min statistical dislocation Z-score (3.0σ)
 RUBBER_BAND_MAKER_DISCOUNT_BPS = float(os.getenv("RUBBER_BAND_MAKER_DISCOUNT_BPS", "25.0"))   # Post-Only Limit Bid discount below best_bid
@@ -129,7 +129,7 @@ RUBBER_BAND_ALPHA_DECAY_SEC = float(os.getenv("RUBBER_BAND_ALPHA_DECAY_SEC", "15
 RUBBER_BAND_COOLDOWN_SEC = float(os.getenv("RUBBER_BAND_COOLDOWN_SEC", "20.0"))                # Cooldown per pair (20s)
 
 # Strategy 5: Cross-Korean Triangle (Bithumb Radar) [Renumbered from S7]
-S5_CROSS_KOREAN_ENABLED = os.getenv("S5_CROSS_KOREAN_ENABLED", os.getenv("S7_CROSS_KOREAN_ENABLED", "false")).lower() in ("true", "1", "yes") # OFF by default
+S5_CROSS_KOREAN_ENABLED = os.getenv("S5_CROSS_KOREAN_ENABLED", os.getenv("S7_CROSS_KOREAN_ENABLED", "true")).lower() in ("true", "1", "yes") # ON by default
 S7_CROSS_KOREAN_ENABLED = S5_CROSS_KOREAN_ENABLED                                                # Backward-compatibility alias
 MIN_BITHUMB_LEAD_BPS = float(os.getenv("MIN_BITHUMB_LEAD_BPS", "25.0"))
 MIN_BITHUMB_BUYS_USD = float(os.getenv("MIN_BITHUMB_BUYS_USD", "2000.0"))                       # Real trade tape confirmation (>= $2,000 in 2s)

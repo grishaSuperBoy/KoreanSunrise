@@ -143,6 +143,7 @@ class KoreanEngine:
         min_trade_confirm_floor_usd: float = 5.0,
         require_trade_confirmation: bool = False,
         require_korean_confirmation: bool = getattr(C, "REQUIRE_KOREAN_CONFIRMATION", False),
+        runner_enabled: Optional[bool] = None,
         pool_state: Any = None,
         profile_manager: Any = None,
         thresholds_file: Optional[str] = None,
@@ -166,6 +167,7 @@ class KoreanEngine:
         self.min_trade_confirm_floor_usd = min_trade_confirm_floor_usd
         self.require_trade_confirmation = require_trade_confirmation
         self.require_korean_confirmation = require_korean_confirmation
+        self.runner_enabled = runner_enabled if runner_enabled is not None else getattr(C, "S1_RUNNER_ENABLED", True)
         self.pool_state = pool_state
         self.profile_manager = profile_manager
 
@@ -1454,7 +1456,7 @@ class KoreanEngine:
 
                 adaptive_trail = sig.runner_peak_pnl_bps * trail_factor
                 sigma_floor = sigma * sigma_factor
-                trail_dist = max(trail_floor, sigma_floor, min(adaptive_trail, trail_cap))
+                trail_dist = max(trail_floor, min(sigma_floor, trail_cap * 1.5), min(adaptive_trail, trail_cap))
                 sig.runner_trail_dist_bps = round(trail_dist, 2)
 
                 # --- Dynamic breakeven escalation ---
@@ -1473,7 +1475,7 @@ class KoreanEngine:
                     runner_exit_reason = "runner_trailing_stop"
                 elif cur_net_pnl < breakeven_floor:
                     runner_exit_reason = "runner_breakeven_lock"
-                elif since_peak >= getattr(C, "S1_RUNNER_NO_PEAK_DECAY_SEC", 20.0) and cur_net_pnl > 0.0:
+                elif since_peak >= getattr(C, "S1_RUNNER_NO_PEAK_DECAY_SEC", 20.0):
                     runner_exit_reason = "runner_dead_stall"
                 elif stop_type is not None:
                     runner_exit_reason = f"runner_{close_reason}"
@@ -1491,11 +1493,12 @@ class KoreanEngine:
                 return
 
             if close_reason is not None:
-                # Phase 1 → Phase 2 Runner transition with threshold gate
+                # Phase 1 → Phase 2 Runner transition with threshold gate (long breakout only)
                 should_activate_runner = (
                     close_reason == "converged"
-                    and getattr(C, "S1_RUNNER_ENABLED", False)
+                    and getattr(self, "runner_enabled", getattr(C, "S1_RUNNER_ENABLED", False))
                     and not getattr(sig, "runner_active", False)
+                    and getattr(sig, "side", "long") == "long"
                 )
                 if should_activate_runner:
                     min_phase1 = getattr(C, "S1_RUNNER_MIN_PHASE1_BPS", 20.0)
@@ -1665,7 +1668,8 @@ class KoreanEngine:
                             sigma = max(sig.pair_sigma_bps, 2.0)
 
                             adaptive_trail = sig.runner_peak_pnl_bps * trail_factor
-                            trail_dist = max(trail_floor, sigma * sigma_factor, min(adaptive_trail, trail_cap))
+                            sigma_floor = sigma * sigma_factor
+                            trail_dist = max(trail_floor, min(sigma_floor, trail_cap * 1.5), min(adaptive_trail, trail_cap))
 
                             escalate_sec = getattr(C, "S1_RUNNER_BREAKEVEN_ESCALATE_SEC", 15.0)
                             lock_frac = getattr(C, "S1_RUNNER_BREAKEVEN_LOCK_FRACTION", 0.5)
@@ -1676,7 +1680,7 @@ class KoreanEngine:
                                 close_reason = "runner_trailing_stop"
                             elif cur_net_pnl < breakeven_floor:
                                 close_reason = "runner_breakeven_lock"
-                            elif since_peak >= getattr(C, "S1_RUNNER_NO_PEAK_DECAY_SEC", 20.0) and cur_net_pnl > 0.0:
+                            elif since_peak >= getattr(C, "S1_RUNNER_NO_PEAK_DECAY_SEC", 20.0):
                                 close_reason = "runner_dead_stall"
                             elif runner_dt >= getattr(C, "S1_RUNNER_MAX_HOLD_SEC", 120.0):
                                 close_reason = "runner_timeout"
