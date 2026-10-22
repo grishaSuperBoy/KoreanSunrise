@@ -86,6 +86,7 @@ class BatchWriter:
             os.replace(tmp_path, final_path)
             with self._lock:
                 self.total_written += batch_rows
+                self._last_flush = flush_time
             log.info(
                 f"[writer] Flushed {batch_rows} signals to {filename} "
                 f"({len(compressed_data)} bytes)"
@@ -93,4 +94,5 @@ class BatchWriter:
         except Exception as e:
             with self._lock:
                 self._lines = batch_lines + self._lines  # Rollback lines to buffer on failure
+                self._last_flush = 0.0  # Reset timer so next maybe_flush retries immediately instead of waiting 30m!
             log.error(f"[writer] Flush error: {e}")

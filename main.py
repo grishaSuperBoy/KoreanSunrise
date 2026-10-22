@@ -236,6 +236,8 @@ class KoreanSunriseService:
             f"S1(LeadLag): {c['signals_triggered']} (⚔️{c.get('signals_battle', 0)}/🧪{c.get('signals_incubator', 0)}) | "
             f"S2(Fade): {c.get('fade_signals_triggered', 0)} (🎯{c.get('fade_signals_converged', 0)}) | "
             f"S3(Maker): {c.get('maker_voids_triggered', 0)} (🧲{c.get('maker_voids_filled', 0)}) | "
+            f"S4(Rubber): {c.get('rubber_band_triggered', 0)} (🎯{c.get('rubber_band_converged', 0)}) | "
+            f"S5(Triangle): {c.get('triangle_triggered', 0)} (🎯{c.get('triangle_converged', 0)}) | "
             f"Streams: [{conn_str}]"
         )
 

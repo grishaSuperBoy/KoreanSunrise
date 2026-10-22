@@ -294,6 +294,13 @@ class SunriseSignal:
     market_breadth_pct: float = 50.0
     btc_ret_300s_bps: float = 0.0
 
+    # Dual-Phase Runner / Moonbag telemetry
+    runner_enabled: bool = False
+    runner_active: bool = False
+    phase1_pnl_bps: float = 0.0
+    runner_pnl_bps: float = 0.0
+    runner_peak_pnl_bps: float = 0.0
+
     path: List[List[float]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:

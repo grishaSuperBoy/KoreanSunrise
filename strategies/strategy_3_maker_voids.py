@@ -291,6 +291,10 @@ class MakerVoidStrategy:
                 top3_depth = float(f_snap.top_n_bid_depth_usd(3))
             else:
                 top3_depth = 100.0
+
+            if top3_depth <= 0.0 or top3_depth < self.min_order_usd:
+                return None  # Dead book / ghost quote guard
+
             size_usd = min(self.max_position_budget_usd, max(self.min_order_usd, round(top3_depth * self.stealth_depth_fraction, 2)))
             if total_exposure + size_usd > self.max_total_exposure_usd:
                 return None

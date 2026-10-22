@@ -20,11 +20,19 @@ import config as C
 from models import OrderBookDepth5, SunriseSignal
 from pipeline.market_regime import MarketRegime, MarketRegimeDetector, MarketRegimeSnapshot
 from strategies import (
+    ActiveBetaNeutralPair,
+    ActiveCrossKoreanPosition,
     ActiveFadePosition,
+    ActiveImbalancePosition,
     ActiveMakerVoid,
+    ActiveRubberBandPosition,
+    BetaNeutralStrategy,
+    CrossKoreanTriangleStrategy,
     FadeFakeoutStrategy,
     KoreanLeadLagStrategy,
     MakerVoidStrategy,
+    OrderbookImbalanceStrategy,
+    RubberBandSniperStrategy,
     PairState,
     UpbitNormState,
     evaluate_exit_reason,
@@ -173,12 +181,13 @@ class KoreanEngine:
 
         # Upbit recent taker buys/sells: coin -> deque of (ts, trade_usd)
         self._buys_lock = threading.Lock()
-        self._upbit_recent_buys: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=200))
-        self._upbit_recent_sells: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=200))
+        self._upbit_recent_buys: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=2000))
+        self._upbit_recent_sells: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=2000))
         self._has_upbit_trades: Dict[str, bool] = defaultdict(bool)
-        self._bithumb_recent_buys: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=200))
-        self._bithumb_recent_sells: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=200))
+        self._bithumb_recent_buys: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=2000))
+        self._bithumb_recent_sells: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=2000))
         self._has_bithumb_trades: Dict[str, bool] = defaultdict(bool)
+        self._upbit_mid_history: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=500))
 
         # Korean leader normalisation state per coin:
         # coin -> {"depth_ask": float, "best_ask_usd": float, "spread_bps": float, "t": float}
@@ -229,6 +238,10 @@ class KoreanEngine:
             "maker_voids_unfilled": 0,
             "maker_voids_stopped": 0,
             "maker_voids_timeout": 0,
+            "rubber_band_triggered": 0,
+            "rubber_band_converged": 0,
+            "rubber_band_stopped": 0,
+            "rubber_band_timeout": 0,
             "regime_dump_blocked": 0,
             "regime_pump_blocked_shorts": 0,
         }
@@ -287,6 +300,77 @@ class KoreanEngine:
             require_upbit=getattr(C, "S3_REQUIRE_UPBIT", True),
             max_active_voids=getattr(C, "MAX_PORTFOLIO_CONCURRENT_POSITIONS", 10),
             max_total_exposure_usd=getattr(C, "MAX_PORTFOLIO_EXPOSURE_USD", 5000.0),
+            counters=self.counters,
+        )
+
+        # Strategy 4: Predatory Rebound Maker (Rubber Band)
+        self.strat_rubber_band = RubberBandSniperStrategy(
+            emit_callback=self._on_strategy_emit,
+            min_order_usd=self.min_order_usd,
+            max_position_budget_usd=self.max_position_budget_usd,
+            stealth_depth_fraction=self.stealth_fraction,
+            min_dislocation_bps=getattr(C, "MIN_RUBBER_BAND_DISLOCATION_BPS", 100.0),
+            min_z_score=getattr(C, "RUBBER_BAND_MIN_Z_SCORE", 3.0),
+            maker_discount_bps=getattr(C, "RUBBER_BAND_MAKER_DISCOUNT_BPS", 25.0),
+            maker_ttl_sec=getattr(C, "RUBBER_BAND_MAKER_TTL_SEC", 2.5),
+            target_rebound_bps=getattr(C, "TARGET_RUBBER_BAND_BPS", 35.0),
+            stop_loss_bps=getattr(C, "STOP_RUBBER_BAND_BPS", 25.0),
+            maker_rebate_bps=getattr(C, "MAKER_REBATE_BPS", 0.0),
+            taker_fee_bps=self.taker_fee_bps,
+            max_hold_sec=getattr(C, "RUBBER_BAND_MAX_HOLD_SEC", 30.0),
+            alpha_decay_sec=getattr(C, "RUBBER_BAND_ALPHA_DECAY_SEC", 15.0),
+            cooldown_sec=getattr(C, "RUBBER_BAND_COOLDOWN_SEC", 20.0),
+            max_active_positions=getattr(C, "MAX_PORTFOLIO_CONCURRENT_POSITIONS", 10),
+            max_total_exposure_usd=getattr(C, "MAX_PORTFOLIO_EXPOSURE_USD", 5000.0),
+            enabled=getattr(C, "S4_RUBBER_BAND_ENABLED", False),
+            counters=self.counters,
+        )
+
+        # Strategy 5: Cross-Korean Triangle (Bithumb Radar) [Renumbered from S7]
+        self.strat_triangle = CrossKoreanTriangleStrategy(
+            emit_callback=self._on_strategy_emit,
+            min_order_usd=self.min_order_usd,
+            max_position_budget_usd=self.max_position_budget_usd,
+            stealth_depth_fraction=self.stealth_fraction,
+            min_bithumb_lead_bps=getattr(C, "MIN_BITHUMB_LEAD_BPS", 25.0),
+            min_bithumb_buys_usd=getattr(C, "MIN_BITHUMB_BUYS_USD", 2000.0),
+            min_volume_share=getattr(C, "BITHUMB_MIN_VOLUME_SHARE", 0.30),
+            min_upbit_confirm_bps=getattr(C, "MIN_UPBIT_CONFIRM_BPS", 3.0),
+            excluded_coins=getattr(C, "EXCLUDED_TRIANGLE_COINS", {"BTC", "ETH", "SOL", "XRP", "DOGE"}),
+            roundtrip_fee_bps=self.roundtrip_fee_bps,
+            max_active_positions=getattr(C, "MAX_PORTFOLIO_CONCURRENT_POSITIONS", 5),
+            max_total_exposure_usd=getattr(C, "MAX_PORTFOLIO_EXPOSURE_USD", 5000.0),
+            enabled=getattr(C, "S5_CROSS_KOREAN_ENABLED", getattr(C, "S7_CROSS_KOREAN_ENABLED", False)),
+            counters=self.counters,
+        )
+
+        # Archived Strategy S5 (Legacy OBIV Imbalance - Dormant)
+        self.strat_imbalance = OrderbookImbalanceStrategy(
+            emit_callback=self._on_strategy_emit,
+            min_order_usd=self.min_order_usd,
+            max_position_budget_usd=self.max_position_budget_usd,
+            stealth_depth_fraction=self.stealth_fraction,
+            min_upbit_imbalance=getattr(C, "MIN_UPBIT_IMBALANCE", 0.60),
+            min_delta_imbalance_5s=getattr(C, "MIN_DELTA_IMBALANCE_5S", 0.35),
+            max_follower_imbalance=getattr(C, "MAX_FOLLOWER_IMBALANCE", 0.25),
+            roundtrip_fee_bps=self.roundtrip_fee_bps,
+            max_active_positions=getattr(C, "MAX_PORTFOLIO_CONCURRENT_POSITIONS", 10),
+            max_total_exposure_usd=getattr(C, "MAX_PORTFOLIO_EXPOSURE_USD", 5000.0),
+            enabled=getattr(C, "S5_IMBALANCE_ENABLED", False),
+            counters=self.counters,
+        )
+
+        # Archived Strategy S6 (Legacy Beta-Neutral Pairs - Dormant)
+        self.strat_beta_neutral = BetaNeutralStrategy(
+            emit_callback=self._on_strategy_emit,
+            min_order_usd=self.min_order_usd,
+            max_position_budget_usd=self.max_position_budget_usd,
+            stealth_depth_fraction=self.stealth_fraction,
+            default_beta=getattr(C, "DEFAULT_BETA_HEDGE", 1.3),
+            roundtrip_fee_bps=self.roundtrip_fee_bps,
+            max_active_pairs=getattr(C, "MAX_PORTFOLIO_CONCURRENT_POSITIONS", 5),
+            max_total_exposure_usd=getattr(C, "MAX_PORTFOLIO_EXPOSURE_USD", 5000.0),
+            enabled=getattr(C, "S6_BETA_NEUTRAL_ENABLED", False),
             counters=self.counters,
         )
 
@@ -391,6 +475,8 @@ class KoreanEngine:
 
         if ex == "upbit":
             self.counters["ticks_upbit"] += 1
+            self._upbit_mid_history[coin].append((now, snap.mid_price))
+            self.strat_imbalance.on_upbit_book_tick(coin, snap, now)
             self._eval_lead_lag(coin, snap, prev_snap, now, leader_ex="upbit")
             self._update_norm(coin, snap, now, venue="upbit")
             self._track_active_signals_for_coin(coin, now)
@@ -450,7 +536,8 @@ class KoreanEngine:
             # Strategy 3: Maker Liquidity Harvesting / Taker Hunter (using follower's own EWMA spread baseline and freshness check)
             f_recv = self._recv_ts.get((ex, coin), now)
             self.strat_maker.on_follower_tick(ex, coin, snap, now, norm_spread_bps=f_norm_spread, recv_ts=f_recv)
-            cur_regime = self.regime_detector.get_regime(now).regime.value
+            reg_snap = self.regime_detector.get_regime(now)
+            cur_regime = reg_snap.regime.value
             self.strat_maker.check_void_opportunity(
                 ex, coin, snap, upbit_snap, now,
                 norm_spread_bps=f_norm_spread,
@@ -458,6 +545,74 @@ class KoreanEngine:
                 is_warmed_up=is_f_warmed,
                 market_regime=cur_regime,
             )
+
+            # Strategy 4: Predatory Rebound Maker (Rubber Band)
+            if self.strat_rubber_band.enabled:
+                self.strat_rubber_band.on_regime_update(cur_regime, now)
+                self.strat_rubber_band.on_follower_tick(ex, coin, snap, now, cur_upbit_mid=cur_upbit_mid)
+                pair_cfg = self.get_pair_threshold_config(coin, ex, leader_ex="upbit")
+                sigma_val = float(pair_cfg.get("sigma_bps", 35.0))
+                self.strat_rubber_band.check_rubber_band_opportunity(
+                    follower_ex=ex,
+                    coin=coin,
+                    follower_snap=snap,
+                    upbit_snap=upbit_snap,
+                    now=now,
+                    regime_snapshot=reg_snap,
+                    recv_ts=f_recv,
+                    pair_sigma_bps=sigma_val,
+                )
+
+            # Strategy 5: Cross-Korean Triangle (Bithumb Radar) [Renumbered from S7]
+            if self.strat_triangle.enabled:
+                recent_b_buys, _ = self.get_recent_bithumb_buys(coin, now - 2.0)
+                recent_u_buys, _ = self.get_recent_upbit_buys(coin, now - 2.0)
+                upbit_ret_2s = self.get_upbit_return_bps(coin, now, window_sec=2.0)
+                vol_share = self.get_bithumb_volume_share(coin, now, window_sec=300.0)
+
+                self.strat_triangle.on_follower_tick(ex, coin, snap, now)
+                self.strat_triangle.check_triangle_opportunity(
+                    follower_ex=ex,
+                    coin=coin,
+                    bithumb_snap=bithumb_snap,
+                    upbit_snap=upbit_snap,
+                    follower_snap=snap,
+                    now=now,
+                    market_regime=cur_regime,
+                    recent_bithumb_buys_usd=recent_b_buys,
+                    recv_ts=f_recv,
+                    bithumb_volume_share=vol_share,
+                    upbit_ret_2s_bps=upbit_ret_2s,
+                    recent_upbit_buys_usd=recent_u_buys,
+                )
+
+            # Archived Strategy: Orderbook Imbalance Front-Runner (OBIV - Dormant)
+            if self.strat_imbalance.enabled:
+                self.strat_imbalance.on_follower_tick(ex, coin, snap, now)
+                self.strat_imbalance.check_imbalance_opportunity(
+                    follower_ex=ex,
+                    coin=coin,
+                    follower_snap=snap,
+                    upbit_snap=upbit_snap,
+                    now=now,
+                    market_regime=cur_regime,
+                    recv_ts=f_recv,
+                )
+
+            # Archived Strategy: Beta-Neutral Pairs Trading (Alt Long + BTC Short - Dormant)
+            if self.strat_beta_neutral.enabled:
+                btc_snap = self._books.get((self.regime_benchmark_exchange, "BTC"))
+                if btc_snap is not None:
+                    self.strat_beta_neutral.on_tick_update(ex, coin, snap, btc_snap, now)
+                    self.strat_beta_neutral.check_pair_opportunity(
+                        follower_ex=ex,
+                        coin=coin,
+                        follower_snap=snap,
+                        upbit_snap=upbit_snap,
+                        btc_snap=btc_snap,
+                        now=now,
+                        recv_ts=f_recv,
+                    )
 
     def on_upbit_trade(self, coin: str, trade_usd: float, is_taker_buy: bool, ts: float) -> None:
         """
@@ -557,6 +712,35 @@ class KoreanEngine:
                 recent_sells_usd = sum(s[1] for s in sells_deque)
             has_trades = self._has_bithumb_trades.get(c, False)
             return recent_sells_usd, has_trades
+
+    def get_upbit_return_bps(self, coin: str, now: float, window_sec: float = 2.0) -> float:
+        """Returns Upbit mid-price return in bps over approximately window_sec."""
+        history = self._upbit_mid_history.get(coin)
+        if not history or len(history) < 2:
+            return 0.0
+        cur_t, cur_px = history[-1]
+        if (now - cur_t) > window_sec:
+            return 0.0
+        target_t = now - window_sec
+        past_px = history[0][1]
+        for t, px in history:
+            if t <= target_t:
+                past_px = px
+            else:
+                break
+        if past_px <= 0.0 or cur_px <= 0.0:
+            return 0.0
+        return (cur_px - past_px) / past_px * 1e4
+
+    def get_bithumb_volume_share(self, coin: str, now: float, window_sec: float = 300.0) -> Optional[float]:
+        """Calculates Bithumb's volume share vs Upbit over the rolling window."""
+        b_buys, _ = self.get_recent_bithumb_buys(coin, now - window_sec)
+        u_buys, _ = self.get_recent_upbit_buys(coin, now - window_sec)
+        if (b_buys + u_buys) <= 0.0:
+            return None
+        if u_buys <= 0.0:
+            return 1.0 if b_buys > 0 else None
+        return round(b_buys / u_buys, 3)
 
     # ----------------------------------------------------------- Korean Norm (EWMA)
     def _update_norm(self, coin: str, snap: OrderBookDepth5, now: float, venue: str = "upbit") -> None:
@@ -1248,7 +1432,47 @@ class KoreanEngine:
                 stop_adverse_pnl_bps=self.stop_adverse_pnl_bps,
             )
 
+            # Dual-Phase Moonbag / Runner Evaluation (Strategy 1)
+            if getattr(sig, "runner_active", False):
+                sig.runner_peak_pnl_bps = max(sig.runner_peak_pnl_bps, cur_net_pnl)
+                runner_exit_reason: Optional[str] = None
+                # Trailing stop drawback
+                if cur_net_pnl <= (sig.runner_peak_pnl_bps - getattr(C, "S1_RUNNER_TRAILING_DIST_BPS", 20.0)):
+                    runner_exit_reason = "runner_trailing_stop"
+                # Breakeven floor: runner cannot turn negative
+                elif cur_net_pnl <= 0.0:
+                    runner_exit_reason = "runner_breakeven"
+                # Maximum runner hold horizon
+                elif dt >= getattr(C, "S1_RUNNER_MAX_HOLD_SEC", 120.0):
+                    runner_exit_reason = "runner_timeout"
+                elif stop_type is not None:
+                    runner_exit_reason = f"runner_{close_reason}"
+
+                if runner_exit_reason is not None:
+                    sig.runner_pnl_bps = cur_net_pnl
+                    portion = getattr(C, "S1_RUNNER_PORTION", 0.30)
+                    blended_pnl = round((1.0 - portion) * sig.phase1_pnl_bps + portion * cur_net_pnl, 2)
+                    self._close_signal(
+                        sig, now, runner_exit_reason, f_mid_move, f_exec_move,
+                        override_net_pnl=blended_pnl
+                    )
+                return
+
             if close_reason is not None:
+                # Transition to Phase 2 Runner if initial target achieved and runner mode enabled
+                if close_reason == "converged" and getattr(C, "S1_RUNNER_ENABLED", False) and not getattr(sig, "runner_active", False):
+                    sig.runner_enabled = True
+                    sig.runner_active = True
+                    sig.phase1_pnl_bps = cur_net_pnl
+                    sig.runner_peak_pnl_bps = cur_net_pnl
+                    sig.runner_pnl_bps = cur_net_pnl
+                    self.counters["signals_runner_activated"] = self.counters.get("signals_runner_activated", 0) + 1
+                    log.info(
+                        f"[S1-RUNNER] 🚀 Moonbag Runner activated on {sig.coin} ({sig.follower_exchange}): "
+                        f"Locked 70% @ {cur_net_pnl:+.1f} bps | Trailing 30% runner"
+                    )
+                    return
+
                 if stop_type is not None:
                     sig.stop_hit = True
                     sig.stop_type = stop_type
@@ -1263,6 +1487,7 @@ class KoreanEngine:
         reason: str,
         f_mid_move_bps: float,
         f_exec_move_bps: float,
+        override_net_pnl: Optional[float] = None,
     ) -> None:
         with self._engine_lock:
             if sig.closed:
@@ -1273,8 +1498,13 @@ class KoreanEngine:
             sig.close_reason = reason
             sig.captured_mid_move_bps = round(f_mid_move_bps, 2)
             sig.captured_exec_move_bps = round(f_exec_move_bps, 2)
-            sig.net_pnl_bps = round(f_exec_move_bps - self.roundtrip_fee_bps, 2)
+            if override_net_pnl is not None:
+                sig.net_pnl_bps = round(override_net_pnl, 2)
+            else:
+                sig.net_pnl_bps = round(f_exec_move_bps - self.roundtrip_fee_bps, 2)
 
+            if "runner" in reason:
+                self.counters["signals_runner_closed"] = self.counters.get("signals_runner_closed", 0) + 1
             if reason == "converged":
                 self.counters["signals_converged"] += 1
             elif reason == "stop_invalidation":
@@ -1318,8 +1548,31 @@ class KoreanEngine:
         for coin, signals in active_items:
             for sig in signals:
                 try:
-                    hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
-                    if not sig.closed and (now - sig.open_ts) >= hold_sec:
+                    if sig.closed:
+                        continue
+                    dt = now - sig.open_ts
+                    is_runner = getattr(sig, "runner_active", False)
+                    if is_runner:
+                        hold_sec = getattr(C, "S1_RUNNER_MAX_HOLD_SEC", 120.0)
+                    else:
+                        hold_sec = getattr(sig, "max_hold_sec", self.max_hold_sec) or self.max_hold_sec
+                    pair_cfg = self.get_pair_threshold_config(sig.coin, sig.follower_exchange, leader_ex=sig.leader_exchange)
+                    default_decay = max(self.alpha_decay_sec, hold_sec * 0.5) if hold_sec > self.max_hold_sec else self.alpha_decay_sec
+                    pair_decay_sec = float(pair_cfg.get("alpha_decay_sec", default_decay))
+
+                    f_recv = self._recv_ts.get((sig.follower_exchange, coin), 0.0)
+                    is_feed_stalled = (now - f_recv) > 5.0
+
+                    should_close = False
+                    close_reason = "runner_timeout" if is_runner else "timeout"
+                    if dt >= hold_sec:
+                        should_close = True
+                        close_reason = "runner_timeout" if is_runner else "timeout"
+                    elif not is_runner and dt >= pair_decay_sec and is_feed_stalled:
+                        should_close = True
+                        close_reason = "stop_decay"
+
+                    if should_close:
                         f_snap = self._books.get((sig.follower_exchange, coin))
                         if f_snap:
                             f_mid_move = (
@@ -1333,7 +1586,14 @@ class KoreanEngine:
                         else:
                             f_mid_move = 0.0
                             f_exec_move = 0.0
-                        self._close_signal(sig, now, "timeout", f_mid_move, f_exec_move)
+
+                        override_pnl = None
+                        if is_runner:
+                            cur_net_pnl = f_exec_move - self.roundtrip_fee_bps
+                            portion = getattr(C, "S1_RUNNER_PORTION", 0.30)
+                            override_pnl = round((1.0 - portion) * sig.phase1_pnl_bps + portion * cur_net_pnl, 2)
+
+                        self._close_signal(sig, now, close_reason, f_mid_move, f_exec_move, override_net_pnl=override_pnl)
                 except Exception as e:
                     log.error(f"[engine] Error sweeping timeout for signal {getattr(sig, 'id', '')}: {e}")
 
@@ -1343,6 +1603,18 @@ class KoreanEngine:
 
         # Strategy 3: Maker Liquidity Harvesting (sweep expired resting orders & filled voids)
         self.strat_maker.sweep_timeouts(now)
+
+        # Strategy 4: Predatory Rebound Maker (sweep expired resting orders & filled positions)
+        self.strat_rubber_band.sweep_timeouts(now)
+
+        # Strategy 5: Cross-Korean Triangle (sweep expired positions)
+        self.strat_triangle.sweep_timeouts(now)
+
+        # Archived Strategy S5 (Legacy OBIV Imbalance)
+        self.strat_imbalance.sweep_timeouts(now)
+
+        # Archived Strategy S6 (Legacy Beta-Neutral Pairs)
+        self.strat_beta_neutral.sweep_timeouts(now)
 
         # Pruning of idle follower spread EWMA baselines (Item 2: idle > 1 hour)
         with self._engine_lock:
