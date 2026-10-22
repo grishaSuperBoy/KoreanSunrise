@@ -55,7 +55,8 @@ TAKER_FEE_BPS = 5.0             # Single-leg VIP0 taker fee (bps) on Binance/Byb
 ROUNDTRIP_FEE_BPS = 10.0        # Theoretical entry + exit taker fee (bps) for net simulated PnL
 MIN_WARMUP_SAMPLES = 30         # Minimum 1s MAD samples before firing signals
 MAX_SIGNAL_HOLD_SEC = 30.0      # Maximum holding horizon before timeout closure (adaptive ceiling)
-MAX_FOLLOWER_BOOK_AGE_SEC = 1.50 # Maximum 1.5s staleness for follower book snapshots — generous enough for slow alts, still blocks stale 15s+ feeds
+MAX_FOLLOWER_BOOK_AGE_SEC = float(os.getenv("MAX_FOLLOWER_BOOK_AGE_SEC", "0.40")) # Maximum 400ms staleness for follower book snapshots — rejects stale quotes during fast market bursts
+ENTRY_LATENCY_BUFFER_BPS = float(os.getenv("ENTRY_LATENCY_BUFFER_BPS", "2.5"))   # Minimum safety buffer (2.5 bps) over roundtrip fee to compensate for in-flight RTT latency and adverse selection
 
 # Adaptive Stop-Loss Parameters
 STOP_INVALIDATION_BPS = 15.0    # Model A: Microstructure invalidation tolerance (leader premium breakdown)

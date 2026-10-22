@@ -236,7 +236,7 @@ class KoreanLeadLagStrategy:
         stealth_depth_fraction: float = C.STEALTH_DEPTH_FRACTION,
         roundtrip_fee_bps: float = C.ROUNDTRIP_FEE_BPS,
         max_hold_sec: float = C.MAX_SIGNAL_HOLD_SEC,
-        max_follower_book_age_sec: float = getattr(C, "MAX_FOLLOWER_BOOK_AGE_SEC", 1.50),
+        max_follower_book_age_sec: float = getattr(C, "MAX_FOLLOWER_BOOK_AGE_SEC", 0.40),
         stop_invalidation_bps: float = getattr(C, "STOP_INVALIDATION_BPS", 15.0),
         stop_adverse_pnl_bps: float = getattr(C, "STOP_ADVERSE_PNL_BPS", 35.0),
         alpha_decay_sec: float = getattr(C, "ALPHA_DECAY_SEC", 15.0),
@@ -378,10 +378,11 @@ class KoreanLeadLagStrategy:
         net_edge = gross_exec_edge_bps - self.roundtrip_fee_bps
         init_net_pnl_bps = round(init_exec_move_bps - self.roundtrip_fee_bps, 2)
 
-        eff_min_edge = self.min_edge_bps * max(edge_multiplier, 0.2)
+        latency_buffer = float(getattr(C, "ENTRY_LATENCY_BUFFER_BPS", 2.5))
+        eff_min_edge = self.min_edge_bps * max(edge_multiplier, 0.2) + latency_buffer
         if "min_spread_bps" in pair_cfg:
             req_spread = float(pair_cfg["min_spread_bps"]) * max(edge_multiplier, 0.2)
-            if gross_exec_edge_bps < req_spread or net_edge <= 0.0:
+            if gross_exec_edge_bps < req_spread or net_edge < latency_buffer:
                 return None
         else:
             if net_edge < eff_min_edge:

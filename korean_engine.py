@@ -135,7 +135,7 @@ class KoreanEngine:
         roundtrip_fee_bps: float = C.ROUNDTRIP_FEE_BPS,
         warmup_samples: int = C.MIN_WARMUP_SAMPLES,
         max_hold_sec: float = C.MAX_SIGNAL_HOLD_SEC,
-        max_follower_book_age_sec: float = getattr(C, "MAX_FOLLOWER_BOOK_AGE_SEC", 1.50),
+        max_follower_book_age_sec: float = getattr(C, "MAX_FOLLOWER_BOOK_AGE_SEC", 0.40),
         stop_invalidation_bps: float = getattr(C, "STOP_INVALIDATION_BPS", 15.0),
         stop_adverse_pnl_bps: float = getattr(C, "STOP_ADVERSE_PNL_BPS", 35.0),
         alpha_decay_sec: float = getattr(C, "ALPHA_DECAY_SEC", 15.0),
