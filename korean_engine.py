@@ -167,7 +167,7 @@ class KoreanEngine:
         self.min_trade_confirm_floor_usd = min_trade_confirm_floor_usd
         self.require_trade_confirmation = require_trade_confirmation
         self.require_korean_confirmation = require_korean_confirmation
-        self.runner_enabled = runner_enabled if runner_enabled is not None else getattr(C, "S1_RUNNER_ENABLED", True)
+        self.runner_enabled = runner_enabled
         self.pool_state = pool_state
         self.profile_manager = profile_manager
 
@@ -552,8 +552,8 @@ class KoreanEngine:
             if self.strat_rubber_band.enabled:
                 self.strat_rubber_band.on_regime_update(cur_regime, now)
                 self.strat_rubber_band.on_follower_tick(ex, coin, snap, now, cur_upbit_mid=cur_upbit_mid)
-                pair_cfg = self.get_pair_threshold_config(coin, ex, leader_ex="upbit")
-                sigma_val = float(pair_cfg.get("sigma_bps", 35.0))
+                st_upbit = self._get_or_create_pair_state(coin, ex, leader_ex="upbit")
+                sigma_val = max(st_upbit.sigma(now), 10.0)
                 self.strat_rubber_band.check_rubber_band_opportunity(
                     follower_ex=ex,
                     coin=coin,
@@ -1494,9 +1494,10 @@ class KoreanEngine:
 
             if close_reason is not None:
                 # Phase 1 → Phase 2 Runner transition with threshold gate (long breakout only)
+                is_runner_enabled = self.runner_enabled if self.runner_enabled is not None else getattr(C, "S1_RUNNER_ENABLED", False)
                 should_activate_runner = (
                     close_reason == "converged"
-                    and getattr(self, "runner_enabled", getattr(C, "S1_RUNNER_ENABLED", False))
+                    and is_runner_enabled
                     and not getattr(sig, "runner_active", False)
                     and getattr(sig, "side", "long") == "long"
                 )
@@ -1562,7 +1563,7 @@ class KoreanEngine:
             if "runner" in reason:
                 self.counters["signals_runner_closed"] = self.counters.get("signals_runner_closed", 0) + 1
                 self.counters[f"signals_{reason}"] = self.counters.get(f"signals_{reason}", 0) + 1
-            if reason == "converged":
+            elif reason == "converged":
                 self.counters["signals_converged"] += 1
             elif reason == "stop_invalidation":
                 self.counters["signals_stop_loss_invalidation"] += 1
