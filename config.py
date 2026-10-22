@@ -128,6 +128,7 @@ STOP_RUBBER_BAND_BPS = float(os.getenv("STOP_RUBBER_BAND_BPS", "25.0"))         
 RUBBER_BAND_MAX_HOLD_SEC = float(os.getenv("RUBBER_BAND_MAX_HOLD_SEC", "30.0"))                # Max holding time (30s)
 RUBBER_BAND_ALPHA_DECAY_SEC = float(os.getenv("RUBBER_BAND_ALPHA_DECAY_SEC", "15.0"))          # Alpha decay timeout (15s)
 RUBBER_BAND_COOLDOWN_SEC = float(os.getenv("RUBBER_BAND_COOLDOWN_SEC", "20.0"))                # Cooldown per pair (20s)
+RUBBER_BAND_PENALTY_COOLDOWN_SEC = float(os.getenv("RUBBER_BAND_PENALTY_COOLDOWN_SEC", "120.0")) # Escalated cooldown after stop/decay (120s)
 RUBBER_BAND_DYNAMIC_DISCOUNT = os.getenv("RUBBER_BAND_DYNAMIC_DISCOUNT", "true").lower() in ("true", "1", "yes") # Quantitative dynamic discount from spread
 RUBBER_BAND_DYNAMIC_TARGET = os.getenv("RUBBER_BAND_DYNAMIC_TARGET", "true").lower() in ("true", "1", "yes")     # Quantitative dynamic target from spread & sigma
 

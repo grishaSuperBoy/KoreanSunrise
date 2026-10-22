@@ -36,6 +36,8 @@ import math
 import threading
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+import config as C
+
 log = logging.getLogger("strategy.rubber_band")
 
 
@@ -115,6 +117,7 @@ class RubberBandSniperStrategy:
         max_hold_sec: float = 30.0,
         alpha_decay_sec: float = 15.0,
         cooldown_sec: float = 20.0,
+        penalty_cooldown_sec: float = getattr(C, "RUBBER_BAND_PENALTY_COOLDOWN_SEC", 120.0),
         max_active_positions: int = 10,
         max_total_exposure_usd: float = 5000.0,
         hunter_mode: bool = False,         # If True: instant taker fill (for backwards-compat/testing)
@@ -143,6 +146,7 @@ class RubberBandSniperStrategy:
         self.max_hold_sec = max_hold_sec
         self.alpha_decay_sec = alpha_decay_sec
         self.cooldown_sec = cooldown_sec
+        self.penalty_cooldown_sec = penalty_cooldown_sec
         self.max_active_positions = max_active_positions
         self.max_total_exposure_usd = max_total_exposure_usd
         self.hunter_mode = hunter_mode
@@ -160,6 +164,8 @@ class RubberBandSniperStrategy:
         self._coin_pos_map: Dict[Tuple[str, str], str] = {}
         # Cooldown: (follower_ex, coin) -> last_trigger_ts
         self._last_trigger_ts: Dict[Tuple[str, str], float] = {}
+        # Per-pair active cooldown requirement (standard vs penalty after stop)
+        self._pair_cooldowns: Dict[Tuple[str, str], float] = {}
 
         # Dump exhaustion tracking
         self._last_dump_ts: float = 0.0
@@ -180,6 +186,7 @@ class RubberBandSniperStrategy:
         regime_snapshot: Optional[Any] = None,
         recv_ts: float = 0.0,
         pair_sigma_bps: float = 35.0,
+        baseline_bps: float = 0.0,
     ) -> Optional[ActiveRubberBandPosition]:
         """
         Evaluates whether a co-listed altcoin exhibits extreme statistical rubber-band dislocation
@@ -206,8 +213,9 @@ class RubberBandSniperStrategy:
             return None  # Disregard illiquid blown-out books
 
         # 2. Rubber-band tension (dislocation) & Statistical Z-Score check
-        # Upbit must be higher than Follower by at least min_dislocation_bps and Z >= min_z_score
-        dislocation_bps = (upbit_mid - f_mid) / f_mid * 1e4
+        # Elastic tension is measured relative to the pair's historical Kimchi baseline
+        raw_diff_bps = (upbit_mid - f_mid) / f_mid * 1e4
+        dislocation_bps = raw_diff_bps - baseline_bps
         if dislocation_bps < self.min_dislocation_bps:
             return None
 
@@ -262,7 +270,8 @@ class RubberBandSniperStrategy:
                 return None  # Already in position
 
             last_trig = self._last_trigger_ts.get(key, 0.0)
-            if (now - last_trig) < self.cooldown_sec:
+            req_cooldown = self._pair_cooldowns.get(key, self.cooldown_sec)
+            if (now - last_trig) < req_cooldown:
                 return None
 
             if len(self._active_positions) >= self.max_active_positions:
@@ -499,6 +508,11 @@ class RubberBandSniperStrategy:
 
             self._active_positions.pop(pos.id, None)
             self._coin_pos_map.pop(key, None)
+            self._last_trigger_ts[key] = now
+            if close_reason in ("stop_decay", "stop_loss", "stop_anchor_collapsed", "timeout") or net_pnl_bps <= 0.0:
+                self._pair_cooldowns[key] = self.penalty_cooldown_sec
+            else:
+                self._pair_cooldowns[key] = self.cooldown_sec
 
         # Update engine counters accurately by economic outcome:
         if close_reason in ("target_converged", "converged_on_anchor_break"):

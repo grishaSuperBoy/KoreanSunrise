@@ -558,6 +558,7 @@ class KoreanEngine:
                 self.strat_rubber_band.on_follower_tick(ex, coin, snap, now, cur_upbit_mid=cur_upbit_mid)
                 st_upbit = self._get_or_create_pair_state(coin, ex, leader_ex="upbit")
                 sigma_val = max(st_upbit.sigma(now), 10.0)
+                baseline_val = float(getattr(st_upbit, "baseline_bps", 0.0) or 0.0)
                 self.strat_rubber_band.check_rubber_band_opportunity(
                     follower_ex=ex,
                     coin=coin,
@@ -567,6 +568,7 @@ class KoreanEngine:
                     regime_snapshot=reg_snap,
                     recv_ts=f_recv,
                     pair_sigma_bps=sigma_val,
+                    baseline_bps=baseline_val,
                 )
 
             # Strategy 5: Cross-Korean Triangle (Bithumb Radar) [Renumbered from S7]
