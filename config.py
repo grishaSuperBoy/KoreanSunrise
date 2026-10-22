@@ -118,24 +118,28 @@ S3_ALIGN_TREND = os.getenv("S3_ALIGN_TREND", "true").lower() in ("true", "1", "y
 S3_REQUIRE_UPBIT = os.getenv("S3_REQUIRE_UPBIT", "true").lower() in ("true", "1", "yes") # True: reject unanchored tokens without active Upbit/Bithumb feed
 
 # Strategy 4: Predatory Rebound Maker (Rubber Band)
-S4_RUBBER_BAND_ENABLED = os.getenv("S4_RUBBER_BAND_ENABLED", "false").lower() in ("true", "1", "yes") # OFF by default
+S4_RUBBER_BAND_ENABLED = os.getenv("S4_RUBBER_BAND_ENABLED", "true").lower() in ("true", "1", "yes") # Enabled
 MIN_RUBBER_BAND_DISLOCATION_BPS = float(os.getenv("MIN_RUBBER_BAND_DISLOCATION_BPS", "100.0")) # Min Upbit-Follower dislocation (+100 bps)
 RUBBER_BAND_MIN_Z_SCORE = float(os.getenv("RUBBER_BAND_MIN_Z_SCORE", "3.0"))                   # Min statistical dislocation Z-score (3.0σ)
-RUBBER_BAND_MAKER_DISCOUNT_BPS = float(os.getenv("RUBBER_BAND_MAKER_DISCOUNT_BPS", "25.0"))   # Post-Only Limit Bid discount below best_bid
+RUBBER_BAND_MAKER_DISCOUNT_BPS = float(os.getenv("RUBBER_BAND_MAKER_DISCOUNT_BPS", "1.0"))     # Baseline discount below best_bid (was 25.0)
 RUBBER_BAND_MAKER_TTL_SEC = float(os.getenv("RUBBER_BAND_MAKER_TTL_SEC", "2.5"))              # Short resting order TTL (sec)
-TARGET_RUBBER_BAND_BPS = float(os.getenv("TARGET_RUBBER_BAND_BPS", "35.0"))                     # Target snap-back take profit (+35 bps)
+TARGET_RUBBER_BAND_BPS = float(os.getenv("TARGET_RUBBER_BAND_BPS", "10.0"))                     # Baseline snap-back target (+10 bps, was 35.0)
 STOP_RUBBER_BAND_BPS = float(os.getenv("STOP_RUBBER_BAND_BPS", "25.0"))                         # Stop loss threshold (-25 bps)
 RUBBER_BAND_MAX_HOLD_SEC = float(os.getenv("RUBBER_BAND_MAX_HOLD_SEC", "30.0"))                # Max holding time (30s)
 RUBBER_BAND_ALPHA_DECAY_SEC = float(os.getenv("RUBBER_BAND_ALPHA_DECAY_SEC", "15.0"))          # Alpha decay timeout (15s)
 RUBBER_BAND_COOLDOWN_SEC = float(os.getenv("RUBBER_BAND_COOLDOWN_SEC", "20.0"))                # Cooldown per pair (20s)
+RUBBER_BAND_DYNAMIC_DISCOUNT = os.getenv("RUBBER_BAND_DYNAMIC_DISCOUNT", "true").lower() in ("true", "1", "yes") # Quantitative dynamic discount from spread
+RUBBER_BAND_DYNAMIC_TARGET = os.getenv("RUBBER_BAND_DYNAMIC_TARGET", "true").lower() in ("true", "1", "yes")     # Quantitative dynamic target from spread & sigma
 
 # Strategy 5: Cross-Korean Triangle (Bithumb Radar) [Renumbered from S7]
-S5_CROSS_KOREAN_ENABLED = os.getenv("S5_CROSS_KOREAN_ENABLED", os.getenv("S7_CROSS_KOREAN_ENABLED", "false")).lower() in ("true", "1", "yes") # OFF by default
+S5_CROSS_KOREAN_ENABLED = os.getenv("S5_CROSS_KOREAN_ENABLED", os.getenv("S7_CROSS_KOREAN_ENABLED", "true")).lower() in ("true", "1", "yes") # Enabled
 S7_CROSS_KOREAN_ENABLED = S5_CROSS_KOREAN_ENABLED                                                # Backward-compatibility alias
 MIN_BITHUMB_LEAD_BPS = float(os.getenv("MIN_BITHUMB_LEAD_BPS", "25.0"))
 MIN_BITHUMB_BUYS_USD = float(os.getenv("MIN_BITHUMB_BUYS_USD", "2000.0"))                       # Real trade tape confirmation (>= $2,000 in 2s)
 MIN_UPBIT_CONFIRM_BPS = float(os.getenv("MIN_UPBIT_CONFIRM_BPS", "3.0"))                        # Upbit momentum confirmation (+3 bps or tape)
 BITHUMB_MIN_VOLUME_SHARE = float(os.getenv("BITHUMB_MIN_VOLUME_SHARE", "0.30"))                 # Minimum Bithumb volume / Upbit volume share
+TARGET_TRIANGLE_BPS = float(os.getenv("TARGET_TRIANGLE_BPS", "12.0"))                           # Quantitative baseline target (+12 bps, was 30.0)
+S5_DYNAMIC_TARGET = os.getenv("S5_DYNAMIC_TARGET", "true").lower() in ("true", "1", "yes")      # Quantitative dynamic target from Bithumb lead
 EXCLUDED_TRIANGLE_COINS = {"BTC", "ETH", "SOL", "XRP", "DOGE"}                                  # Reject major coins where Bithumb cannot lead Upbit
 
 # Archived / Deprecated Strategies (Kept for telemetry and historical replay)

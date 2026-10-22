@@ -93,6 +93,7 @@ class CrossKoreanTriangleStrategy:
         cooldown_sec: float = 30.0,
         max_active_positions: int = 5,
         max_total_exposure_usd: float = 3000.0,
+        dynamic_target: bool = False,
         enabled: bool = False,                 # Disabled by default until user verification
         counters: Optional[Dict[str, int]] = None,
     ):
@@ -113,6 +114,7 @@ class CrossKoreanTriangleStrategy:
         self.cooldown_sec = cooldown_sec
         self.max_active_positions = max_active_positions
         self.max_total_exposure_usd = max_total_exposure_usd
+        self.dynamic_target = dynamic_target
         self.enabled = enabled
         self.counters = counters if counters is not None else {}
 
@@ -231,6 +233,13 @@ class CrossKoreanTriangleStrategy:
         pos_id = f"tri_{int(now)}_{seq}"
         sym = getattr(follower_snap, "symbol", coin)
 
+        if self.dynamic_target:
+            # Quantitative Dynamic Target for S5:
+            # Rebound is proportional to Bithumb's lead over Upbit, floored by friction
+            eff_target_bps = max(8.0, min(16.0, round(0.4 * bit_upbit_diff_bps, 2)))
+        else:
+            eff_target_bps = self.target_pnl_bps
+
         pos = ActiveCrossKoreanPosition(
             id=pos_id,
             coin=coin,
@@ -245,7 +254,7 @@ class CrossKoreanTriangleStrategy:
             entry_px=best_ask,
             suggested_size_usd=order_size_usd,
             spread_open_bps=f_spread_bps,
-            target_pnl_bps=self.target_pnl_bps,
+            target_pnl_bps=eff_target_bps,
             stop_loss_bps=self.stop_loss_bps,
             roundtrip_fee_bps=self.roundtrip_fee_bps,
             max_hold_sec=self.max_hold_sec,
@@ -260,7 +269,7 @@ class CrossKoreanTriangleStrategy:
         self.counters["triangle_triggered"] = self.counters.get("triangle_triggered", 0) + 1
         log.info(
             f"[S5-TRIANGLE] 🔺 Bithumb early radar LONG on {coin} ({follower_ex}): "
-            f"Bithumb-Upbit={bit_upbit_diff_bps:+.1f} bps | Target=+{self.target_pnl_bps:.1f} bps | "
+            f"Bithumb-Upbit={bit_upbit_diff_bps:+.1f} bps | Target=+{eff_target_bps:.1f} bps | "
             f"Size=${order_size_usd:.1f}"
         )
         return pos

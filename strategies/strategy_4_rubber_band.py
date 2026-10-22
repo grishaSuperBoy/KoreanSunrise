@@ -118,6 +118,8 @@ class RubberBandSniperStrategy:
         max_active_positions: int = 10,
         max_total_exposure_usd: float = 5000.0,
         hunter_mode: bool = False,         # If True: instant taker fill (for backwards-compat/testing)
+        dynamic_discount: bool = False,    # If True: auto-derive discount from spread (0.0..2.5 bps)
+        dynamic_target: bool = False,      # If True: auto-derive rebound target from spread & sigma (8..15 bps)
         enabled: bool = True,
         counters: Optional[Dict[str, int]] = None,
     ):
@@ -144,6 +146,8 @@ class RubberBandSniperStrategy:
         self.max_active_positions = max_active_positions
         self.max_total_exposure_usd = max_total_exposure_usd
         self.hunter_mode = hunter_mode
+        self.dynamic_discount = dynamic_discount
+        self.dynamic_target = dynamic_target
         self.enabled = enabled
         self.counters = counters if counters is not None else {}
 
@@ -289,7 +293,20 @@ class RubberBandSniperStrategy:
         # 6. Predatory Maker Limit Pricing
         # Instead of crossing the spread at best_ask, place a post-only limit bid
         # at a discount below best_bid to catch the liquidation knife tip with 0 bps taker fees.
-        target_limit_px = round(best_bid * (1.0 - self.maker_discount_bps / 1e4), 8)
+        if self.dynamic_discount:
+            # Pegged to follower spread: max(0.0, min(2.5, 0.15 * f_spread_bps))
+            eff_discount_bps = max(0.0, min(2.5, round(0.15 * f_spread_bps, 2)))
+        else:
+            eff_discount_bps = self.maker_discount_bps
+
+        if self.dynamic_target:
+            # Quantitative First-Passage Formula on 9,564 empirical trajectories:
+            # T* = max(8.0, min(15.0, 0.8 * f_spread_bps + 0.15 * effective_sigma))
+            eff_target_bps = max(8.0, min(15.0, round(0.8 * f_spread_bps + 0.15 * effective_sigma, 2)))
+        else:
+            eff_target_bps = self.target_rebound_bps
+
+        target_limit_px = round(best_bid * (1.0 - eff_discount_bps / 1e4), 8)
         if target_limit_px <= 0.0:
             target_limit_px = best_bid
 
@@ -323,10 +340,10 @@ class RubberBandSniperStrategy:
             fill_ts=now if is_filled else None,
             fill_px=best_ask if is_filled else None,
             maker_ttl_sec=self.maker_ttl_sec,
-            maker_discount_bps=self.maker_discount_bps,
+            maker_discount_bps=eff_discount_bps,
             maker_rebate_bps=self.maker_rebate_bps,
             taker_fee_bps=self.taker_fee_bps,
-            target_rebound_bps=self.target_rebound_bps,
+            target_rebound_bps=eff_target_bps,
             stop_loss_bps=self.stop_loss_bps,
             roundtrip_fee_bps=self.roundtrip_fee_bps,
             max_hold_sec=self.max_hold_sec,
@@ -344,9 +361,9 @@ class RubberBandSniperStrategy:
 
         log.info(
             f"[S4-RUBBER-BAND] 🏹 Posted Predatory Maker BID on {coin} ({follower_ex}): "
-            f"Limit Px={target_limit_px:.6f} (-{self.maker_discount_bps:.1f} bps) | "
+            f"Limit Px={target_limit_px:.6f} (-{eff_discount_bps:.1f} bps) | "
             f"Disloc={dislocation_bps:+.1f} bps (Z={disloc_z:.1f}σ) | "
-            f"Target=+{self.target_rebound_bps:.1f} bps | Size=${order_size_usd:.1f}"
+            f"Target=+{eff_target_bps:.1f} bps | Size=${order_size_usd:.1f}"
         )
         return pos
 
