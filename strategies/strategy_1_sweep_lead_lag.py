@@ -18,6 +18,14 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import config as C
 from models import OrderBookDepth5, SunriseSignal
+from strategies.quant_lead_lag import (
+    evaluate_lead_lag_microstructure_gate,
+    compute_raw_dislocation_bps,
+    compute_elastic_dislocation_bps,
+    compute_impulse_power_ratio,
+    check_information_flow_leadership,
+    check_impulse_power_ratio,
+)
 
 log = logging.getLogger("strategy.lead_lag")
 
@@ -240,6 +248,8 @@ class KoreanLeadLagStrategy:
         stop_invalidation_bps: float = getattr(C, "STOP_INVALIDATION_BPS", 15.0),
         stop_adverse_pnl_bps: float = getattr(C, "STOP_ADVERSE_PNL_BPS", 35.0),
         alpha_decay_sec: float = getattr(C, "ALPHA_DECAY_SEC", 15.0),
+        min_power_ratio: float = getattr(C, "LEAD_LAG_MIN_POWER_RATIO", 4.0),
+        min_lead_basis_bps: float = getattr(C, "LEAD_LAG_MIN_LEAD_BASIS_BPS", -10.0),
         pool_state: Any = None,
         profile_manager: Any = None,
     ):
@@ -254,6 +264,8 @@ class KoreanLeadLagStrategy:
         self.stop_invalidation_bps = stop_invalidation_bps
         self.stop_adverse_pnl_bps = stop_adverse_pnl_bps
         self.alpha_decay_sec = alpha_decay_sec
+        self.min_power_ratio = min_power_ratio
+        self.min_lead_basis_bps = min_lead_basis_bps
         self.pool_state = pool_state
         self.profile_manager = profile_manager
 
@@ -296,7 +308,8 @@ class KoreanLeadLagStrategy:
 
         # Follower spread guard: reject illiquid books where follower spread is abnormally wide
         # (Blocks 150-350 bps defensive quarantine spreads on AsterDex like TAIKO/TREE)
-        f_spread_bps = float(getattr(f_snap, "spread_bps", 0.0) or ((f_ask - f_bid) / f_bid * 1e4))
+        snap_spread = getattr(f_snap, "spread_bps", None)
+        f_spread_bps = float(snap_spread) if snap_spread is not None else ((f_ask - f_bid) / f_bid * 1e4)
         max_f_spread = getattr(C, "MAX_ASTERDEX_SPREAD_BPS", 45.0) if follower_ex.lower() == "asterdex" else 80.0
         if f_spread_bps > max_f_spread:
             return None
@@ -305,26 +318,6 @@ class KoreanLeadLagStrategy:
         if f_book_age_ms > (self.max_follower_book_age_sec * 1000.0):
             return None
 
-        raw_diff_bps = (upbit_mid - f_mid) / f_mid * 1e4
-        if side == "short":
-            # Downward dislocation: Korean leader dropped below follower
-            dislocation_bps = st.baseline_bps - raw_diff_bps
-        else:
-            # Upward dislocation: Korean leader lifted above follower
-            dislocation_bps = raw_diff_bps - st.baseline_bps
-
-        if dislocation_bps <= 0:
-            return None
-
-        dev_z = dislocation_bps / max(sigma, 1.5)
-        if not pair_cfg.get("enabled", True):
-            return None  # Pruned pair due to negative EV or high adverse flow
-
-        min_dev_z = float(pair_cfg.get("min_dev_z", 1.8))
-        if dev_z < min_dev_z:
-            return None
-
-        pair_hold_sec = float(pair_cfg.get("max_hold_sec", self.max_hold_sec))
         top3_ask_depth_usd = f_snap.top_n_ask_depth_usd(3)
         top3_bid_depth_usd = f_snap.top_n_bid_depth_usd(3)
         target_top3_depth = top3_bid_depth_usd if side == "short" else top3_ask_depth_usd
@@ -332,6 +325,36 @@ class KoreanLeadLagStrategy:
         min_depth_needed = self.min_order_usd / max(self.stealth_fraction, 0.01)
         if target_top3_depth < min_depth_needed:
             return None
+
+        if not pair_cfg.get("enabled", True):
+            return None  # Pruned pair due to negative EV or high adverse flow
+
+        min_dev_z = float(pair_cfg.get("min_dev_z", 1.8))
+        min_power_ratio = float(pair_cfg.get("min_power_ratio", self.min_power_ratio))
+        min_lead_basis_bps = float(pair_cfg.get("min_lead_basis_bps", self.min_lead_basis_bps))
+
+        quant_decision = evaluate_lead_lag_microstructure_gate(
+            leader_mid=upbit_mid,
+            follower_mid=f_mid,
+            baseline_bps=st.baseline_bps,
+            sigma=sigma,
+            swept_usd=swept_usd,
+            follower_opposing_depth_usd=target_top3_depth,
+            side=side,
+            min_dev_z=min_dev_z,
+            min_power_ratio=min_power_ratio,
+            min_lead_basis_bps=min_lead_basis_bps,
+        )
+
+        if not quant_decision.passed:
+            log.debug(f"[S1-QUANT-GATE] {coin}@{follower_ex} side={side} veto: {quant_decision.reason}")
+            return None
+
+        raw_diff_bps = quant_decision.raw_diff_bps
+        dislocation_bps = quant_decision.dislocation_bps
+        dev_z = quant_decision.dev_z
+        phi = quant_decision.phi
+        pair_hold_sec = float(pair_cfg.get("max_hold_sec", self.max_hold_sec))
 
         stealth_capacity_usd = round(self.stealth_fraction * target_top3_depth, 2)
         is_battle = pool_st.is_battle_coin(coin) if pool_st else False
@@ -428,6 +451,7 @@ class KoreanLeadLagStrategy:
             follower_entry_px=round(f_entry_px, 8),
             leader_recent_buys_usd=round(recent_buys_usd, 2),
             side=side,
+            phi=phi,
             basket=basket,
             is_actionable=is_actionable,
             max_hold_sec=pair_hold_sec,

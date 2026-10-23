@@ -308,6 +308,7 @@ class TestPipelineE2E(unittest.TestCase):
             emit_callback=lambda sig_dict: emitted.append(sig_dict),
             thresholds_file=thresh_file,
             max_hold_sec=6.0,
+            lead_lag_min_power_ratio=0.0,
         )
 
         # 1. Verify PairState gets pair-specific spike_sigma
@@ -939,7 +940,7 @@ class TestPipelineE2E(unittest.TestCase):
         """Verifies that KoreanEngine strictly rejects stale follower order books (> 300ms)."""
         from korean_engine import KoreanEngine, PairState
         emitted = []
-        engine = KoreanEngine(emit_callback=emitted.append, max_follower_book_age_sec=0.30)
+        engine = KoreanEngine(emit_callback=emitted.append, max_follower_book_age_sec=0.30, lead_lag_min_power_ratio=0.0)
         st = PairState("BTC", "binance", warmup_samples=1)
         st.learn(0.0, 1000.0)
 
@@ -1079,6 +1080,7 @@ class TestPipelineE2E(unittest.TestCase):
             emit_callback=emitted.append,
             require_trade_confirmation=True,
             drain_threshold=0.30,
+            lead_lag_min_power_ratio=0.0,
         )
 
         st = engine._get_or_create_pair_state("BTC", "binance")

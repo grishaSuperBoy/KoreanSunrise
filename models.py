@@ -259,6 +259,7 @@ class SunriseSignal:
     follower_entry_px: float = 0.0
     leader_recent_buys_usd: float = 0.0
     side: str = "long"               # Directional side: "long" | "short"
+    phi: float = 0.0                 # Microstructure Impulse Power Ratio (swept_usd / follower_opposing_depth_usd)
 
     # Pool routing
     basket: str = "incubator"

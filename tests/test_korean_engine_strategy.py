@@ -45,6 +45,7 @@ class TestKoreanEngineStrategy(unittest.TestCase):
             alpha_decay_sec=8.0,
             require_trade_confirmation=False,
             runner_enabled=False,
+            lead_lag_min_power_ratio=0.0,
         )
 
     # -------------------------------------------------------------------------

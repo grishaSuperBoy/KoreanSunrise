@@ -127,10 +127,11 @@ class FadeFakeoutStrategy:
 
     def is_fakeout_pattern(
         self,
-        is_cancel_blocked: bool,
-        swept_usd: float,
-        upbit_spread_bps: float,         
+        is_cancel_detected: bool = False,
+        swept_usd: float = 0.0,
+        upbit_spread_bps: float = 0.0,
         korean_confirmed: bool = False,
+        is_cancel_blocked: Optional[bool] = None,
     ) -> Tuple[bool, str]:
         """
         Detects if an observed Upbit sweep event fits the fakeout pattern.
@@ -141,6 +142,8 @@ class FadeFakeoutStrategy:
         4. Cross-Korean Confirmation Guard: If korean_confirmed is True (both Upbit & Bithumb
            are surging together), NEVER fade — it is a genuine dual-exchange Korean pump.
         """
+        cancel_detected = is_cancel_blocked if is_cancel_blocked is not None else is_cancel_detected
+
         # Hard gate: cross-Korean dual pump. Never short when both Korean venues are pumping!
         if korean_confirmed:
             return False, ""
@@ -153,7 +156,7 @@ class FadeFakeoutStrategy:
         if upbit_spread_bps < self.min_upbit_spread_bps:
             return False, ""
 
-        if is_cancel_blocked:
+        if cancel_detected:
             return True, "mm_quote_cancel"
         return True, "micro_sweep_exhaustion"
 
@@ -420,7 +423,7 @@ class FadeFakeoutStrategy:
             self._active[coin] = alive
 
     def on_upbit_tick(self, coin: str, upbit_snap: Any, now: float) -> None:
-        """Periodic timeout sweep and leader reversion audit."""
+        """Periodic timeout sweep for coin positions on Upbit tick (upbit_snap reserved for leader reversion telemetry)."""
         self._sweep_coin_timeouts(coin, now)
 
     def sweep_timeouts(self, now: float) -> None:

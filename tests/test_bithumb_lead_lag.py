@@ -31,6 +31,7 @@ class TestBithumbLeadLagIntegration(unittest.TestCase):
             emit_callback=lambda s: self.emitted.append(s),
             require_trade_confirmation=True,
             drain_threshold=0.30,
+            lead_lag_min_power_ratio=0.0,
         )
 
     def test_bithumb_anti_ghosting_and_real_sweep(self):

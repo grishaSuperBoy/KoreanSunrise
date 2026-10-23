@@ -144,6 +144,8 @@ class KoreanEngine:
         require_trade_confirmation: bool = False,
         require_korean_confirmation: bool = getattr(C, "REQUIRE_KOREAN_CONFIRMATION", False),
         runner_enabled: Optional[bool] = None,
+        lead_lag_min_power_ratio: Optional[float] = None,
+        lead_lag_min_lead_basis_bps: Optional[float] = None,
         pool_state: Any = None,
         profile_manager: Any = None,
         thresholds_file: Optional[str] = None,
@@ -168,6 +170,8 @@ class KoreanEngine:
         self.require_trade_confirmation = require_trade_confirmation
         self.require_korean_confirmation = require_korean_confirmation
         self.runner_enabled = runner_enabled
+        self.lead_lag_min_power_ratio = float(lead_lag_min_power_ratio) if lead_lag_min_power_ratio is not None else float(getattr(C, "LEAD_LAG_MIN_POWER_RATIO", 4.0))
+        self.lead_lag_min_lead_basis_bps = float(lead_lag_min_lead_basis_bps) if lead_lag_min_lead_basis_bps is not None else float(getattr(C, "LEAD_LAG_MIN_LEAD_BASIS_BPS", -10.0))
         self.pool_state = pool_state
         self.profile_manager = profile_manager
 
@@ -266,6 +270,8 @@ class KoreanEngine:
             stop_invalidation_bps=self.stop_invalidation_bps,
             stop_adverse_pnl_bps=self.stop_adverse_pnl_bps,
             alpha_decay_sec=self.alpha_decay_sec,
+            min_power_ratio=self.lead_lag_min_power_ratio,
+            min_lead_basis_bps=self.lead_lag_min_lead_basis_bps,
             pool_state=self.pool_state,
             profile_manager=self.profile_manager,
         )
@@ -949,7 +955,7 @@ class KoreanEngine:
 
         # Cancel vs. Sweep Discrimination (Anti-Ghosting Guard)
         recent_buys_usd = 0.0
-        is_cancel_blocked = False
+        is_cancel_detected = False
         saved_trigger_type = long_trigger_type
         saved_swept_usd = long_swept_usd
         cutoff = now - getattr(self, "trade_confirm_lookback_sec", 2.0)
@@ -967,7 +973,7 @@ class KoreanEngine:
 
                 if recent_buys_usd < min_buys_needed:
                     self.counters["cancels_blocked"] = self.counters.get("cancels_blocked", 0) + 1
-                    is_cancel_blocked = True
+                    is_cancel_detected = True
                     log.debug(
                         f"[engine] Blocked false sweep / MM cancel on {leader_ex.capitalize()} {coin}: "
                         f"swept_usd=${long_swept_usd:.1f}, but recent taker buys=${recent_buys_usd:.1f} "
@@ -1055,7 +1061,7 @@ class KoreanEngine:
                 fade_reason = None
             else:
                 is_fake, fade_reason = self.strat_fade.is_fakeout_pattern(
-                    is_cancel_blocked=is_cancel_blocked,
+                    is_cancel_detected=is_cancel_detected,
                     swept_usd=fade_swept,
                     upbit_spread_bps=cur_spread,
                     korean_confirmed=korean_dual_pump,

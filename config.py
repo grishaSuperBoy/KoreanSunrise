@@ -62,6 +62,10 @@ ENTRY_LATENCY_BUFFER_BPS = float(os.getenv("ENTRY_LATENCY_BUFFER_BPS", "2.5"))  
 STOP_INVALIDATION_BPS = 15.0    # Model A: Microstructure invalidation tolerance (leader premium breakdown)
 STOP_ADVERSE_PNL_BPS = 35.0     # Model B: Hard adverse PnL drawdown stop (bps)
 
+# Strategy 1 Quantitative Microstructure Gating Parameters
+LEAD_LAG_MIN_POWER_RATIO = float(os.getenv("LEAD_LAG_MIN_POWER_RATIO", "4.0"))         # Minimum swept_usd / follower_opposing_depth_usd ratio (Phi)
+LEAD_LAG_MIN_LEAD_BASIS_BPS = float(os.getenv("LEAD_LAG_MIN_LEAD_BASIS_BPS", "-10.0")) # Follower basis floor (bps): perps must not already lead pump with inverted basis
+
 # Bithumb Co-Leader Configuration
 BITHUMB_ENABLED = os.getenv("BITHUMB_ENABLED", "true").lower() in ("true", "1", "yes")
 BITHUMB_MIN_SWEPT_USD = float(os.getenv("BITHUMB_MIN_SWEPT_USD", "3000.0"))

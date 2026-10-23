@@ -64,7 +64,7 @@ class TestCargoCultAudit(unittest.TestCase):
 
     def test_contemporaneous_baseline_learning_guard(self):
         """Baseline learning requires reasonably contemporaneous quotes (<= 2.0s) to prevent market drift poisoning."""
-        engine = KoreanEngine(emit_callback=lambda s: None, max_follower_book_age_sec=0.50)
+        engine = KoreanEngine(emit_callback=lambda s: None, max_follower_book_age_sec=0.50, lead_lag_min_power_ratio=0.0)
         coin = "QUIETALT"
         follower = "binance"
         st = engine._get_or_create_pair_state(coin, follower)
@@ -179,7 +179,7 @@ class TestCargoCultAudit(unittest.TestCase):
 
     def test_follower_book_age_strictly_bounded_hft(self):
         """HFT quote freshness: books older than 500ms are strictly rejected for entry."""
-        engine = KoreanEngine(emit_callback=lambda s: None, max_follower_book_age_sec=0.50)
+        engine = KoreanEngine(emit_callback=lambda s: None, max_follower_book_age_sec=0.50, lead_lag_min_power_ratio=0.0)
         coin = "FAST"
         follower = "binance"
         st = engine._get_or_create_pair_state(coin, follower)
@@ -220,7 +220,7 @@ class TestCargoCultAudit(unittest.TestCase):
 
     def test_gross_calibration_vs_net_edge_alignment(self):
         """When matrix has min_spread_bps=20.0, gross edge >= 20.0 with net edge > 0 is accepted."""
-        engine = KoreanEngine(emit_callback=lambda s: None, roundtrip_fee_bps=10.0)
+        engine = KoreanEngine(emit_callback=lambda s: None, roundtrip_fee_bps=10.0, lead_lag_min_power_ratio=0.0)
         coin = "MATRIXCOIN"
         follower = "binance"
         # Pair threshold config has min_spread_bps=20.0 (calibrated on gross spread)

@@ -35,6 +35,7 @@ class TestAdaptiveStopsAndFixes(unittest.TestCase):
             stop_invalidation_bps=15.0,
             stop_adverse_pnl_bps=35.0,
             alpha_decay_sec=8.0,
+            lead_lag_min_power_ratio=0.0,
         )
 
     # -------------------------------------------------------------

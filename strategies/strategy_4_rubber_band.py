@@ -447,7 +447,10 @@ class RubberBandSniperStrategy:
 
         # True executable PnL: Exit at current best bid (taker sell)
         raw_pnl_bps = (best_bid - fill_px) / fill_px * 1e4
-        net_pnl_bps = raw_pnl_bps - pos.taker_fee_bps + pos.maker_rebate_bps
+        if pos.order_type == "taker_sniper":
+            net_pnl_bps = raw_pnl_bps - pos.roundtrip_fee_bps
+        else:
+            net_pnl_bps = raw_pnl_bps - pos.taker_fee_bps + pos.maker_rebate_bps
 
         # Track trajectory (sample max 1 per 0.5s)
         if not pos.path or (now - pos.path[-1][0]) >= 0.5:
@@ -478,7 +481,7 @@ class RubberBandSniperStrategy:
             close_reason = "stop_decay"
         # 5. Max Hold Duration
         elif dt >= pos.max_hold_sec:
-            close_reason = "timeout"
+            close_reason = "converged" if net_pnl_bps > 0.0 else "timeout"
 
         if close_reason is not None:
             self._close_position(pos, close_reason, best_bid, net_pnl_bps, now)
@@ -582,7 +585,8 @@ class RubberBandSniperStrategy:
             else:
                 # Realistic stale book penalty on timeout: spread cost + fee + adverse slippage
                 fill_p = pos.fill_px or pos.entry_px
-                penalty_bps = pos.spread_open_bps + pos.taker_fee_bps + 10.0
+                fee_cost = pos.roundtrip_fee_bps if pos.order_type == "taker_sniper" else pos.taker_fee_bps
+                penalty_bps = pos.spread_open_bps + fee_cost + 10.0
                 net_pnl = -penalty_bps
                 exit_px = fill_p * (1.0 - penalty_bps / 1e4)
                 self._close_position(pos, "timeout", exit_px, net_pnl, now)

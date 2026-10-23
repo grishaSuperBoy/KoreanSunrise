@@ -9,7 +9,7 @@ import os
 from typing import List, Dict, Any
 
 from models import OrderBookDepth5
-from strategies import FadeFakeoutStrategy, MakerVoidStrategy
+from strategies import FadeFakeoutStrategy, MakerVoidStrategy, RubberBandSniperStrategy
 
 
 def make_snap(ex: str, sym: str, bids: list, asks: list, now: float, raw: str = "") -> OrderBookDepth5:
@@ -339,7 +339,7 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
         from korean_engine import KoreanEngine
         import threading
 
-        engine = KoreanEngine(emit_callback=lambda s: None)
+        engine = KoreanEngine(emit_callback=lambda s: None, lead_lag_min_power_ratio=0.0)
         now = time.time()
         coin = "SOL"
         st = engine._get_or_create_pair_state(coin, "binance")
@@ -542,7 +542,7 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
     def test_asterdex_lead_lag_tight_spread_allowed_wide_rejected(self):
         """Lead-Lag Taker: AsterDex allowed on tight spreads (<=45 bps), rejected on wide defensive spreads."""
         from strategies.strategy_1_sweep_lead_lag import KoreanLeadLagStrategy, PairState
-        strat1 = KoreanLeadLagStrategy(emit_callback=lambda s: None)
+        strat1 = KoreanLeadLagStrategy(emit_callback=lambda s: None, min_power_ratio=0.0)
         now = time.time()
         coin = "GMT"
         st = PairState(coin, "asterdex", warmup_samples=10)
@@ -805,7 +805,7 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
         from korean_engine import KoreanEngine
         now = time.time()
         coin = "DOGE"
-        engine = KoreanEngine(emit_callback=lambda s: None)
+        engine = KoreanEngine(emit_callback=lambda s: None, lead_lag_min_power_ratio=0.0)
 
         # 1. Bybit tick arrives with tight spread (5.0 bps)
         f_tight = make_snap("bybit", coin, [(0.1000, 1000.0)], [(0.10005, 1000.0)], now)
@@ -913,7 +913,7 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
         from models import SunriseSignal
         now = time.time()
         coin = "GTC"
-        engine = KoreanEngine(emit_callback=lambda s: None)
+        engine = KoreanEngine(emit_callback=lambda s: None, lead_lag_min_power_ratio=0.0)
         st = engine._get_or_create_pair_state(coin, "bybit", leader_ex="upbit")
 
         upbit_t0 = make_snap("upbit", coin, [(10.0, 100.0)], [(10.01, 100.0)], now)
@@ -976,7 +976,7 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
         from unittest.mock import patch
         from korean_engine import KoreanEngine
 
-        engine = KoreanEngine(emit_callback=lambda s: None)
+        engine = KoreanEngine(emit_callback=lambda s: None, lead_lag_min_power_ratio=0.0)
         coin = "ZEROCOIN"
         now = time.time()
         engine._get_or_create_pair_state(coin, "bybit")
@@ -1055,7 +1055,7 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
         """Verify idle follower spread EWMA entries (> 1 hour) are pruned during timeout sweeps."""
         from korean_engine import KoreanEngine, FollowerSpreadNorm
 
-        engine = KoreanEngine(emit_callback=lambda s: None)
+        engine = KoreanEngine(emit_callback=lambda s: None, lead_lag_min_power_ratio=0.0)
         now = 10000.0
 
         # Active entry (last updated 30s ago)
@@ -1262,6 +1262,80 @@ class TestFadeAndMakerStrategies(unittest.TestCase):
         upbit_snap = make_snap("upbit", "RANDOM", [(10.05, 1000.0)], [(10.07, 1000.0)], now)
         v_ok = strat.check_void_opportunity("gateio", "RANDOM", f_snap, upbit_snap, now, norm_spread_bps=15.0, is_warmed_up=True)
         self.assertIsNotNone(v_ok)
+
+    def test_rubber_band_hunter_mode_roundtrip_fee(self):
+        """Verifies hunter_mode=True deducts full roundtrip taker fee (2 * taker_fee_bps)."""
+        emitted = []
+        strat = RubberBandSniperStrategy(
+            emit_callback=emitted.append,
+            hunter_mode=True,
+            taker_fee_bps=5.0,
+            roundtrip_fee_bps=10.0,
+            target_rebound_bps=15.0,
+        )
+        now = time.time()
+        f_snap = make_snap("binance", "SOL", [(100.0, 5000.0)], [(100.1, 5000.0)], now, "SOLUSDT")
+        upbit_snap = make_snap("upbit", "SOL", [(101.5, 5000.0)], [(101.6, 5000.0)], now)
+
+        pos = strat.check_rubber_band_opportunity("binance", "SOL", f_snap, upbit_snap, now)
+        self.assertIsNotNone(pos)
+        self.assertEqual(pos.order_type, "taker_sniper")
+
+        # In hunter_mode, entry is filled immediately at f_snap.best_ask (100.10)
+        # Price rebounds to 100.40 (+29.97 bps raw move)
+        f_rebound = make_snap("binance", "SOL", [(100.40, 5000.0)], [(100.45, 5000.0)], now + 1.0, "SOLUSDT")
+        closed = strat.on_follower_tick("binance", "SOL", f_rebound, now + 1.0, cur_upbit_mid=101.55)
+        self.assertIsNotNone(closed)
+        self.assertEqual(closed.close_reason, "target_converged")
+        # Expected Net PnL = (100.40 - 100.10)/100.10 * 1e4 - 10.0 = 29.97 - 10.0 = ~19.97 bps
+        raw_bps = (100.40 - 100.10) / 100.10 * 1e4
+        self.assertAlmostEqual(closed.net_pnl_bps, raw_bps - 10.0, places=1)
+
+    def test_rubber_band_positive_timeout_converged(self):
+        """Verifies positions closed at max_hold_sec with net profit are recorded as converged."""
+        counters = {}
+        strat = RubberBandSniperStrategy(
+            emit_callback=lambda s: None,
+            hunter_mode=True,
+            taker_fee_bps=5.0,
+            roundtrip_fee_bps=10.0,
+            max_hold_sec=5.0,
+            target_rebound_bps=50.0,
+            counters=counters,
+        )
+        now = time.time()
+        f_snap = make_snap("binance", "SOL", [(100.0, 5000.0)], [(100.1, 5000.0)], now, "SOLUSDT")
+        upbit_snap = make_snap("upbit", "SOL", [(101.5, 5000.0)], [(101.6, 5000.0)], now)
+
+        pos = strat.check_rubber_band_opportunity("binance", "SOL", f_snap, upbit_snap, now)
+        self.assertIsNotNone(pos)
+
+        # Tick at dt = 5.1s (> max_hold_sec) with net profit of +15 bps (< target 50 bps)
+        f_exit = make_snap("binance", "SOL", [(100.35, 5000.0)], [(100.40, 5000.0)], now + 5.1, "SOLUSDT")
+        closed = strat.on_follower_tick("binance", "SOL", f_exit, now + 5.1, cur_upbit_mid=101.55)
+        self.assertIsNotNone(closed)
+        self.assertEqual(closed.close_reason, "converged")
+        self.assertEqual(counters.get("rubber_band_converged"), 1)
+
+    def test_fade_is_cancel_detected_semantic_alias(self):
+        """Verifies is_cancel_detected works as primary name and is_cancel_blocked acts as alias."""
+        # 1. Primary name
+        is_fake1, reason1 = self.fade_strat.is_fakeout_pattern(
+            is_cancel_detected=True,
+            swept_usd=500.0,
+            upbit_spread_bps=50.0,
+        )
+        self.assertTrue(is_fake1)
+        self.assertEqual(reason1, "mm_quote_cancel")
+
+        # 2. Legacy alias name
+        is_fake2, reason2 = self.fade_strat.is_fakeout_pattern(
+            is_cancel_blocked=True,
+            swept_usd=500.0,
+            upbit_spread_bps=50.0,
+        )
+        self.assertTrue(is_fake2)
+        self.assertEqual(reason2, "mm_quote_cancel")
 
 
 if __name__ == "__main__":

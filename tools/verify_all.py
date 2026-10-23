@@ -36,6 +36,8 @@ CORE_FILES = [
     "config.py",
     "models.py",
     "korean_engine.py",
+    "strategies/quant_lead_lag.py",
+    "strategies/strategy_1_sweep_lead_lag.py",
     "venues/base.py",
     "venues/manager.py",
     "venues/bithumb.py",
@@ -51,6 +53,7 @@ CORE_FILES = [
     "tests/test_cargo_cult_audit.py",
     "tests/test_korean_engine_strategy.py",
     "tests/test_pipeline_e2e.py",
+    "tests/test_quant_lead_lag.py",
     "tests/test_venues_streams_resilience.py",
 ]
 
